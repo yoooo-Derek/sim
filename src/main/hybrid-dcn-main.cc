@@ -17,8 +17,8 @@ main(int argc, char* argv[])
     cmd.Parse(argc, argv);
 
     std::cout << "[HYBRID-DCN] Experiment: " << experimentName << std::endl;
-    std::cout << "[HYBRID-DCN] Project root: ~/hybrid-dcn-sim" << std::endl;
-    std::cout << "[HYBRID-DCN] ns-3 engine: ~/sim/ns-3.47" << std::endl;
+    std::cout << "[HYBRID-DCN] Project root: ~/sim" << std::endl;
+    std::cout << "[HYBRID-DCN] ns-3 engine: ~/ns-3.47" << std::endl;
     std::cout << "[HYBRID-DCN] Stage: 0C external project skeleton" << std::endl;
     std::cout << "[HYBRID-DCN] Simulation time: " << simTime << " s" << std::endl;
 
