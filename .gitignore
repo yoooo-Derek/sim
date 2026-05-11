@@ -1,0 +1,26 @@
+# Build and runtime outputs
+*.o
+*.so
+*.a
+*.pcap
+*.tr
+*.xml
+*.csv
+*.log
+*.dat
+*.png
+*.pdf
+*.svg
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Temporary files
+.tmp/
+.cache/
+
+# Keep result directory structure
+!results/raw/.gitkeep
+!results/figures/.gitkeep
+!results/tables/.gitkeep
