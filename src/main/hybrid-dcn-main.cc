@@ -2,6 +2,7 @@
 #include "ns3/internet-module.h"
 #include "ns3/ipv4-address-helper.h"
 #include "ns3/network-module.h"
+#include "ns3/netanim-module.h"
 #include "ns3/point-to-point-module.h"
 
 #include <iostream>
@@ -16,9 +17,11 @@ AddOcsLink(Ptr<Node> leafA, Ptr<Node> leafB)
     (void)leafA;
     (void)leafB;
 
-    // Reserved OCS L1 lightpath interface between two Leaf/ToR switches.
-    // Future implementation should install a direct P2P link with:
-    // DataRate = 100Gbps, Delay = 5us.
+    // Stage-1.5 does not instantiate OCS links.
+    // Later stages will use this interface to install Leaf-To-Leaf direct L1
+    // lightpaths with DataRate = 100Gbps and Delay = 5us.
+    // The graph clustering and cross-scale cooperative scheduling modules will
+    // call this interface when dynamic optical circuit setup is introduced.
 }
 
 int
@@ -38,9 +41,36 @@ main(int argc, char* argv[])
     cmd.AddValue("serversPerLeaf", "Number of servers attached to each Leaf/ToR.", serversPerLeaf);
     cmd.Parse(argc, argv);
 
+    if (simTime <= 0)
+    {
+        std::cerr << "[HYBRID-DCN][ERROR] simTime must be greater than 0." << std::endl;
+        return 1;
+    }
+
+    if (numSpines == 0)
+    {
+        std::cerr << "[HYBRID-DCN][ERROR] numSpines must be greater than 0." << std::endl;
+        return 1;
+    }
+
+    if (numLeaves <= 1)
+    {
+        std::cerr << "[HYBRID-DCN][ERROR] numLeaves must be greater than 1." << std::endl;
+        return 1;
+    }
+
+    if (serversPerLeaf == 0)
+    {
+        std::cerr << "[HYBRID-DCN][ERROR] serversPerLeaf must be greater than 0." << std::endl;
+        return 1;
+    }
+
     const uint32_t totalServers = numLeaves * serversPerLeaf;
     const uint32_t totalNodes = totalServers + numLeaves + numSpines;
-    const uint32_t epsLinksCount = totalServers + (numLeaves * numSpines);
+    const uint32_t serverLeafLinks = totalServers;
+    const uint32_t leafSpineLinks = numLeaves * numSpines;
+    const uint32_t epsLinksCount = serverLeafLinks + leafSpineLinks;
+    const uint32_t reservedOcsLinks = 0;
 
     NodeContainer servers;
     NodeContainer leaves;
@@ -116,14 +146,50 @@ main(int argc, char* argv[])
         }
     }
 
-    std::cout << "[HYBRID-DCN] experimentName=" << experimentName << std::endl;
-    std::cout << "[HYBRID-DCN] simTime=" << simTime << "s" << std::endl;
-    std::cout << "[HYBRID-DCN] numSpines=" << numSpines << std::endl;
-    std::cout << "[HYBRID-DCN] numLeaves=" << numLeaves << std::endl;
-    std::cout << "[HYBRID-DCN] serversPerLeaf=" << serversPerLeaf << std::endl;
-    std::cout << "[HYBRID-DCN] totalServers=" << totalServers << std::endl;
-    std::cout << "[HYBRID-DCN] totalNodes=" << totalNodes << std::endl;
-    std::cout << "[HYBRID-DCN] epsLinksCount=" << epsLinksCount << std::endl;
+    std::cout << "[HYBRID-DCN] experimentName   = " << experimentName << std::endl;
+    std::cout << "[HYBRID-DCN] simTime          = " << simTime << " s" << std::endl;
+    std::cout << "[HYBRID-DCN] numSpines        = " << numSpines << std::endl;
+    std::cout << "[HYBRID-DCN] numLeaves        = " << numLeaves << std::endl;
+    std::cout << "[HYBRID-DCN] serversPerLeaf   = " << serversPerLeaf << std::endl;
+    std::cout << "[HYBRID-DCN] totalServers     = " << totalServers << std::endl;
+    std::cout << "[HYBRID-DCN] totalNodes       = " << totalNodes << std::endl;
+    std::cout << "[HYBRID-DCN] serverLeafLinks  = " << serverLeafLinks << std::endl;
+    std::cout << "[HYBRID-DCN] leafSpineLinks   = " << leafSpineLinks << std::endl;
+    std::cout << "[HYBRID-DCN] epsLinksCount    = " << epsLinksCount << std::endl;
+    std::cout << "[HYBRID-DCN] reservedOcsLinks = " << reservedOcsLinks << std::endl;
+
+    AnimationInterface anim("../sim/results/raw/hybrid-dcn-anim.xml");
+
+    const double layerXOffset = 40.0;
+    const double layerSpacing = 40.0;
+    const double serverSpacing = 8.0;
+
+    auto layerX = [layerXOffset, layerSpacing](uint32_t index) {
+        return layerXOffset + (static_cast<double>(index) * layerSpacing);
+    };
+
+    for (uint32_t spineIndex = 0; spineIndex < numSpines; ++spineIndex)
+    {
+        AnimationInterface::SetConstantPosition(spines.Get(spineIndex), layerX(spineIndex), 0.0);
+    }
+
+    for (uint32_t leafIndex = 0; leafIndex < numLeaves; ++leafIndex)
+    {
+        const double leafX = layerX(leafIndex);
+        AnimationInterface::SetConstantPosition(leaves.Get(leafIndex), leafX, 50.0);
+
+        for (uint32_t serverOffset = 0; serverOffset < serversPerLeaf; ++serverOffset)
+        {
+            const double serverX =
+                leafX + ((static_cast<double>(serverOffset) -
+                          (static_cast<double>(serversPerLeaf - 1) / 2.0)) *
+                         serverSpacing);
+            AnimationInterface::SetConstantPosition(
+                servers.Get(serverIndex(leafIndex, serverOffset)),
+                serverX,
+                100.0);
+        }
+    }
 
     Simulator::Stop(Seconds(simTime));
     Simulator::Run();
