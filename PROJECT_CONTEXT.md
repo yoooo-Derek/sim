@@ -47,6 +47,4 @@ The simulated architecture contains:
 9. Route residual traffic through EPS.
 10. Update EPS-WECMP weights according to measured link utilization.
 
-## Current Stage
 
-Stage 0C initializes the external thesis simulation project directory.
