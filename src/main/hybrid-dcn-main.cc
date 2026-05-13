@@ -3,6 +3,8 @@
 #include "ns3/internet-module.h"
 #include "ns3/ipv4-address-helper.h"
 #include "ns3/ipv4-global-routing-helper.h"
+#include "ns3/ipv4-static-routing-helper.h"
+#include "ns3/ipv4-static-routing.h"
 #include "ns3/network-module.h"
 #include "ns3/netanim-module.h"
 #include "ns3/point-to-point-module.h"
@@ -18,6 +20,8 @@ uint64_t g_bulkRxBytes = 0;
 bool g_bulkSeenFirstRx = false;
 double g_bulkFirstRxTime = 0.0;
 double g_bulkLastRxTime = 0.0;
+uint64_t g_ocsTxPackets = 0;
+uint64_t g_ocsTxBytes = 0;
 
 std::string
 FormatIpv4Endpoint(const Address& address)
@@ -46,6 +50,13 @@ BulkSinkRxTrace(Ptr<const Packet> packet, const Address& from)
         g_bulkFirstRxTime = now;
     }
     g_bulkLastRxTime = now;
+}
+
+void
+OcsTxTrace(Ptr<const Packet> packet)
+{
+    g_ocsTxPackets += 1;
+    g_ocsTxBytes += packet->GetSize();
 }
 
 void
@@ -80,7 +91,8 @@ AddOcsLink(Ptr<Node> leafA,
            Ptr<Node> leafB,
            const std::string& dataRate,
            const std::string& delay,
-           Ipv4AddressHelper& ipv4)
+           Ipv4AddressHelper& ipv4,
+           NetDeviceContainer& ocsDevices)
 {
     // Stage-4 models OCS as a static Leaf-To-Leaf L1 lightpath.
     // No Optical Core node is created here. Later stages can call this interface
@@ -91,8 +103,8 @@ AddOcsLink(Ptr<Node> leafA,
     ocsP2p.SetChannelAttribute("Delay", StringValue(delay));
 
     NodeContainer pair(leafA, leafB);
-    NetDeviceContainer devices = ocsP2p.Install(pair);
-    Ipv4InterfaceContainer interfaces = ipv4.Assign(devices);
+    ocsDevices = ocsP2p.Install(pair);
+    Ipv4InterfaceContainer interfaces = ipv4.Assign(ocsDevices);
     ipv4.NewNetwork();
     return interfaces;
 }
@@ -118,6 +130,12 @@ main(int argc, char* argv[])
     uint32_t ocsLeafB = 3;
     std::string ocsDataRate = "100Gbps";
     std::string ocsDelay = "5us";
+    std::string routeMode = "global";
+
+    const uint32_t bulkSrcLeaf = 0;
+    const uint32_t bulkSrcServer = 0;
+    const uint32_t bulkDstLeaf = 3;
+    const uint32_t bulkDstServer = 0;
 
     CommandLine cmd(__FILE__);
     cmd.AddValue("simTime", "Simulation time in seconds.", simTime);
@@ -138,6 +156,7 @@ main(int argc, char* argv[])
     cmd.AddValue("ocsLeafB", "Second Leaf/ToR index for the static OCS lightpath.", ocsLeafB);
     cmd.AddValue("ocsDataRate", "Static OCS lightpath data rate.", ocsDataRate);
     cmd.AddValue("ocsDelay", "Static OCS lightpath delay.", ocsDelay);
+    cmd.AddValue("routeMode", "Routing mode: global or ocs-forced.", routeMode);
     cmd.Parse(argc, argv);
 
     if (simTime <= 0)
@@ -161,6 +180,12 @@ main(int argc, char* argv[])
     if (serversPerLeaf == 0)
     {
         std::cerr << "[HYBRID-DCN][ERROR] serversPerLeaf must be greater than 0." << std::endl;
+        return 1;
+    }
+
+    if (routeMode != "global" && routeMode != "ocs-forced")
+    {
+        std::cerr << "[HYBRID-DCN][ERROR] routeMode must be global or ocs-forced." << std::endl;
         return 1;
     }
 
@@ -301,6 +326,47 @@ main(int argc, char* argv[])
         }
     }
 
+    if (routeMode == "ocs-forced")
+    {
+        if (!enableStaticOcs)
+        {
+            std::cerr
+                << "[HYBRID-DCN][ERROR] routeMode=ocs-forced requires enableStaticOcs=true."
+                << std::endl;
+            return 1;
+        }
+
+        if (!enableBulk)
+        {
+            std::cerr << "[HYBRID-DCN][ERROR] routeMode=ocs-forced requires enableBulk=true."
+                      << std::endl;
+            return 1;
+        }
+
+        if (ocsLeafA != bulkSrcLeaf)
+        {
+            std::cerr << "[HYBRID-DCN][ERROR] routeMode=ocs-forced requires ocsLeafA to match "
+                         "bulkSrcLeaf."
+                      << std::endl;
+            return 1;
+        }
+
+        if (ocsLeafB != bulkDstLeaf)
+        {
+            std::cerr << "[HYBRID-DCN][ERROR] routeMode=ocs-forced requires ocsLeafB to match "
+                         "bulkDstLeaf."
+                      << std::endl;
+            return 1;
+        }
+
+        if (ocsLeafA == ocsLeafB)
+        {
+            std::cerr << "[HYBRID-DCN][ERROR] ocsLeafA and ocsLeafB must be different."
+                      << std::endl;
+            return 1;
+        }
+    }
+
     const uint32_t totalServers = numLeaves * serversPerLeaf;
     const uint32_t totalNodes = totalServers + numLeaves + numSpines;
     const uint32_t serverLeafLinks = totalServers;
@@ -359,6 +425,14 @@ main(int argc, char* argv[])
 
     std::vector<std::vector<Ipv4Address>> serverIpv4(numLeaves,
                                                      std::vector<Ipv4Address>(serversPerLeaf));
+    std::vector<std::vector<Ipv4Address>> leafServerIpv4(
+        numLeaves,
+        std::vector<Ipv4Address>(serversPerLeaf));
+    std::vector<std::vector<uint32_t>> serverIfIndex(numLeaves,
+                                                     std::vector<uint32_t>(serversPerLeaf));
+    std::vector<std::vector<uint32_t>> leafServerIfIndex(
+        numLeaves,
+        std::vector<uint32_t>(serversPerLeaf));
 
     Ipv4AddressHelper ipv4;
     ipv4.SetBase("10.0.0.0", "255.255.255.252");
@@ -372,6 +446,9 @@ main(int argc, char* argv[])
             NetDeviceContainer devices = serverLeafP2p.Install(pair);
             Ipv4InterfaceContainer interfaces = ipv4.Assign(devices);
             serverIpv4[leafIndex][serverOffset] = interfaces.GetAddress(0);
+            leafServerIpv4[leafIndex][serverOffset] = interfaces.GetAddress(1);
+            serverIfIndex[leafIndex][serverOffset] = interfaces.Get(0).second;
+            leafServerIfIndex[leafIndex][serverOffset] = interfaces.Get(1).second;
             ipv4.NewNetwork();
         }
     }
@@ -389,17 +466,61 @@ main(int argc, char* argv[])
 
     Ipv4Address ocsLeafAAddress("0.0.0.0");
     Ipv4Address ocsLeafBAddress("0.0.0.0");
+    uint32_t ocsLeafAIfIndex = 0;
+    uint32_t ocsLeafBIfIndex = 0;
+    NetDeviceContainer ocsDevices;
     if (enableStaticOcs)
     {
         Ipv4InterfaceContainer ocsInterfaces =
-            AddOcsLink(leaves.Get(ocsLeafA), leaves.Get(ocsLeafB), ocsDataRate, ocsDelay, ipv4);
+            AddOcsLink(leaves.Get(ocsLeafA),
+                       leaves.Get(ocsLeafB),
+                       ocsDataRate,
+                       ocsDelay,
+                       ipv4,
+                       ocsDevices);
         ocsLeafAAddress = ocsInterfaces.GetAddress(0);
         ocsLeafBAddress = ocsInterfaces.GetAddress(1);
+        ocsLeafAIfIndex = ocsInterfaces.Get(0).second;
+        ocsLeafBIfIndex = ocsInterfaces.Get(1).second;
+        ocsDevices.Get(0)->TraceConnectWithoutContext("MacTx", MakeCallback(&OcsTxTrace));
+        ocsDevices.Get(1)->TraceConnectWithoutContext("MacTx", MakeCallback(&OcsTxTrace));
         staticOcsLinks = 1;
         reservedOcsLinks = 1;
     }
 
     Ipv4GlobalRoutingHelper::PopulateRoutingTables();
+
+    const Ipv4Address bulkSrcAddress = enableBulk ? serverIpv4[bulkSrcLeaf][bulkSrcServer]
+                                                   : Ipv4Address("0.0.0.0");
+    const Ipv4Address bulkDstAddress = enableBulk ? serverIpv4[bulkDstLeaf][bulkDstServer]
+                                                   : Ipv4Address("0.0.0.0");
+    bool ocsForced = false;
+    if (routeMode == "ocs-forced")
+    {
+        Ipv4StaticRoutingHelper staticRoutingHelper;
+
+        Ptr<Ipv4StaticRouting> srcServerRouting = staticRoutingHelper.GetStaticRouting(
+            servers.Get(serverIndex(bulkSrcLeaf, bulkSrcServer))->GetObject<Ipv4>());
+        srcServerRouting->AddHostRouteTo(bulkDstAddress,
+                                         leafServerIpv4[bulkSrcLeaf][bulkSrcServer],
+                                         serverIfIndex[bulkSrcLeaf][bulkSrcServer]);
+
+        Ptr<Ipv4StaticRouting> leafARouting =
+            staticRoutingHelper.GetStaticRouting(leaves.Get(ocsLeafA)->GetObject<Ipv4>());
+        leafARouting->AddHostRouteTo(bulkDstAddress, ocsLeafBAddress, ocsLeafAIfIndex);
+
+        Ptr<Ipv4StaticRouting> leafBRouting =
+            staticRoutingHelper.GetStaticRouting(leaves.Get(ocsLeafB)->GetObject<Ipv4>());
+        leafBRouting->AddHostRouteTo(bulkSrcAddress, ocsLeafAAddress, ocsLeafBIfIndex);
+
+        Ptr<Ipv4StaticRouting> dstServerRouting = staticRoutingHelper.GetStaticRouting(
+            servers.Get(serverIndex(bulkDstLeaf, bulkDstServer))->GetObject<Ipv4>());
+        dstServerRouting->AddHostRouteTo(bulkSrcAddress,
+                                         leafServerIpv4[bulkDstLeaf][bulkDstServer],
+                                         serverIfIndex[bulkDstLeaf][bulkDstServer]);
+
+        ocsForced = true;
+    }
 
     const uint32_t echoPort = 9000;
     const uint32_t echoSrcLeaf = 0;
@@ -410,14 +531,8 @@ main(int argc, char* argv[])
     const std::string echoDstName = "server-l3-s0";
     const Ipv4Address echoDstAddress = enableEcho ? serverIpv4[echoDstLeaf][echoDstServer]
                                                    : Ipv4Address("0.0.0.0");
-    const uint32_t bulkSrcLeaf = 0;
-    const uint32_t bulkSrcServer = 0;
-    const uint32_t bulkDstLeaf = 3;
-    const uint32_t bulkDstServer = 0;
     const std::string bulkSrcName = "server-l0-s0";
     const std::string bulkDstName = "server-l3-s0";
-    const Ipv4Address bulkDstAddress = enableBulk ? serverIpv4[bulkDstLeaf][bulkDstServer]
-                                                   : Ipv4Address("0.0.0.0");
 
     if (enableEcho)
     {
@@ -560,6 +675,59 @@ main(int argc, char* argv[])
                   << std::endl;
     }
 
+    std::cout << "[HYBRID-DCN][ROUTE] routeMode       = " << routeMode << std::endl;
+    std::cout << "[HYBRID-DCN][ROUTE] bulkSrcAddress  = ";
+    if (enableBulk)
+    {
+        std::cout << bulkSrcAddress;
+    }
+    else
+    {
+        std::cout << "N/A";
+    }
+    std::cout << std::endl;
+    std::cout << "[HYBRID-DCN][ROUTE] bulkDstAddress  = ";
+    if (enableBulk)
+    {
+        std::cout << bulkDstAddress;
+    }
+    else
+    {
+        std::cout << "N/A";
+    }
+    std::cout << std::endl;
+    std::cout << "[HYBRID-DCN][ROUTE] ocsLeafAAddress = ";
+    if (enableStaticOcs)
+    {
+        std::cout << ocsLeafAAddress;
+    }
+    else
+    {
+        std::cout << "N/A";
+    }
+    std::cout << std::endl;
+    std::cout << "[HYBRID-DCN][ROUTE] ocsLeafBAddress = ";
+    if (enableStaticOcs)
+    {
+        std::cout << ocsLeafBAddress;
+    }
+    else
+    {
+        std::cout << "N/A";
+    }
+    std::cout << std::endl;
+    std::cout << "[HYBRID-DCN][ROUTE] ocsForced       = " << (ocsForced ? "true" : "false")
+              << std::endl;
+    if (ocsForced)
+    {
+        std::cout << "[HYBRID-DCN][ROUTE] srcServerRoute  = bulkDst via leafServerIf"
+                  << std::endl;
+        std::cout << "[HYBRID-DCN][ROUTE] leafARoute      = bulkDst via OCS" << std::endl;
+        std::cout << "[HYBRID-DCN][ROUTE] leafBRoute      = bulkSrc via OCS" << std::endl;
+        std::cout << "[HYBRID-DCN][ROUTE] dstServerRoute  = bulkSrc via leafServerIf"
+                  << std::endl;
+    }
+
     AnimationInterface anim("../sim/results/raw/hybrid-dcn-anim.xml");
     anim.EnablePacketMetadata(true);
     if (enableStaticOcs)
@@ -603,6 +771,9 @@ main(int argc, char* argv[])
                 100.0);
         }
     }
+
+    g_ocsTxPackets = 0;
+    g_ocsTxBytes = 0;
 
     Simulator::Stop(Seconds(simTime));
     Simulator::Run();
@@ -667,6 +838,13 @@ main(int argc, char* argv[])
         std::cout << "[HYBRID-DCN][BULK] completed        = false" << std::endl;
         std::cout << "[HYBRID-DCN][BULK] avgGoodputMbps   = 0 Mbps" << std::endl;
     }
+
+    std::cout << "[HYBRID-DCN][OCS] enabled     = " << (enableStaticOcs ? "true" : "false")
+              << std::endl;
+    std::cout << "[HYBRID-DCN][OCS] txPackets   = " << g_ocsTxPackets << std::endl;
+    std::cout << "[HYBRID-DCN][OCS] txBytes     = " << g_ocsTxBytes << std::endl;
+    std::cout << "[HYBRID-DCN][OCS] observedUse = "
+              << (g_ocsTxPackets > 0 ? "true" : "false") << std::endl;
 
     std::cout << "[OK] Hybrid Core DCN topology build completed." << std::endl;
 
