@@ -14,6 +14,11 @@
 
 using namespace ns3;
 
+uint64_t g_bulkRxBytes = 0;
+bool g_bulkSeenFirstRx = false;
+double g_bulkFirstRxTime = 0.0;
+double g_bulkLastRxTime = 0.0;
+
 std::string
 FormatIpv4Endpoint(const Address& address)
 {
@@ -26,6 +31,21 @@ FormatIpv4Endpoint(const Address& address)
     std::ostringstream stream;
     stream << endpoint.GetIpv4() << " port " << endpoint.GetPort();
     return stream.str();
+}
+
+void
+BulkSinkRxTrace(Ptr<const Packet> packet, const Address& from)
+{
+    (void)from;
+    g_bulkRxBytes += packet->GetSize();
+
+    const double now = Simulator::Now().GetSeconds();
+    if (!g_bulkSeenFirstRx)
+    {
+        g_bulkSeenFirstRx = true;
+        g_bulkFirstRxTime = now;
+    }
+    g_bulkLastRxTime = now;
 }
 
 void
@@ -80,6 +100,10 @@ main(int argc, char* argv[])
     uint32_t echoPacketSize = 1024;
     double echoInterval = 0.1;
     uint32_t echoCount = 5;
+    bool enableBulk = true;
+    uint64_t bulkMaxBytes = 1048576;
+    double bulkStart = 0.2;
+    uint16_t bulkPort = 10000;
 
     CommandLine cmd(__FILE__);
     cmd.AddValue("simTime", "Simulation time in seconds.", simTime);
@@ -91,6 +115,10 @@ main(int argc, char* argv[])
     cmd.AddValue("echoPacketSize", "UDP Echo client packet size in bytes.", echoPacketSize);
     cmd.AddValue("echoInterval", "UDP Echo client send interval in seconds.", echoInterval);
     cmd.AddValue("echoCount", "UDP Echo client packet count.", echoCount);
+    cmd.AddValue("enableBulk", "Enable the Stage-3 TCP BulkSend validation flow.", enableBulk);
+    cmd.AddValue("bulkMaxBytes", "TCP BulkSend maximum bytes to send.", bulkMaxBytes);
+    cmd.AddValue("bulkStart", "TCP BulkSend application start time in seconds.", bulkStart);
+    cmd.AddValue("bulkPort", "TCP PacketSink listening port.", bulkPort);
     cmd.Parse(argc, argv);
 
     if (simTime <= 0)
@@ -158,6 +186,56 @@ main(int argc, char* argv[])
             std::cerr
                 << "[HYBRID-DCN][ERROR] simTime must be greater than 0.3 when enableEcho is true."
                 << std::endl;
+            return 1;
+        }
+    }
+
+    if (enableBulk)
+    {
+        if (numLeaves < 4)
+        {
+            std::cerr << "[HYBRID-DCN][ERROR] numLeaves must be at least 4 when enableBulk is true."
+                      << std::endl;
+            return 1;
+        }
+
+        if (serversPerLeaf < 1)
+        {
+            std::cerr
+                << "[HYBRID-DCN][ERROR] serversPerLeaf must be at least 1 when enableBulk is true."
+                << std::endl;
+            return 1;
+        }
+
+        if (bulkMaxBytes == 0)
+        {
+            std::cerr << "[HYBRID-DCN][ERROR] bulkMaxBytes must be greater than 0." << std::endl;
+            return 1;
+        }
+
+        if (bulkStart < 0)
+        {
+            std::cerr << "[HYBRID-DCN][ERROR] bulkStart must be greater than or equal to 0."
+                      << std::endl;
+            return 1;
+        }
+
+        if (bulkStart >= simTime)
+        {
+            std::cerr << "[HYBRID-DCN][ERROR] bulkStart must be less than simTime." << std::endl;
+            return 1;
+        }
+
+        if ((simTime - bulkStart) <= 0.1)
+        {
+            std::cerr << "[HYBRID-DCN][ERROR] simTime - bulkStart must be greater than 0.1."
+                      << std::endl;
+            return 1;
+        }
+
+        if (bulkPort == 0)
+        {
+            std::cerr << "[HYBRID-DCN][ERROR] bulkPort must be greater than 0." << std::endl;
             return 1;
         }
     }
@@ -258,6 +336,14 @@ main(int argc, char* argv[])
     const std::string echoDstName = "server-l3-s0";
     const Ipv4Address echoDstAddress = enableEcho ? serverIpv4[echoDstLeaf][echoDstServer]
                                                    : Ipv4Address("0.0.0.0");
+    const uint32_t bulkSrcLeaf = 0;
+    const uint32_t bulkSrcServer = 0;
+    const uint32_t bulkDstLeaf = 3;
+    const uint32_t bulkDstServer = 0;
+    const std::string bulkSrcName = "server-l0-s0";
+    const std::string bulkDstName = "server-l3-s0";
+    const Ipv4Address bulkDstAddress = enableBulk ? serverIpv4[bulkDstLeaf][bulkDstServer]
+                                                   : Ipv4Address("0.0.0.0");
 
     if (enableEcho)
     {
@@ -284,6 +370,30 @@ main(int argc, char* argv[])
                                                       MakeCallback(&EchoClientRxTrace));
         clientApps.Start(Seconds(0.2));
         clientApps.Stop(Seconds(simTime));
+    }
+
+    if (enableBulk)
+    {
+        g_bulkRxBytes = 0;
+        g_bulkSeenFirstRx = false;
+        g_bulkFirstRxTime = 0.0;
+        g_bulkLastRxTime = 0.0;
+
+        Address sinkAddress(InetSocketAddress(Ipv4Address::GetAny(), bulkPort));
+        PacketSinkHelper packetSink("ns3::TcpSocketFactory", sinkAddress);
+        ApplicationContainer sinkApps =
+            packetSink.Install(servers.Get(serverIndex(bulkDstLeaf, bulkDstServer)));
+        sinkApps.Get(0)->TraceConnectWithoutContext("Rx", MakeCallback(&BulkSinkRxTrace));
+        sinkApps.Start(Seconds(0.1));
+        sinkApps.Stop(Seconds(simTime));
+
+        Address bulkRemoteAddress(InetSocketAddress(bulkDstAddress, bulkPort));
+        BulkSendHelper bulkSender("ns3::TcpSocketFactory", bulkRemoteAddress);
+        bulkSender.SetAttribute("MaxBytes", UintegerValue(bulkMaxBytes));
+        ApplicationContainer bulkApps =
+            bulkSender.Install(servers.Get(serverIndex(bulkSrcLeaf, bulkSrcServer)));
+        bulkApps.Start(Seconds(bulkStart));
+        bulkApps.Stop(Seconds(simTime));
     }
 
     std::cout << "[HYBRID-DCN] experimentName   = " << experimentName << std::endl;
@@ -319,6 +429,35 @@ main(int argc, char* argv[])
               << " s" << std::endl;
     std::cout << "[HYBRID-DCN] echoCount       = " << (enableEcho ? echoCount : 0)
               << std::endl;
+    std::cout << "[HYBRID-DCN] enableBulk     = " << (enableBulk ? "true" : "false")
+              << std::endl;
+    std::cout << "[HYBRID-DCN] bulkSrc        = " << (enableBulk ? bulkSrcName : "N/A")
+              << std::endl;
+    std::cout << "[HYBRID-DCN] bulkDst        = " << (enableBulk ? bulkDstName : "N/A")
+              << std::endl;
+    std::cout << "[HYBRID-DCN] bulkDstAddress = ";
+    if (enableBulk)
+    {
+        std::cout << bulkDstAddress;
+    }
+    else
+    {
+        std::cout << "N/A";
+    }
+    std::cout << std::endl;
+    std::cout << "[HYBRID-DCN] bulkMaxBytes   = " << (enableBulk ? bulkMaxBytes : 0)
+              << std::endl;
+    std::cout << "[HYBRID-DCN] bulkStart      = " << (enableBulk ? bulkStart : 0.0) << " s"
+              << std::endl;
+    std::cout << "[HYBRID-DCN] bulkPort       = " << (enableBulk ? bulkPort : 0)
+              << std::endl;
+
+    if (enableEcho && enableBulk)
+    {
+        std::cout << "[HYBRID-DCN][WARN] Echo and Bulk are both enabled; Stage-3 metrics are for "
+                     "engineering validation only."
+                  << std::endl;
+    }
 
     AnimationInterface anim("../sim/results/raw/hybrid-dcn-anim.xml");
     anim.EnablePacketMetadata(true);
@@ -357,6 +496,47 @@ main(int argc, char* argv[])
     Simulator::Stop(Seconds(simTime));
     Simulator::Run();
     Simulator::Destroy();
+
+    std::cout << "[HYBRID-DCN][BULK] enabled          = " << (enableBulk ? "true" : "false")
+              << std::endl;
+    if (enableBulk)
+    {
+        const double activeDuration = simTime - bulkStart;
+        const double observedFct = g_bulkSeenFirstRx ? (g_bulkLastRxTime - g_bulkFirstRxTime) : 0.0;
+        const double avgGoodputMbps =
+            static_cast<double>(g_bulkRxBytes) * 8.0 / activeDuration / 1e6;
+
+        std::cout << "[HYBRID-DCN][BULK] src              = " << bulkSrcName << std::endl;
+        std::cout << "[HYBRID-DCN][BULK] dst              = " << bulkDstName << std::endl;
+        std::cout << "[HYBRID-DCN][BULK] dstAddress       = " << bulkDstAddress << std::endl;
+        std::cout << "[HYBRID-DCN][BULK] bulkMaxBytes     = " << bulkMaxBytes << std::endl;
+        std::cout << "[HYBRID-DCN][BULK] rxBytes          = " << g_bulkRxBytes << std::endl;
+        std::cout << "[HYBRID-DCN][BULK] firstRxTime      = "
+                  << (g_bulkSeenFirstRx ? g_bulkFirstRxTime : 0.0) << " s" << std::endl;
+        std::cout << "[HYBRID-DCN][BULK] lastRxTime       = "
+                  << (g_bulkSeenFirstRx ? g_bulkLastRxTime : 0.0) << " s" << std::endl;
+        std::cout << "[HYBRID-DCN][BULK] observedFct      = " << observedFct << " s"
+                  << std::endl;
+        std::cout << "[HYBRID-DCN][BULK] avgGoodputMbps   = " << avgGoodputMbps << " Mbps"
+                  << std::endl;
+
+        if (g_bulkRxBytes == 0)
+        {
+            std::cout << "[HYBRID-DCN][BULK][WARN] No bytes received by PacketSink." << std::endl;
+        }
+    }
+    else
+    {
+        std::cout << "[HYBRID-DCN][BULK] src              = N/A" << std::endl;
+        std::cout << "[HYBRID-DCN][BULK] dst              = N/A" << std::endl;
+        std::cout << "[HYBRID-DCN][BULK] dstAddress       = N/A" << std::endl;
+        std::cout << "[HYBRID-DCN][BULK] bulkMaxBytes     = 0" << std::endl;
+        std::cout << "[HYBRID-DCN][BULK] rxBytes          = 0" << std::endl;
+        std::cout << "[HYBRID-DCN][BULK] firstRxTime      = 0 s" << std::endl;
+        std::cout << "[HYBRID-DCN][BULK] lastRxTime       = 0 s" << std::endl;
+        std::cout << "[HYBRID-DCN][BULK] observedFct      = 0 s" << std::endl;
+        std::cout << "[HYBRID-DCN][BULK] avgGoodputMbps   = 0 Mbps" << std::endl;
+    }
 
     std::cout << "[OK] Hybrid Core DCN topology build completed." << std::endl;
 
