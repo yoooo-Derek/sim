@@ -163,6 +163,7 @@ main(int argc, char* argv[])
     std::string ocsDataRate = "100Gbps";
     std::string ocsDelay = "5us";
     std::string routeMode = "global";
+    bool enableMatrixSelect = true;
 
     const uint32_t bulkSrcLeaf = 0;
     const uint32_t bulkSrcServer = 0;
@@ -197,6 +198,7 @@ main(int argc, char* argv[])
     cmd.AddValue("ocsDataRate", "Static OCS lightpath data rate.", ocsDataRate);
     cmd.AddValue("ocsDelay", "Static OCS lightpath delay.", ocsDelay);
     cmd.AddValue("routeMode", "Routing mode: global or ocs-forced.", routeMode);
+    cmd.AddValue("enableMatrixSelect", "Select the static OCS Leaf pair from a built-in ToR traffic matrix.", enableMatrixSelect);
     cmd.Parse(argc, argv);
 
     if (simTime <= 0)
@@ -227,6 +229,75 @@ main(int argc, char* argv[])
     {
         std::cerr << "[HYBRID-DCN][ERROR] routeMode must be global or ocs-forced." << std::endl;
         return 1;
+    }
+
+    if (enableMatrixSelect)
+    {
+        if (numLeaves < 4)
+        {
+            std::cerr
+                << "[HYBRID-DCN][ERROR] numLeaves must be at least 4 when enableMatrixSelect is true."
+                << std::endl;
+            return 1;
+        }
+
+        if (!enableStaticOcs)
+        {
+            std::cerr
+                << "[HYBRID-DCN][ERROR] enableMatrixSelect=true requires enableStaticOcs=true."
+                << std::endl;
+            return 1;
+        }
+    }
+
+    std::vector<std::vector<double>> torTrafficMatrix(numLeaves,
+                                                      std::vector<double>(numLeaves, 0.0));
+    for (uint32_t i = 0; i < numLeaves; ++i)
+    {
+        for (uint32_t j = i + 1; j < numLeaves; ++j)
+        {
+            torTrafficMatrix[i][j] = 10.0;
+            torTrafficMatrix[j][i] = 10.0;
+        }
+    }
+    if (numLeaves >= 4)
+    {
+        torTrafficMatrix[0][3] = 100.0;
+        torTrafficMatrix[3][0] = 100.0;
+    }
+    if (numLeaves >= 3)
+    {
+        torTrafficMatrix[1][2] = 30.0;
+        torTrafficMatrix[2][1] = 30.0;
+    }
+
+    double selectedOcsWeight = 0.0;
+    if (enableMatrixSelect)
+    {
+        uint32_t bestI = 0;
+        uint32_t bestJ = 1;
+        double bestWeight = torTrafficMatrix[bestI][bestJ];
+        for (uint32_t i = 0; i < numLeaves; ++i)
+        {
+            for (uint32_t j = i + 1; j < numLeaves; ++j)
+            {
+                if (torTrafficMatrix[i][j] > bestWeight)
+                {
+                    bestI = i;
+                    bestJ = j;
+                    bestWeight = torTrafficMatrix[i][j];
+                }
+            }
+        }
+        ocsLeafA = bestI;
+        ocsLeafB = bestJ;
+        selectedOcsWeight = bestWeight;
+
+        if (routeMode != "ocs-forced")
+        {
+            std::cout << "[HYBRID-DCN][MATRIX][WARN] Matrix-selected OCS pair is most meaningful with routeMode=ocs-forced."
+                      << std::endl;
+        }
     }
 
     if (enableEcho)
@@ -806,6 +877,17 @@ main(int argc, char* argv[])
               << (enableResidualBulk ? residualBulkStart : 0.0) << " s" << std::endl;
     std::cout << "[HYBRID-DCN] residualBulkPort       = "
               << (enableResidualBulk ? residualBulkPort : 0) << std::endl;
+
+    std::cout << "[HYBRID-DCN][MATRIX] enableMatrixSelect = "
+              << (enableMatrixSelect ? "true" : "false") << std::endl;
+    std::cout << "[HYBRID-DCN][MATRIX] selectedOcsLeafA   = " << ocsLeafA << std::endl;
+    std::cout << "[HYBRID-DCN][MATRIX] selectedOcsLeafB   = " << ocsLeafB << std::endl;
+    std::cout << "[HYBRID-DCN][MATRIX] selectedWeight     = "
+              << (enableMatrixSelect ? selectedOcsWeight : 0.0) << std::endl;
+    std::cout << "[HYBRID-DCN][MATRIX] traffic[0][3]      = "
+              << (numLeaves >= 4 ? torTrafficMatrix[0][3] : 0.0) << std::endl;
+    std::cout << "[HYBRID-DCN][MATRIX] traffic[1][2]      = "
+              << (numLeaves >= 3 ? torTrafficMatrix[1][2] : 0.0) << std::endl;
 
     if (enableEcho && enableBulk)
     {
