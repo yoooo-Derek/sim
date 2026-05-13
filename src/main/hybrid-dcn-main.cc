@@ -22,6 +22,8 @@ double g_bulkFirstRxTime = 0.0;
 double g_bulkLastRxTime = 0.0;
 uint64_t g_ocsTxPackets = 0;
 uint64_t g_ocsTxBytes = 0;
+uint64_t g_epsTxPackets = 0;
+uint64_t g_epsTxBytes = 0;
 uint64_t g_residualBulkRxBytes = 0;
 bool g_residualBulkSeenFirstRx = false;
 double g_residualBulkFirstRxTime = 0.0;
@@ -61,6 +63,13 @@ OcsTxTrace(Ptr<const Packet> packet)
 {
     g_ocsTxPackets += 1;
     g_ocsTxBytes += packet->GetSize();
+}
+
+void
+EpsTxTrace(Ptr<const Packet> packet)
+{
+    g_epsTxPackets += 1;
+    g_epsTxBytes += packet->GetSize();
 }
 
 void
@@ -522,6 +531,8 @@ main(int argc, char* argv[])
         {
             NodeContainer pair(leaves.Get(leafIndex), spines.Get(spineIndex));
             NetDeviceContainer devices = leafSpineP2p.Install(pair);
+            devices.Get(0)->TraceConnectWithoutContext("MacTx", MakeCallback(&EpsTxTrace));
+            devices.Get(1)->TraceConnectWithoutContext("MacTx", MakeCallback(&EpsTxTrace));
             ipv4.Assign(devices);
             ipv4.NewNetwork();
         }
@@ -855,6 +866,18 @@ main(int argc, char* argv[])
     }
     std::cout << "[HYBRID-DCN][ROUTE] ocsPairHostRoutes = " << ocsPairHostRoutes
               << std::endl;
+    if (routeMode == "ocs-forced")
+    {
+        std::cout << "[HYBRID-DCN][VERIFY] coveredPairExpectedPath  = OCS" << std::endl;
+        std::cout << "[HYBRID-DCN][VERIFY] residualPairExpectedPath = EPS" << std::endl;
+    }
+    else
+    {
+        std::cout << "[HYBRID-DCN][VERIFY] coveredPairExpectedPath  = global-routing"
+                  << std::endl;
+        std::cout << "[HYBRID-DCN][VERIFY] residualPairExpectedPath = global-routing"
+                  << std::endl;
+    }
 
     AnimationInterface anim("../sim/results/raw/hybrid-dcn-anim.xml");
     anim.EnablePacketMetadata(true);
@@ -902,6 +925,8 @@ main(int argc, char* argv[])
 
     g_ocsTxPackets = 0;
     g_ocsTxBytes = 0;
+    g_epsTxPackets = 0;
+    g_epsTxBytes = 0;
 
     Simulator::Stop(Seconds(simTime));
     Simulator::Run();
@@ -1018,6 +1043,10 @@ main(int argc, char* argv[])
     std::cout << "[HYBRID-DCN][OCS] txBytes     = " << g_ocsTxBytes << std::endl;
     std::cout << "[HYBRID-DCN][OCS] observedUse = "
               << (g_ocsTxPackets > 0 ? "true" : "false") << std::endl;
+    std::cout << "[HYBRID-DCN][EPS] txPackets   = " << g_epsTxPackets << std::endl;
+    std::cout << "[HYBRID-DCN][EPS] txBytes     = " << g_epsTxBytes << std::endl;
+    std::cout << "[HYBRID-DCN][EPS] observedUse = "
+              << (g_epsTxPackets > 0 ? "true" : "false") << std::endl;
 
     std::cout << "[OK] Hybrid Core DCN topology build completed." << std::endl;
 
