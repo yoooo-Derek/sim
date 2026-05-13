@@ -75,17 +75,26 @@ EchoServerRxTrace(Ptr<const Packet> packet, const Address& from, const Address& 
               << FormatIpv4Endpoint(from) << std::endl;
 }
 
-void
-AddOcsLink(Ptr<Node> leafA, Ptr<Node> leafB)
+Ipv4InterfaceContainer
+AddOcsLink(Ptr<Node> leafA,
+           Ptr<Node> leafB,
+           const std::string& dataRate,
+           const std::string& delay,
+           Ipv4AddressHelper& ipv4)
 {
-    (void)leafA;
-    (void)leafB;
+    // Stage-4 models OCS as a static Leaf-To-Leaf L1 lightpath.
+    // No Optical Core node is created here. Later stages can call this interface
+    // from graph clustering and cross-scale scheduling modules to install dynamic
+    // optical circuits.
+    PointToPointHelper ocsP2p;
+    ocsP2p.SetDeviceAttribute("DataRate", StringValue(dataRate));
+    ocsP2p.SetChannelAttribute("Delay", StringValue(delay));
 
-    // Stage-1.5 does not instantiate OCS links.
-    // Later stages will use this interface to install Leaf-To-Leaf direct L1
-    // lightpaths with DataRate = 100Gbps and Delay = 5us.
-    // The graph clustering and cross-scale cooperative scheduling modules will
-    // call this interface when dynamic optical circuit setup is introduced.
+    NodeContainer pair(leafA, leafB);
+    NetDeviceContainer devices = ocsP2p.Install(pair);
+    Ipv4InterfaceContainer interfaces = ipv4.Assign(devices);
+    ipv4.NewNetwork();
+    return interfaces;
 }
 
 int
@@ -104,6 +113,11 @@ main(int argc, char* argv[])
     uint64_t bulkMaxBytes = 1048576;
     double bulkStart = 0.2;
     uint16_t bulkPort = 10000;
+    bool enableStaticOcs = true;
+    uint32_t ocsLeafA = 0;
+    uint32_t ocsLeafB = 3;
+    std::string ocsDataRate = "100Gbps";
+    std::string ocsDelay = "5us";
 
     CommandLine cmd(__FILE__);
     cmd.AddValue("simTime", "Simulation time in seconds.", simTime);
@@ -119,6 +133,11 @@ main(int argc, char* argv[])
     cmd.AddValue("bulkMaxBytes", "TCP BulkSend maximum bytes to send.", bulkMaxBytes);
     cmd.AddValue("bulkStart", "TCP BulkSend application start time in seconds.", bulkStart);
     cmd.AddValue("bulkPort", "TCP PacketSink listening port.", bulkPort);
+    cmd.AddValue("enableStaticOcs", "Enable the Stage-4 static Leaf-To-Leaf OCS lightpath.", enableStaticOcs);
+    cmd.AddValue("ocsLeafA", "First Leaf/ToR index for the static OCS lightpath.", ocsLeafA);
+    cmd.AddValue("ocsLeafB", "Second Leaf/ToR index for the static OCS lightpath.", ocsLeafB);
+    cmd.AddValue("ocsDataRate", "Static OCS lightpath data rate.", ocsDataRate);
+    cmd.AddValue("ocsDelay", "Static OCS lightpath delay.", ocsDelay);
     cmd.Parse(argc, argv);
 
     if (simTime <= 0)
@@ -240,12 +259,55 @@ main(int argc, char* argv[])
         }
     }
 
+    if (enableStaticOcs)
+    {
+        if (numLeaves <= 1)
+        {
+            std::cerr
+                << "[HYBRID-DCN][ERROR] numLeaves must be greater than 1 when enableStaticOcs is true."
+                << std::endl;
+            return 1;
+        }
+
+        if (ocsLeafA >= numLeaves)
+        {
+            std::cerr << "[HYBRID-DCN][ERROR] ocsLeafA must be less than numLeaves." << std::endl;
+            return 1;
+        }
+
+        if (ocsLeafB >= numLeaves)
+        {
+            std::cerr << "[HYBRID-DCN][ERROR] ocsLeafB must be less than numLeaves." << std::endl;
+            return 1;
+        }
+
+        if (ocsLeafA == ocsLeafB)
+        {
+            std::cerr << "[HYBRID-DCN][ERROR] ocsLeafA and ocsLeafB must be different."
+                      << std::endl;
+            return 1;
+        }
+
+        if (ocsDataRate.empty())
+        {
+            std::cerr << "[HYBRID-DCN][ERROR] ocsDataRate must not be empty." << std::endl;
+            return 1;
+        }
+
+        if (ocsDelay.empty())
+        {
+            std::cerr << "[HYBRID-DCN][ERROR] ocsDelay must not be empty." << std::endl;
+            return 1;
+        }
+    }
+
     const uint32_t totalServers = numLeaves * serversPerLeaf;
     const uint32_t totalNodes = totalServers + numLeaves + numSpines;
     const uint32_t serverLeafLinks = totalServers;
     const uint32_t leafSpineLinks = numLeaves * numSpines;
     const uint32_t epsLinksCount = serverLeafLinks + leafSpineLinks;
-    const uint32_t reservedOcsLinks = 0;
+    uint32_t staticOcsLinks = 0;
+    uint32_t reservedOcsLinks = 0;
 
     NodeContainer servers;
     NodeContainer leaves;
@@ -323,6 +385,18 @@ main(int argc, char* argv[])
             ipv4.Assign(devices);
             ipv4.NewNetwork();
         }
+    }
+
+    Ipv4Address ocsLeafAAddress("0.0.0.0");
+    Ipv4Address ocsLeafBAddress("0.0.0.0");
+    if (enableStaticOcs)
+    {
+        Ipv4InterfaceContainer ocsInterfaces =
+            AddOcsLink(leaves.Get(ocsLeafA), leaves.Get(ocsLeafB), ocsDataRate, ocsDelay, ipv4);
+        ocsLeafAAddress = ocsInterfaces.GetAddress(0);
+        ocsLeafBAddress = ocsInterfaces.GetAddress(1);
+        staticOcsLinks = 1;
+        reservedOcsLinks = 1;
     }
 
     Ipv4GlobalRoutingHelper::PopulateRoutingTables();
@@ -407,6 +481,33 @@ main(int argc, char* argv[])
     std::cout << "[HYBRID-DCN] leafSpineLinks   = " << leafSpineLinks << std::endl;
     std::cout << "[HYBRID-DCN] epsLinksCount    = " << epsLinksCount << std::endl;
     std::cout << "[HYBRID-DCN] reservedOcsLinks = " << reservedOcsLinks << std::endl;
+    std::cout << "[HYBRID-DCN] enableStaticOcs = " << (enableStaticOcs ? "true" : "false")
+              << std::endl;
+    std::cout << "[HYBRID-DCN] ocsLeafA        = " << ocsLeafA << std::endl;
+    std::cout << "[HYBRID-DCN] ocsLeafB        = " << ocsLeafB << std::endl;
+    std::cout << "[HYBRID-DCN] ocsDataRate     = " << ocsDataRate << std::endl;
+    std::cout << "[HYBRID-DCN] ocsDelay        = " << ocsDelay << std::endl;
+    std::cout << "[HYBRID-DCN] staticOcsLinks  = " << staticOcsLinks << std::endl;
+    std::cout << "[HYBRID-DCN] ocsLeafAAddress = ";
+    if (enableStaticOcs)
+    {
+        std::cout << ocsLeafAAddress;
+    }
+    else
+    {
+        std::cout << "N/A";
+    }
+    std::cout << std::endl;
+    std::cout << "[HYBRID-DCN] ocsLeafBAddress = ";
+    if (enableStaticOcs)
+    {
+        std::cout << ocsLeafBAddress;
+    }
+    else
+    {
+        std::cout << "N/A";
+    }
+    std::cout << std::endl;
     std::cout << "[HYBRID-DCN] enableEcho      = " << (enableEcho ? "true" : "false")
               << std::endl;
     std::cout << "[HYBRID-DCN] echoSrc         = " << (enableEcho ? echoSrcName : "N/A")
@@ -461,6 +562,16 @@ main(int argc, char* argv[])
 
     AnimationInterface anim("../sim/results/raw/hybrid-dcn-anim.xml");
     anim.EnablePacketMetadata(true);
+    if (enableStaticOcs)
+    {
+        std::ostringstream leafADescription;
+        leafADescription << "leaf-" << ocsLeafA << "-OCS";
+        anim.UpdateNodeDescription(leaves.Get(ocsLeafA), leafADescription.str());
+
+        std::ostringstream leafBDescription;
+        leafBDescription << "leaf-" << ocsLeafB << "-OCS";
+        anim.UpdateNodeDescription(leaves.Get(ocsLeafB), leafBDescription.str());
+    }
 
     const double layerXOffset = 40.0;
     const double layerSpacing = 40.0;
@@ -502,7 +613,12 @@ main(int argc, char* argv[])
     if (enableBulk)
     {
         const double activeDuration = simTime - bulkStart;
-        const double observedFct = g_bulkSeenFirstRx ? (g_bulkLastRxTime - g_bulkFirstRxTime) : 0.0;
+        const double observedFct = g_bulkSeenFirstRx ? (g_bulkLastRxTime - bulkStart) : 0.0;
+        const double rxDuration = g_bulkSeenFirstRx ? (g_bulkLastRxTime - g_bulkFirstRxTime) : 0.0;
+        const double completionRatio =
+            bulkMaxBytes > 0 ? static_cast<double>(g_bulkRxBytes) / static_cast<double>(bulkMaxBytes)
+                             : 0.0;
+        const bool completed = (g_bulkRxBytes >= bulkMaxBytes);
         const double avgGoodputMbps =
             static_cast<double>(g_bulkRxBytes) * 8.0 / activeDuration / 1e6;
 
@@ -517,12 +633,23 @@ main(int argc, char* argv[])
                   << (g_bulkSeenFirstRx ? g_bulkLastRxTime : 0.0) << " s" << std::endl;
         std::cout << "[HYBRID-DCN][BULK] observedFct      = " << observedFct << " s"
                   << std::endl;
+        std::cout << "[HYBRID-DCN][BULK] rxDuration       = " << rxDuration << " s"
+                  << std::endl;
+        std::cout << "[HYBRID-DCN][BULK] completionRatio  = " << completionRatio << std::endl;
+        std::cout << "[HYBRID-DCN][BULK] completed        = "
+                  << (completed ? "true" : "false") << std::endl;
         std::cout << "[HYBRID-DCN][BULK] avgGoodputMbps   = " << avgGoodputMbps << " Mbps"
                   << std::endl;
 
         if (g_bulkRxBytes == 0)
         {
             std::cout << "[HYBRID-DCN][BULK][WARN] No bytes received by PacketSink." << std::endl;
+        }
+
+        if (!completed)
+        {
+            std::cout << "[HYBRID-DCN][BULK][WARN] Bulk flow did not complete before simTime."
+                      << std::endl;
         }
     }
     else
@@ -535,6 +662,9 @@ main(int argc, char* argv[])
         std::cout << "[HYBRID-DCN][BULK] firstRxTime      = 0 s" << std::endl;
         std::cout << "[HYBRID-DCN][BULK] lastRxTime       = 0 s" << std::endl;
         std::cout << "[HYBRID-DCN][BULK] observedFct      = 0 s" << std::endl;
+        std::cout << "[HYBRID-DCN][BULK] rxDuration       = 0 s" << std::endl;
+        std::cout << "[HYBRID-DCN][BULK] completionRatio  = 0" << std::endl;
+        std::cout << "[HYBRID-DCN][BULK] completed        = false" << std::endl;
         std::cout << "[HYBRID-DCN][BULK] avgGoodputMbps   = 0 Mbps" << std::endl;
     }
 
