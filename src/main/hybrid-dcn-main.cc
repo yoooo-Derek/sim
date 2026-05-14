@@ -27,6 +27,19 @@ struct OcsCandidateEdge
     double utility;
 };
 
+struct OcsInstalledLink
+{
+    uint32_t leafA;
+    uint32_t leafB;
+    Ipv4Address leafAAddress;
+    Ipv4Address leafBAddress;
+    uint32_t leafAIfIndex;
+    uint32_t leafBIfIndex;
+    NetDeviceContainer devices;
+    double traffic;
+    double utility;
+};
+
 uint64_t g_bulkRxBytes = 0;
 bool g_bulkSeenFirstRx = false;
 double g_bulkFirstRxTime = 0.0;
@@ -39,6 +52,10 @@ uint64_t g_residualBulkRxBytes = 0;
 bool g_residualBulkSeenFirstRx = false;
 double g_residualBulkFirstRxTime = 0.0;
 double g_residualBulkLastRxTime = 0.0;
+uint64_t g_secondBulkRxBytes = 0;
+bool g_secondBulkSeenFirstRx = false;
+double g_secondBulkFirstRxTime = 0.0;
+double g_secondBulkLastRxTime = 0.0;
 
 std::string
 FormatIpv4Endpoint(const Address& address)
@@ -96,6 +113,21 @@ ResidualBulkSinkRxTrace(Ptr<const Packet> packet, const Address& from)
         g_residualBulkFirstRxTime = now;
     }
     g_residualBulkLastRxTime = now;
+}
+
+void
+SecondBulkSinkRxTrace(Ptr<const Packet> packet, const Address& from)
+{
+    (void)from;
+    g_secondBulkRxBytes += packet->GetSize();
+
+    const double now = Simulator::Now().GetSeconds();
+    if (!g_secondBulkSeenFirstRx)
+    {
+        g_secondBulkSeenFirstRx = true;
+        g_secondBulkFirstRxTime = now;
+    }
+    g_secondBulkLastRxTime = now;
 }
 
 void
@@ -164,6 +196,10 @@ main(int argc, char* argv[])
     uint64_t bulkMaxBytes = 1048576;
     double bulkStart = 0.2;
     uint16_t bulkPort = 10000;
+    bool enableSecondBulk = true;
+    uint16_t secondBulkPort = 10002;
+    uint64_t secondBulkMaxBytes = 1048576;
+    double secondBulkStart = 0.3;
     bool enableResidualBulk = true;
     uint16_t residualBulkPort = 10001;
     uint64_t residualBulkMaxBytes = 1048576;
@@ -184,9 +220,13 @@ main(int argc, char* argv[])
     const uint32_t bulkSrcServer = 0;
     const uint32_t bulkDstLeaf = 3;
     const uint32_t bulkDstServer = 0;
-    const uint32_t residualBulkSrcLeaf = 1;
-    const uint32_t residualBulkSrcServer = 0;
-    const uint32_t residualBulkDstLeaf = 2;
+    const uint32_t secondBulkSrcLeaf = 1;
+    const uint32_t secondBulkSrcServer = 0;
+    const uint32_t secondBulkDstLeaf = 2;
+    const uint32_t secondBulkDstServer = 0;
+    const uint32_t residualBulkSrcLeaf = 0;
+    const uint32_t residualBulkSrcServer = 1;
+    const uint32_t residualBulkDstLeaf = 1;
     const uint32_t residualBulkDstServer = 0;
 
     CommandLine cmd(__FILE__);
@@ -203,6 +243,10 @@ main(int argc, char* argv[])
     cmd.AddValue("bulkMaxBytes", "TCP BulkSend maximum bytes to send.", bulkMaxBytes);
     cmd.AddValue("bulkStart", "TCP BulkSend application start time in seconds.", bulkStart);
     cmd.AddValue("bulkPort", "TCP PacketSink listening port.", bulkPort);
+    cmd.AddValue("enableSecondBulk", "Enable the Stage-11 second OCS-covered BulkSend validation flow.", enableSecondBulk);
+    cmd.AddValue("secondBulkPort", "Second TCP PacketSink listening port.", secondBulkPort);
+    cmd.AddValue("secondBulkMaxBytes", "Second TCP BulkSend maximum bytes to send.", secondBulkMaxBytes);
+    cmd.AddValue("secondBulkStart", "Second TCP BulkSend application start time in seconds.", secondBulkStart);
     cmd.AddValue("enableResidualBulk", "Enable the Stage-6 residual EPS BulkSend validation flow.", enableResidualBulk);
     cmd.AddValue("residualBulkPort", "Residual TCP PacketSink listening port.", residualBulkPort);
     cmd.AddValue("residualBulkMaxBytes", "Residual TCP BulkSend maximum bytes to send.", residualBulkMaxBytes);
@@ -543,12 +587,12 @@ main(int argc, char* argv[])
         }
     }
 
-    if (enableResidualBulk)
+    if (enableSecondBulk)
     {
         if (numLeaves < 3)
         {
             std::cerr
-                << "[HYBRID-DCN][ERROR] numLeaves must be at least 3 when enableResidualBulk is true."
+                << "[HYBRID-DCN][ERROR] numLeaves must be at least 3 when enableSecondBulk is true."
                 << std::endl;
             return 1;
         }
@@ -556,7 +600,61 @@ main(int argc, char* argv[])
         if (serversPerLeaf < 1)
         {
             std::cerr << "[HYBRID-DCN][ERROR] serversPerLeaf must be at least 1 when "
-                         "enableResidualBulk is true."
+                         "enableSecondBulk is true."
+                      << std::endl;
+            return 1;
+        }
+
+        if (secondBulkPort == 0)
+        {
+            std::cerr << "[HYBRID-DCN][ERROR] secondBulkPort must be greater than 0."
+                      << std::endl;
+            return 1;
+        }
+
+        if (secondBulkMaxBytes == 0)
+        {
+            std::cerr << "[HYBRID-DCN][ERROR] secondBulkMaxBytes must be greater than 0."
+                      << std::endl;
+            return 1;
+        }
+
+        if (secondBulkStart < 0)
+        {
+            std::cerr << "[HYBRID-DCN][ERROR] secondBulkStart must be greater than or equal to 0."
+                      << std::endl;
+            return 1;
+        }
+
+        if (secondBulkStart >= simTime)
+        {
+            std::cerr << "[HYBRID-DCN][ERROR] secondBulkStart must be less than simTime."
+                      << std::endl;
+            return 1;
+        }
+
+        if ((simTime - secondBulkStart) <= 0.1)
+        {
+            std::cerr
+                << "[HYBRID-DCN][ERROR] simTime - secondBulkStart must be greater than 0.1."
+                << std::endl;
+            return 1;
+        }
+    }
+
+    if (enableResidualBulk)
+    {
+        if (numLeaves < 2)
+        {
+            std::cerr
+                << "[HYBRID-DCN][ERROR] numLeaves must be at least 2 when enableResidualBulk is true."
+                << std::endl;
+            return 1;
+        }
+
+        if (serversPerLeaf < 2)
+        {
+            std::cerr << "[HYBRID-DCN][ERROR] enableResidualBulk requires serversPerLeaf >= 2."
                       << std::endl;
             return 1;
         }
@@ -759,26 +857,61 @@ main(int argc, char* argv[])
 
     Ipv4Address ocsLeafAAddress("0.0.0.0");
     Ipv4Address ocsLeafBAddress("0.0.0.0");
-    uint32_t ocsLeafAIfIndex = 0;
-    uint32_t ocsLeafBIfIndex = 0;
-    NetDeviceContainer ocsDevices;
+    std::vector<OcsInstalledLink> installedOcsLinks;
     if (enableStaticOcs)
     {
-        Ipv4InterfaceContainer ocsInterfaces =
-            AddOcsLink(leaves.Get(ocsLeafA),
-                       leaves.Get(ocsLeafB),
-                       ocsDataRate,
-                       ocsDelay,
-                       ipv4,
-                       ocsDevices);
-        ocsLeafAAddress = ocsInterfaces.GetAddress(0);
-        ocsLeafBAddress = ocsInterfaces.GetAddress(1);
-        ocsLeafAIfIndex = ocsInterfaces.Get(0).second;
-        ocsLeafBIfIndex = ocsInterfaces.Get(1).second;
-        ocsDevices.Get(0)->TraceConnectWithoutContext("MacTx", MakeCallback(&OcsTxTrace));
-        ocsDevices.Get(1)->TraceConnectWithoutContext("MacTx", MakeCallback(&OcsTxTrace));
-        staticOcsLinks = 1;
-        reservedOcsLinks = 1;
+        std::vector<OcsCandidateEdge> edgesToInstall;
+        if (enableMatrixSelect)
+        {
+            edgesToInstall = selectedOcsEdges;
+        }
+        else
+        {
+            edgesToInstall.push_back({ocsLeafA,
+                                      ocsLeafB,
+                                      torTrafficMatrix[ocsLeafA][ocsLeafB],
+                                      expectedTraffic[ocsLeafA][ocsLeafB],
+                                      modularityGain[ocsLeafA][ocsLeafB],
+                                      ocsUtility[ocsLeafA][ocsLeafB]});
+        }
+
+        for (const auto& edge : edgesToInstall)
+        {
+            NetDeviceContainer linkDevices;
+            Ipv4InterfaceContainer ocsInterfaces =
+                AddOcsLink(leaves.Get(edge.leafA),
+                           leaves.Get(edge.leafB),
+                           ocsDataRate,
+                           ocsDelay,
+                           ipv4,
+                           linkDevices);
+            linkDevices.Get(0)->TraceConnectWithoutContext("MacTx", MakeCallback(&OcsTxTrace));
+            linkDevices.Get(1)->TraceConnectWithoutContext("MacTx", MakeCallback(&OcsTxTrace));
+
+            installedOcsLinks.push_back({edge.leafA,
+                                         edge.leafB,
+                                         ocsInterfaces.GetAddress(0),
+                                         ocsInterfaces.GetAddress(1),
+                                         ocsInterfaces.Get(0).second,
+                                         ocsInterfaces.Get(1).second,
+                                         linkDevices,
+                                         edge.traffic,
+                                         edge.utility});
+        }
+
+        if (installedOcsLinks.empty())
+        {
+            std::cerr << "[HYBRID-DCN][ERROR] enableStaticOcs=true but no OCS link was installed."
+                      << std::endl;
+            return 1;
+        }
+
+        ocsLeafA = installedOcsLinks.front().leafA;
+        ocsLeafB = installedOcsLinks.front().leafB;
+        ocsLeafAAddress = installedOcsLinks.front().leafAAddress;
+        ocsLeafBAddress = installedOcsLinks.front().leafBAddress;
+        staticOcsLinks = static_cast<uint32_t>(installedOcsLinks.size());
+        reservedOcsLinks = staticOcsLinks;
     }
 
     Ipv4GlobalRoutingHelper::PopulateRoutingTables();
@@ -787,6 +920,9 @@ main(int argc, char* argv[])
                                                    : Ipv4Address("0.0.0.0");
     const Ipv4Address bulkDstAddress = enableBulk ? serverIpv4[bulkDstLeaf][bulkDstServer]
                                                    : Ipv4Address("0.0.0.0");
+    const Ipv4Address secondBulkDstAddress =
+        enableSecondBulk ? serverIpv4[secondBulkDstLeaf][secondBulkDstServer]
+                         : Ipv4Address("0.0.0.0");
     const Ipv4Address residualBulkDstAddress =
         enableResidualBulk ? serverIpv4[residualBulkDstLeaf][residualBulkDstServer]
                            : Ipv4Address("0.0.0.0");
@@ -796,38 +932,46 @@ main(int argc, char* argv[])
     {
         Ipv4StaticRoutingHelper staticRoutingHelper;
 
-        Ptr<Ipv4StaticRouting> leafARouting =
-            staticRoutingHelper.GetStaticRouting(leaves.Get(ocsLeafA)->GetObject<Ipv4>());
-        Ptr<Ipv4StaticRouting> leafBRouting =
-            staticRoutingHelper.GetStaticRouting(leaves.Get(ocsLeafB)->GetObject<Ipv4>());
+        auto applyOcsPairHostRoutes = [&](const OcsInstalledLink& link) {
+            Ptr<Ipv4StaticRouting> leafARouting =
+                staticRoutingHelper.GetStaticRouting(leaves.Get(link.leafA)->GetObject<Ipv4>());
+            Ptr<Ipv4StaticRouting> leafBRouting =
+                staticRoutingHelper.GetStaticRouting(leaves.Get(link.leafB)->GetObject<Ipv4>());
 
-        for (uint32_t serverOffsetA = 0; serverOffsetA < serversPerLeaf; ++serverOffsetA)
-        {
-            Ptr<Ipv4StaticRouting> serverARouting = staticRoutingHelper.GetStaticRouting(
-                servers.Get(serverIndex(ocsLeafA, serverOffsetA))->GetObject<Ipv4>());
-
-            for (uint32_t serverOffsetB = 0; serverOffsetB < serversPerLeaf; ++serverOffsetB)
+            for (uint32_t serverOffsetA = 0; serverOffsetA < serversPerLeaf; ++serverOffsetA)
             {
-                const Ipv4Address dstB = serverIpv4[ocsLeafB][serverOffsetB];
-                const Ipv4Address dstA = serverIpv4[ocsLeafA][serverOffsetA];
+                Ptr<Ipv4StaticRouting> serverARouting = staticRoutingHelper.GetStaticRouting(
+                    servers.Get(serverIndex(link.leafA, serverOffsetA))->GetObject<Ipv4>());
 
-                serverARouting->AddHostRouteTo(dstB,
-                                               leafServerIpv4[ocsLeafA][serverOffsetA],
-                                               serverIfIndex[ocsLeafA][serverOffsetA]);
-                leafARouting->AddHostRouteTo(dstB, ocsLeafBAddress, ocsLeafAIfIndex);
+                for (uint32_t serverOffsetB = 0; serverOffsetB < serversPerLeaf; ++serverOffsetB)
+                {
+                    const Ipv4Address dstB = serverIpv4[link.leafB][serverOffsetB];
+                    const Ipv4Address dstA = serverIpv4[link.leafA][serverOffsetA];
 
-                leafBRouting->AddHostRouteTo(dstA, ocsLeafAAddress, ocsLeafBIfIndex);
+                    serverARouting->AddHostRouteTo(dstB,
+                                                   leafServerIpv4[link.leafA][serverOffsetA],
+                                                   serverIfIndex[link.leafA][serverOffsetA]);
+                    leafARouting->AddHostRouteTo(dstB, link.leafBAddress, link.leafAIfIndex);
 
-                Ptr<Ipv4StaticRouting> serverBRouting = staticRoutingHelper.GetStaticRouting(
-                    servers.Get(serverIndex(ocsLeafB, serverOffsetB))->GetObject<Ipv4>());
-                serverBRouting->AddHostRouteTo(dstA,
-                                               leafServerIpv4[ocsLeafB][serverOffsetB],
-                                               serverIfIndex[ocsLeafB][serverOffsetB]);
+                    leafBRouting->AddHostRouteTo(dstA, link.leafAAddress, link.leafBIfIndex);
+
+                    Ptr<Ipv4StaticRouting> serverBRouting = staticRoutingHelper.GetStaticRouting(
+                        servers.Get(serverIndex(link.leafB, serverOffsetB))->GetObject<Ipv4>());
+                    serverBRouting->AddHostRouteTo(dstA,
+                                                   leafServerIpv4[link.leafB][serverOffsetB],
+                                                   serverIfIndex[link.leafB][serverOffsetB]);
+                }
             }
+
+            ocsPairHostRoutes += serversPerLeaf * serversPerLeaf * 4;
+        };
+
+        for (const auto& link : installedOcsLinks)
+        {
+            applyOcsPairHostRoutes(link);
         }
 
         ocsForced = true;
-        ocsPairHostRoutes = serversPerLeaf * serversPerLeaf * 4;
     }
 
     const uint32_t echoPort = 9000;
@@ -841,8 +985,10 @@ main(int argc, char* argv[])
                                                    : Ipv4Address("0.0.0.0");
     const std::string bulkSrcName = "server-l0-s0";
     const std::string bulkDstName = "server-l3-s0";
-    const std::string residualBulkSrcName = "server-l1-s0";
-    const std::string residualBulkDstName = "server-l2-s0";
+    const std::string secondBulkSrcName = "server-l1-s0";
+    const std::string secondBulkDstName = "server-l2-s0";
+    const std::string residualBulkSrcName = "server-l0-s1";
+    const std::string residualBulkDstName = "server-l1-s0";
 
     if (enableEcho)
     {
@@ -893,6 +1039,31 @@ main(int argc, char* argv[])
             bulkSender.Install(servers.Get(serverIndex(bulkSrcLeaf, bulkSrcServer)));
         bulkApps.Start(Seconds(bulkStart));
         bulkApps.Stop(Seconds(simTime));
+    }
+
+    if (enableSecondBulk)
+    {
+        g_secondBulkRxBytes = 0;
+        g_secondBulkSeenFirstRx = false;
+        g_secondBulkFirstRxTime = 0.0;
+        g_secondBulkLastRxTime = 0.0;
+
+        Address secondSinkAddress(InetSocketAddress(Ipv4Address::GetAny(), secondBulkPort));
+        PacketSinkHelper secondPacketSink("ns3::TcpSocketFactory", secondSinkAddress);
+        ApplicationContainer secondSinkApps = secondPacketSink.Install(
+            servers.Get(serverIndex(secondBulkDstLeaf, secondBulkDstServer)));
+        secondSinkApps.Get(0)->TraceConnectWithoutContext("Rx",
+                                                          MakeCallback(&SecondBulkSinkRxTrace));
+        secondSinkApps.Start(Seconds(0.1));
+        secondSinkApps.Stop(Seconds(simTime));
+
+        Address secondRemoteAddress(InetSocketAddress(secondBulkDstAddress, secondBulkPort));
+        BulkSendHelper secondBulkSender("ns3::TcpSocketFactory", secondRemoteAddress);
+        secondBulkSender.SetAttribute("MaxBytes", UintegerValue(secondBulkMaxBytes));
+        ApplicationContainer secondBulkApps = secondBulkSender.Install(
+            servers.Get(serverIndex(secondBulkSrcLeaf, secondBulkSrcServer)));
+        secondBulkApps.Start(Seconds(secondBulkStart));
+        secondBulkApps.Stop(Seconds(simTime));
     }
 
     if (enableResidualBulk)
@@ -959,6 +1130,16 @@ main(int argc, char* argv[])
         std::cout << "N/A";
     }
     std::cout << std::endl;
+    std::cout << "[HYBRID-DCN][OCS-LINK] installedOcsLinks = "
+              << installedOcsLinks.size() << std::endl;
+    for (uint32_t linkIndex = 0; linkIndex < installedOcsLinks.size(); ++linkIndex)
+    {
+        const auto& link = installedOcsLinks[linkIndex];
+        std::cout << "[HYBRID-DCN][OCS-LINK] link[" << linkIndex << "] = " << link.leafA
+                  << "-" << link.leafB << " addrA=" << link.leafAAddress
+                  << " addrB=" << link.leafBAddress << " utility=" << link.utility
+                  << std::endl;
+    }
     std::cout << "[HYBRID-DCN] enableEcho      = " << (enableEcho ? "true" : "false")
               << std::endl;
     std::cout << "[HYBRID-DCN] echoSrc         = " << (enableEcho ? echoSrcName : "N/A")
@@ -1003,6 +1184,28 @@ main(int argc, char* argv[])
               << std::endl;
     std::cout << "[HYBRID-DCN] bulkPort       = " << (enableBulk ? bulkPort : 0)
               << std::endl;
+    std::cout << "[HYBRID-DCN] enableSecondBulk     = "
+              << (enableSecondBulk ? "true" : "false") << std::endl;
+    std::cout << "[HYBRID-DCN] secondBulkSrc        = "
+              << (enableSecondBulk ? secondBulkSrcName : "N/A") << std::endl;
+    std::cout << "[HYBRID-DCN] secondBulkDst        = "
+              << (enableSecondBulk ? secondBulkDstName : "N/A") << std::endl;
+    std::cout << "[HYBRID-DCN] secondBulkDstAddress = ";
+    if (enableSecondBulk)
+    {
+        std::cout << secondBulkDstAddress;
+    }
+    else
+    {
+        std::cout << "N/A";
+    }
+    std::cout << std::endl;
+    std::cout << "[HYBRID-DCN] secondBulkMaxBytes   = "
+              << (enableSecondBulk ? secondBulkMaxBytes : 0) << std::endl;
+    std::cout << "[HYBRID-DCN] secondBulkStart      = "
+              << (enableSecondBulk ? secondBulkStart : 0.0) << " s" << std::endl;
+    std::cout << "[HYBRID-DCN] secondBulkPort       = "
+              << (enableSecondBulk ? secondBulkPort : 0) << std::endl;
     std::cout << "[HYBRID-DCN] enableResidualBulk     = "
               << (enableResidualBulk ? "true" : "false") << std::endl;
     std::cout << "[HYBRID-DCN] residualBulkSrc        = "
@@ -1143,18 +1346,51 @@ main(int argc, char* argv[])
         std::cout << "[HYBRID-DCN][ROUTE] ocsPairLeafA      = " << ocsLeafA << std::endl;
         std::cout << "[HYBRID-DCN][ROUTE] ocsPairLeafB      = " << ocsLeafB << std::endl;
     }
+    std::cout << "[HYBRID-DCN][ROUTE] ocsPairRules      = "
+              << (ocsForced ? installedOcsLinks.size() : 0) << std::endl;
+    if (ocsForced)
+    {
+        for (uint32_t linkIndex = 0; linkIndex < installedOcsLinks.size(); ++linkIndex)
+        {
+            const auto& link = installedOcsLinks[linkIndex];
+            std::cout << "[HYBRID-DCN][ROUTE] ocsPairRule[" << linkIndex << "] = "
+                      << link.leafA << "-" << link.leafB << std::endl;
+        }
+    }
     std::cout << "[HYBRID-DCN][ROUTE] ocsPairHostRoutes = " << ocsPairHostRoutes
               << std::endl;
+    auto isOcsPairInstalled = [&installedOcsLinks](uint32_t leafA, uint32_t leafB) {
+        for (const auto& link : installedOcsLinks)
+        {
+            if ((link.leafA == leafA && link.leafB == leafB) ||
+                (link.leafA == leafB && link.leafB == leafA))
+            {
+                return true;
+            }
+        }
+        return false;
+    };
     if (routeMode == "ocs-forced")
     {
-        std::cout << "[HYBRID-DCN][VERIFY] coveredPairExpectedPath  = OCS" << std::endl;
-        std::cout << "[HYBRID-DCN][VERIFY] residualPairExpectedPath = EPS" << std::endl;
+        std::cout << "[HYBRID-DCN][VERIFY] primaryCoveredPairExpectedPath   = "
+                  << (isOcsPairInstalled(bulkSrcLeaf, bulkDstLeaf) ? "OCS" : "EPS")
+                  << std::endl;
+        std::cout << "[HYBRID-DCN][VERIFY] secondCoveredPairExpectedPath    = "
+                  << (enableSecondBulk
+                          ? (isOcsPairInstalled(secondBulkSrcLeaf, secondBulkDstLeaf) ? "OCS"
+                                                                                      : "EPS")
+                          : "disabled")
+                  << std::endl;
+        std::cout << "[HYBRID-DCN][VERIFY] residualPairExpectedPath         = EPS"
+                  << std::endl;
     }
     else
     {
-        std::cout << "[HYBRID-DCN][VERIFY] coveredPairExpectedPath  = global-routing"
+        std::cout << "[HYBRID-DCN][VERIFY] primaryCoveredPairExpectedPath   = global-routing"
                   << std::endl;
-        std::cout << "[HYBRID-DCN][VERIFY] residualPairExpectedPath = global-routing"
+        std::cout << "[HYBRID-DCN][VERIFY] secondCoveredPairExpectedPath    = "
+                  << (enableSecondBulk ? "global-routing" : "disabled") << std::endl;
+        std::cout << "[HYBRID-DCN][VERIFY] residualPairExpectedPath         = global-routing"
                   << std::endl;
     }
 
@@ -1162,13 +1398,16 @@ main(int argc, char* argv[])
     anim.EnablePacketMetadata(true);
     if (enableStaticOcs)
     {
-        std::ostringstream leafADescription;
-        leafADescription << "leaf-" << ocsLeafA << "-OCS";
-        anim.UpdateNodeDescription(leaves.Get(ocsLeafA), leafADescription.str());
+        for (const auto& link : installedOcsLinks)
+        {
+            std::ostringstream leafADescription;
+            leafADescription << "leaf-" << link.leafA << "-OCS";
+            anim.UpdateNodeDescription(leaves.Get(link.leafA), leafADescription.str());
 
-        std::ostringstream leafBDescription;
-        leafBDescription << "leaf-" << ocsLeafB << "-OCS";
-        anim.UpdateNodeDescription(leaves.Get(ocsLeafB), leafBDescription.str());
+            std::ostringstream leafBDescription;
+            leafBDescription << "leaf-" << link.leafB << "-OCS";
+            anim.UpdateNodeDescription(leaves.Get(link.leafB), leafBDescription.str());
+        }
     }
 
     const double layerXOffset = 40.0;
@@ -1269,6 +1508,48 @@ main(int argc, char* argv[])
         std::cout << "[HYBRID-DCN][BULK] completionRatio  = 0" << std::endl;
         std::cout << "[HYBRID-DCN][BULK] completed        = false" << std::endl;
         std::cout << "[HYBRID-DCN][BULK] avgGoodputMbps   = 0 Mbps" << std::endl;
+    }
+
+    std::cout << "[HYBRID-DCN][SECOND] enabled          = "
+              << (enableSecondBulk ? "true" : "false") << std::endl;
+    if (enableSecondBulk)
+    {
+        const double secondActiveDuration = simTime - secondBulkStart;
+        const double secondObservedFct =
+            g_secondBulkSeenFirstRx ? (g_secondBulkLastRxTime - secondBulkStart) : 0.0;
+        const double secondCompletionRatio =
+            secondBulkMaxBytes > 0
+                ? static_cast<double>(g_secondBulkRxBytes) /
+                      static_cast<double>(secondBulkMaxBytes)
+                : 0.0;
+        const bool secondCompleted = (g_secondBulkRxBytes >= secondBulkMaxBytes);
+        const double secondAvgGoodputMbps =
+            static_cast<double>(g_secondBulkRxBytes) * 8.0 / secondActiveDuration / 1e6;
+
+        std::cout << "[HYBRID-DCN][SECOND] src              = " << secondBulkSrcName
+                  << std::endl;
+        std::cout << "[HYBRID-DCN][SECOND] dst              = " << secondBulkDstName
+                  << std::endl;
+        std::cout << "[HYBRID-DCN][SECOND] completed        = "
+                  << (secondCompleted ? "true" : "false") << std::endl;
+        std::cout << "[HYBRID-DCN][SECOND] rxBytes          = "
+                  << g_secondBulkRxBytes << std::endl;
+        std::cout << "[HYBRID-DCN][SECOND] completionRatio  = "
+                  << secondCompletionRatio << std::endl;
+        std::cout << "[HYBRID-DCN][SECOND] observedFct      = " << secondObservedFct
+                  << " s" << std::endl;
+        std::cout << "[HYBRID-DCN][SECOND] avgGoodputMbps   = "
+                  << secondAvgGoodputMbps << " Mbps" << std::endl;
+    }
+    else
+    {
+        std::cout << "[HYBRID-DCN][SECOND] src              = N/A" << std::endl;
+        std::cout << "[HYBRID-DCN][SECOND] dst              = N/A" << std::endl;
+        std::cout << "[HYBRID-DCN][SECOND] completed        = false" << std::endl;
+        std::cout << "[HYBRID-DCN][SECOND] rxBytes          = 0" << std::endl;
+        std::cout << "[HYBRID-DCN][SECOND] completionRatio  = 0" << std::endl;
+        std::cout << "[HYBRID-DCN][SECOND] observedFct      = 0 s" << std::endl;
+        std::cout << "[HYBRID-DCN][SECOND] avgGoodputMbps   = 0 Mbps" << std::endl;
     }
 
     std::cout << "[HYBRID-DCN][RESIDUAL] enabled          = "
