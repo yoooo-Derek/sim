@@ -40,6 +40,25 @@ struct OcsInstalledLink
     double utility;
 };
 
+struct MatrixBulkFlowSpec
+{
+    uint32_t srcLeaf;
+    uint32_t dstLeaf;
+    uint32_t srcServer;
+    uint32_t dstServer;
+    uint16_t port;
+    bool ocsCovered;
+    std::string name;
+};
+
+struct MatrixBulkFlowStats
+{
+    uint64_t rxBytes;
+    bool seenFirstRx;
+    double firstRxTime;
+    double lastRxTime;
+};
+
 uint64_t g_bulkRxBytes = 0;
 bool g_bulkSeenFirstRx = false;
 double g_bulkFirstRxTime = 0.0;
@@ -215,6 +234,10 @@ main(int argc, char* argv[])
     double eta = 1.0;
     uint32_t ocsPortK = 1;
     uint32_t maxSelectedOcsLinks = 1;
+    bool enableMatrixFlows = true;
+    uint64_t matrixFlowMaxBytes = 524288;
+    double matrixFlowStart = 0.35;
+    uint16_t matrixFlowPortBase = 11000;
 
     const uint32_t bulkSrcLeaf = 0;
     const uint32_t bulkSrcServer = 0;
@@ -262,6 +285,10 @@ main(int argc, char* argv[])
     cmd.AddValue("eta", "Resolution parameter for modularity gain.", eta);
     cmd.AddValue("ocsPortK", "Per-Leaf OCS port budget for greedy candidate selection.", ocsPortK);
     cmd.AddValue("maxSelectedOcsLinks", "Maximum number of OCS candidate links selected by the controller.", maxSelectedOcsLinks);
+    cmd.AddValue("enableMatrixFlows", "Enable Stage-12 matrix-driven multi-pair BulkSend flows.", enableMatrixFlows);
+    cmd.AddValue("matrixFlowMaxBytes", "MaxBytes for each matrix-generated BulkSend flow.", matrixFlowMaxBytes);
+    cmd.AddValue("matrixFlowStart", "Start time for matrix-generated BulkSend flows in seconds.", matrixFlowStart);
+    cmd.AddValue("matrixFlowPortBase", "Base TCP port for matrix-generated PacketSink applications.", matrixFlowPortBase);
     cmd.Parse(argc, argv);
 
     if (simTime <= 0)
@@ -696,6 +723,59 @@ main(int argc, char* argv[])
         }
     }
 
+    if (enableMatrixFlows)
+    {
+        if (matrixFlowMaxBytes == 0)
+        {
+            std::cerr << "[HYBRID-DCN][ERROR] matrixFlowMaxBytes must be greater than 0."
+                      << std::endl;
+            return 1;
+        }
+
+        if (matrixFlowStart < 0)
+        {
+            std::cerr << "[HYBRID-DCN][ERROR] matrixFlowStart must be greater than or equal to 0."
+                      << std::endl;
+            return 1;
+        }
+
+        if (matrixFlowStart >= simTime)
+        {
+            std::cerr << "[HYBRID-DCN][ERROR] matrixFlowStart must be less than simTime."
+                      << std::endl;
+            return 1;
+        }
+
+        if ((simTime - matrixFlowStart) <= 0.1)
+        {
+            std::cerr
+                << "[HYBRID-DCN][ERROR] simTime - matrixFlowStart must be greater than 0.1."
+                << std::endl;
+            return 1;
+        }
+
+        if (matrixFlowPortBase == 0)
+        {
+            std::cerr << "[HYBRID-DCN][ERROR] matrixFlowPortBase must be greater than 0."
+                      << std::endl;
+            return 1;
+        }
+
+        if (serversPerLeaf < 2)
+        {
+            std::cerr << "[HYBRID-DCN][ERROR] enableMatrixFlows requires serversPerLeaf >= 2."
+                      << std::endl;
+            return 1;
+        }
+
+        if (numLeaves < 4)
+        {
+            std::cerr << "[HYBRID-DCN][ERROR] enableMatrixFlows requires numLeaves >= 4."
+                      << std::endl;
+            return 1;
+        }
+    }
+
     if (enableStaticOcs)
     {
         if (numLeaves <= 1)
@@ -914,6 +994,18 @@ main(int argc, char* argv[])
         reservedOcsLinks = staticOcsLinks;
     }
 
+    auto isOcsPairInstalled = [&installedOcsLinks](uint32_t leafA, uint32_t leafB) {
+        for (const auto& link : installedOcsLinks)
+        {
+            if ((link.leafA == leafA && link.leafB == leafB) ||
+                (link.leafA == leafB && link.leafB == leafA))
+            {
+                return true;
+            }
+        }
+        return false;
+    };
+
     Ipv4GlobalRoutingHelper::PopulateRoutingTables();
 
     const Ipv4Address bulkSrcAddress = enableBulk ? serverIpv4[bulkSrcLeaf][bulkSrcServer]
@@ -989,6 +1081,67 @@ main(int argc, char* argv[])
     const std::string secondBulkDstName = "server-l2-s0";
     const std::string residualBulkSrcName = "server-l0-s1";
     const std::string residualBulkDstName = "server-l1-s0";
+
+    auto makeServerName = [](uint32_t leafIndex, uint32_t serverOffset) {
+        std::ostringstream name;
+        name << "server-l" << leafIndex << "-s" << serverOffset;
+        return name.str();
+    };
+
+    std::vector<MatrixBulkFlowSpec> matrixFlowSpecs;
+    std::vector<MatrixBulkFlowStats> matrixFlowStats;
+    std::vector<Ptr<PacketSink>> matrixFlowSinks;
+    if (enableMatrixFlows)
+    {
+        for (const auto& link : installedOcsLinks)
+        {
+            std::ostringstream flowName;
+            flowName << "matrix-flow-" << matrixFlowSpecs.size();
+            matrixFlowSpecs.push_back({link.leafA,
+                                       link.leafB,
+                                       0,
+                                       0,
+                                       static_cast<uint16_t>(matrixFlowPortBase +
+                                                             matrixFlowSpecs.size()),
+                                       true,
+                                       flowName.str()});
+        }
+
+        bool residualMatrixFlowAdded = false;
+        for (uint32_t srcLeaf = 0; srcLeaf < numLeaves && !residualMatrixFlowAdded; ++srcLeaf)
+        {
+            for (uint32_t dstLeaf = srcLeaf + 1; dstLeaf < numLeaves; ++dstLeaf)
+            {
+                if (torTrafficMatrix[srcLeaf][dstLeaf] <= 0 ||
+                    isOcsPairInstalled(srcLeaf, dstLeaf))
+                {
+                    continue;
+                }
+
+                std::ostringstream flowName;
+                flowName << "matrix-flow-" << matrixFlowSpecs.size();
+                matrixFlowSpecs.push_back({srcLeaf,
+                                           dstLeaf,
+                                           1,
+                                           0,
+                                           static_cast<uint16_t>(matrixFlowPortBase +
+                                                                 matrixFlowSpecs.size()),
+                                           false,
+                                           flowName.str()});
+                residualMatrixFlowAdded = true;
+                break;
+            }
+        }
+
+        if (!residualMatrixFlowAdded)
+        {
+            std::cerr << "[HYBRID-DCN][ERROR] no residual matrix flow candidate found."
+                      << std::endl;
+            return 1;
+        }
+
+        matrixFlowStats.resize(matrixFlowSpecs.size(), {0, false, 0.0, 0.0});
+    }
 
     if (enableEcho)
     {
@@ -1090,6 +1243,31 @@ main(int argc, char* argv[])
             servers.Get(serverIndex(residualBulkSrcLeaf, residualBulkSrcServer)));
         residualBulkApps.Start(Seconds(residualBulkStart));
         residualBulkApps.Stop(Seconds(simTime));
+    }
+
+    if (enableMatrixFlows)
+    {
+        for (uint32_t flowIndex = 0; flowIndex < matrixFlowSpecs.size(); ++flowIndex)
+        {
+            const auto& spec = matrixFlowSpecs[flowIndex];
+            Address sinkAddress(InetSocketAddress(Ipv4Address::GetAny(), spec.port));
+            PacketSinkHelper matrixPacketSink("ns3::TcpSocketFactory", sinkAddress);
+            ApplicationContainer sinkApps = matrixPacketSink.Install(
+                servers.Get(serverIndex(spec.dstLeaf, spec.dstServer)));
+            Ptr<PacketSink> sink = DynamicCast<PacketSink>(sinkApps.Get(0));
+            matrixFlowSinks.push_back(sink);
+            sinkApps.Start(Seconds(0.1));
+            sinkApps.Stop(Seconds(simTime));
+
+            Address remoteAddress(
+                InetSocketAddress(serverIpv4[spec.dstLeaf][spec.dstServer], spec.port));
+            BulkSendHelper matrixBulkSender("ns3::TcpSocketFactory", remoteAddress);
+            matrixBulkSender.SetAttribute("MaxBytes", UintegerValue(matrixFlowMaxBytes));
+            ApplicationContainer bulkApps =
+                matrixBulkSender.Install(servers.Get(serverIndex(spec.srcLeaf, spec.srcServer)));
+            bulkApps.Start(Seconds(matrixFlowStart + (0.02 * static_cast<double>(flowIndex))));
+            bulkApps.Stop(Seconds(simTime));
+        }
     }
 
     std::cout << "[HYBRID-DCN] experimentName   = " << experimentName << std::endl;
@@ -1228,6 +1406,14 @@ main(int argc, char* argv[])
               << (enableResidualBulk ? residualBulkStart : 0.0) << " s" << std::endl;
     std::cout << "[HYBRID-DCN] residualBulkPort       = "
               << (enableResidualBulk ? residualBulkPort : 0) << std::endl;
+    std::cout << "[HYBRID-DCN] enableMatrixFlows      = "
+              << (enableMatrixFlows ? "true" : "false") << std::endl;
+    std::cout << "[HYBRID-DCN] matrixFlowMaxBytes     = "
+              << (enableMatrixFlows ? matrixFlowMaxBytes : 0) << std::endl;
+    std::cout << "[HYBRID-DCN] matrixFlowStart        = "
+              << (enableMatrixFlows ? matrixFlowStart : 0.0) << " s" << std::endl;
+    std::cout << "[HYBRID-DCN] matrixFlowPortBase     = "
+              << (enableMatrixFlows ? matrixFlowPortBase : 0) << std::endl;
 
     std::cout << "[HYBRID-DCN][MATRIX] enableMatrixSelect = "
               << (enableMatrixSelect ? "true" : "false") << std::endl;
@@ -1359,17 +1545,6 @@ main(int argc, char* argv[])
     }
     std::cout << "[HYBRID-DCN][ROUTE] ocsPairHostRoutes = " << ocsPairHostRoutes
               << std::endl;
-    auto isOcsPairInstalled = [&installedOcsLinks](uint32_t leafA, uint32_t leafB) {
-        for (const auto& link : installedOcsLinks)
-        {
-            if ((link.leafA == leafA && link.leafB == leafB) ||
-                (link.leafA == leafB && link.leafB == leafA))
-            {
-                return true;
-            }
-        }
-        return false;
-    };
     if (routeMode == "ocs-forced")
     {
         std::cout << "[HYBRID-DCN][VERIFY] primaryCoveredPairExpectedPath   = "
@@ -1449,6 +1624,15 @@ main(int argc, char* argv[])
     Simulator::Stop(Seconds(simTime));
     Simulator::Run();
     Simulator::Destroy();
+
+    if (enableMatrixFlows)
+    {
+        for (uint32_t flowIndex = 0; flowIndex < matrixFlowSinks.size(); ++flowIndex)
+        {
+            matrixFlowStats[flowIndex].rxBytes = matrixFlowSinks[flowIndex]->GetTotalRx();
+            matrixFlowStats[flowIndex].seenFirstRx = matrixFlowStats[flowIndex].rxBytes > 0;
+        }
+    }
 
     std::cout << "[HYBRID-DCN][BULK] enabled          = " << (enableBulk ? "true" : "false")
               << std::endl;
@@ -1595,6 +1779,80 @@ main(int argc, char* argv[])
         std::cout << "[HYBRID-DCN][RESIDUAL] completed        = false" << std::endl;
         std::cout << "[HYBRID-DCN][RESIDUAL] observedFct      = 0 s" << std::endl;
         std::cout << "[HYBRID-DCN][RESIDUAL] avgGoodputMbps   = 0 Mbps" << std::endl;
+    }
+
+    std::cout << "[HYBRID-DCN][MATRIX-FLOW] enabled          = "
+              << (enableMatrixFlows ? "true" : "false") << std::endl;
+    if (enableMatrixFlows)
+    {
+        uint32_t coveredFlows = 0;
+        uint32_t residualFlows = 0;
+        uint32_t completedFlows = 0;
+        uint64_t totalMatrixRxBytes = 0;
+        for (uint32_t flowIndex = 0; flowIndex < matrixFlowSpecs.size(); ++flowIndex)
+        {
+            const auto& spec = matrixFlowSpecs[flowIndex];
+            const auto& stats = matrixFlowStats[flowIndex];
+            if (spec.ocsCovered)
+            {
+                coveredFlows++;
+            }
+            else
+            {
+                residualFlows++;
+            }
+            if (stats.rxBytes >= matrixFlowMaxBytes)
+            {
+                completedFlows++;
+            }
+            totalMatrixRxBytes += stats.rxBytes;
+        }
+
+        const double matrixCompletionRatio =
+            matrixFlowSpecs.empty()
+                ? 0.0
+                : static_cast<double>(completedFlows) / static_cast<double>(matrixFlowSpecs.size());
+        const double matrixAvgGoodputMbps =
+            static_cast<double>(totalMatrixRxBytes) * 8.0 / (simTime - matrixFlowStart) / 1e6;
+
+        std::cout << "[HYBRID-DCN][MATRIX-FLOW] flowCount        = "
+                  << matrixFlowSpecs.size() << std::endl;
+        std::cout << "[HYBRID-DCN][MATRIX-FLOW] coveredFlows     = " << coveredFlows
+                  << std::endl;
+        std::cout << "[HYBRID-DCN][MATRIX-FLOW] residualFlows    = " << residualFlows
+                  << std::endl;
+        std::cout << "[HYBRID-DCN][MATRIX-FLOW] completedFlows   = " << completedFlows
+                  << std::endl;
+        std::cout << "[HYBRID-DCN][MATRIX-FLOW] completionRatio  = "
+                  << matrixCompletionRatio << std::endl;
+        std::cout << "[HYBRID-DCN][MATRIX-FLOW] totalRxBytes     = "
+                  << totalMatrixRxBytes << std::endl;
+        std::cout << "[HYBRID-DCN][MATRIX-FLOW] avgGoodputMbps   = "
+                  << matrixAvgGoodputMbps << " Mbps" << std::endl;
+
+        for (uint32_t flowIndex = 0; flowIndex < matrixFlowSpecs.size(); ++flowIndex)
+        {
+            const auto& spec = matrixFlowSpecs[flowIndex];
+            const auto& stats = matrixFlowStats[flowIndex];
+            const bool completed = stats.rxBytes >= matrixFlowMaxBytes;
+            std::cout << "[HYBRID-DCN][MATRIX-FLOW] flow[" << flowIndex
+                      << "] name=" << spec.name
+                      << " src=" << makeServerName(spec.srcLeaf, spec.srcServer)
+                      << " dst=" << makeServerName(spec.dstLeaf, spec.dstServer)
+                      << " ocsCovered=" << (spec.ocsCovered ? "true" : "false")
+                      << " rxBytes=" << stats.rxBytes
+                      << " completed=" << (completed ? "true" : "false") << std::endl;
+        }
+    }
+    else
+    {
+        std::cout << "[HYBRID-DCN][MATRIX-FLOW] flowCount        = 0" << std::endl;
+        std::cout << "[HYBRID-DCN][MATRIX-FLOW] coveredFlows     = 0" << std::endl;
+        std::cout << "[HYBRID-DCN][MATRIX-FLOW] residualFlows    = 0" << std::endl;
+        std::cout << "[HYBRID-DCN][MATRIX-FLOW] completedFlows   = 0" << std::endl;
+        std::cout << "[HYBRID-DCN][MATRIX-FLOW] completionRatio  = 0" << std::endl;
+        std::cout << "[HYBRID-DCN][MATRIX-FLOW] totalRxBytes     = 0" << std::endl;
+        std::cout << "[HYBRID-DCN][MATRIX-FLOW] avgGoodputMbps   = 0 Mbps" << std::endl;
     }
 
     std::cout << "[HYBRID-DCN][OCS] enabled     = " << (enableStaticOcs ? "true" : "false")
