@@ -10,6 +10,7 @@
 #include "ns3/point-to-point-module.h"
 
 #include <algorithm>
+#include <cmath>
 #include <iostream>
 #include <sstream>
 #include <string>
@@ -63,6 +64,15 @@ struct CommunityPreview
 {
     std::vector<uint32_t> labels;
     uint32_t communityCount;
+};
+
+struct LouvainResult
+{
+    std::vector<uint32_t> labels;
+    uint32_t communityCount;
+    uint32_t passes;
+    bool moved;
+    double modularityQ;
 };
 
 uint64_t g_bulkRxBytes = 0;
@@ -237,6 +247,9 @@ main(int argc, char* argv[])
     std::string routeMode = "global";
     bool enableMatrixSelect = true;
     std::string trafficMatrixMode = "skewed";
+    std::string communityMode = "preview";
+    uint32_t louvainMaxPasses = 10;
+    double louvainEpsilon = 1e-9;
     std::string selectionMetric = "excess";
     double eta = 1.0;
     uint32_t ocsPortK = 1;
@@ -289,6 +302,9 @@ main(int argc, char* argv[])
     cmd.AddValue("routeMode", "Routing mode: global or ocs-forced.", routeMode);
     cmd.AddValue("enableMatrixSelect", "Select the static OCS Leaf pair from a built-in ToR traffic matrix.", enableMatrixSelect);
     cmd.AddValue("trafficMatrixMode", "Built-in ToR traffic matrix mode: skewed, clustered, or uniform.", trafficMatrixMode);
+    cmd.AddValue("communityMode", "Community label source: preview or louvain.", communityMode);
+    cmd.AddValue("louvainMaxPasses", "Maximum passes for single-level Louvain local moving.", louvainMaxPasses);
+    cmd.AddValue("louvainEpsilon", "Minimum modularity gain for Louvain local moving.", louvainEpsilon);
     cmd.AddValue("selectionMetric", "OCS pair selection metric: absolute or excess.", selectionMetric);
     cmd.AddValue("eta", "Resolution parameter for modularity gain.", eta);
     cmd.AddValue("ocsPortK", "Per-Leaf OCS port budget for greedy candidate selection.", ocsPortK);
@@ -348,6 +364,27 @@ main(int argc, char* argv[])
         std::cerr
             << "[HYBRID-DCN][ERROR] trafficMatrixMode must be skewed, clustered, or uniform."
             << std::endl;
+        return 1;
+    }
+
+    if (communityMode != "preview" && communityMode != "louvain")
+    {
+        std::cerr << "[HYBRID-DCN][ERROR] communityMode must be preview or louvain."
+                  << std::endl;
+        return 1;
+    }
+
+    if (communityMode == "louvain" && louvainMaxPasses == 0)
+    {
+        std::cerr << "[HYBRID-DCN][ERROR] louvainMaxPasses must be greater than 0."
+                  << std::endl;
+        return 1;
+    }
+
+    if (communityMode == "louvain" && louvainEpsilon <= 0)
+    {
+        std::cerr << "[HYBRID-DCN][ERROR] louvainEpsilon must be greater than 0."
+                  << std::endl;
         return 1;
     }
 
@@ -494,10 +531,6 @@ main(int argc, char* argv[])
     const CommunityPreview communityPreview =
         buildCommunityPreview(trafficMatrixMode, numLeaves);
 
-    auto isIntraCommunity = [&communityPreview](uint32_t leafA, uint32_t leafB) {
-        return communityPreview.labels[leafA] == communityPreview.labels[leafB];
-    };
-
     std::vector<double> nodeDegree(numLeaves, 0.0);
     for (uint32_t i = 0; i < numLeaves; ++i)
     {
@@ -546,6 +579,153 @@ main(int argc, char* argv[])
             }
         }
     }
+
+    auto normalizeCommunityLabels = [](std::vector<uint32_t>& labels) {
+        std::vector<uint32_t> oldLabels;
+        for (uint32_t& label : labels)
+        {
+            uint32_t normalized = 0;
+            bool found = false;
+            for (uint32_t index = 0; index < oldLabels.size(); ++index)
+            {
+                if (oldLabels[index] == label)
+                {
+                    normalized = index;
+                    found = true;
+                    break;
+                }
+            }
+
+            if (!found)
+            {
+                normalized = static_cast<uint32_t>(oldLabels.size());
+                oldLabels.push_back(label);
+            }
+            label = normalized;
+        }
+        return static_cast<uint32_t>(oldLabels.size());
+    };
+
+    auto computeModularityQ = [&](const std::vector<uint32_t>& labels) {
+        if (totalTraffic <= 0)
+        {
+            return 0.0;
+        }
+
+        const double twoM = 2.0 * totalTraffic;
+        double modularitySum = 0.0;
+        for (uint32_t i = 0; i < numLeaves; ++i)
+        {
+            for (uint32_t j = 0; j < numLeaves; ++j)
+            {
+                if (labels[i] != labels[j])
+                {
+                    continue;
+                }
+                const double expected = nodeDegree[i] * nodeDegree[j] / twoM;
+                modularitySum += torTrafficMatrix[i][j] - (eta * expected);
+            }
+        }
+        return modularitySum / twoM;
+    };
+
+    auto runSingleLevelLouvain = [&]() {
+        LouvainResult result;
+        result.labels.resize(numLeaves);
+        for (uint32_t leafIndex = 0; leafIndex < numLeaves; ++leafIndex)
+        {
+            result.labels[leafIndex] = leafIndex;
+        }
+        result.communityCount = numLeaves;
+        result.passes = 0;
+        result.moved = false;
+        result.modularityQ = computeModularityQ(result.labels);
+
+        for (uint32_t pass = 0; pass < louvainMaxPasses; ++pass)
+        {
+            bool passMoved = false;
+            for (uint32_t leafIndex = 0; leafIndex < numLeaves; ++leafIndex)
+            {
+                const uint32_t oldLabel = result.labels[leafIndex];
+                std::vector<uint32_t> candidateLabels;
+                candidateLabels.push_back(oldLabel);
+                for (uint32_t neighbor = 0; neighbor < numLeaves; ++neighbor)
+                {
+                    if (torTrafficMatrix[leafIndex][neighbor] <= 0)
+                    {
+                        continue;
+                    }
+
+                    const uint32_t neighborLabel = result.labels[neighbor];
+                    if (std::find(candidateLabels.begin(),
+                                  candidateLabels.end(),
+                                  neighborLabel) == candidateLabels.end())
+                    {
+                        candidateLabels.push_back(neighborLabel);
+                    }
+                }
+                std::sort(candidateLabels.begin(), candidateLabels.end());
+
+                const double currentQ = computeModularityQ(result.labels);
+                double bestQ = currentQ;
+                uint32_t bestLabel = oldLabel;
+                std::vector<uint32_t> bestLabels = result.labels;
+
+                for (uint32_t candidateLabel : candidateLabels)
+                {
+                    std::vector<uint32_t> trialLabels = result.labels;
+                    trialLabels[leafIndex] = candidateLabel;
+                    normalizeCommunityLabels(trialLabels);
+                    const double trialQ = computeModularityQ(trialLabels);
+                    const uint32_t trialLabel = trialLabels[leafIndex];
+
+                    if (trialQ > bestQ + louvainEpsilon ||
+                        (std::abs(trialQ - bestQ) <= louvainEpsilon &&
+                         trialLabel < bestLabel))
+                    {
+                        bestQ = trialQ;
+                        bestLabel = trialLabel;
+                        bestLabels = trialLabels;
+                    }
+                }
+
+                if (bestLabels != result.labels)
+                {
+                    result.labels = bestLabels;
+                    result.communityCount = normalizeCommunityLabels(result.labels);
+                    passMoved = true;
+                    result.moved = true;
+                }
+            }
+
+            result.passes = pass + 1;
+            if (!passMoved)
+            {
+                break;
+            }
+        }
+
+        result.communityCount = normalizeCommunityLabels(result.labels);
+        result.modularityQ = computeModularityQ(result.labels);
+        return result;
+    };
+
+    const LouvainResult louvainResult =
+        communityMode == "louvain" ? runSingleLevelLouvain()
+                                   : LouvainResult{communityPreview.labels,
+                                                   communityPreview.communityCount,
+                                                   0,
+                                                   false,
+                                                   computeModularityQ(communityPreview.labels)};
+    const std::vector<uint32_t>& activeCommunityLabels =
+        communityMode == "louvain" ? louvainResult.labels : communityPreview.labels;
+    const uint32_t activeCommunityCount =
+        communityMode == "louvain" ? louvainResult.communityCount
+                                   : communityPreview.communityCount;
+
+    auto isIntraCommunity = [&activeCommunityLabels](uint32_t leafA, uint32_t leafB) {
+        return activeCommunityLabels[leafA] == activeCommunityLabels[leafB];
+    };
 
     double selectedOcsWeight = 0.0;
     double selectedExpectedTraffic = 0.0;
@@ -1612,10 +1792,29 @@ main(int argc, char* argv[])
     }
 
     std::cout << "[HYBRID-DCN][COMMUNITY] previewEnabled = true" << std::endl;
-    std::cout << "[HYBRID-DCN][COMMUNITY] source = trafficMatrixMode" << std::endl;
+    std::cout << "[HYBRID-DCN][COMMUNITY] communityMode = " << communityMode << std::endl;
+    std::cout << "[HYBRID-DCN][COMMUNITY] source = "
+              << (communityMode == "louvain" ? "louvain-single-level"
+                                              : "trafficMatrixMode-preview")
+              << std::endl;
     std::cout << "[HYBRID-DCN][COMMUNITY] communityCount = "
-              << communityPreview.communityCount << std::endl;
-    if (trafficMatrixMode == "uniform")
+              << activeCommunityCount << std::endl;
+    if (communityMode == "louvain")
+    {
+        std::cout << "[HYBRID-DCN][LOUVAIN] implementation = single-level-local-moving"
+                  << std::endl;
+        std::cout << "[HYBRID-DCN][LOUVAIN] foldedGraph = false" << std::endl;
+        std::cout << "[HYBRID-DCN][LOUVAIN] maxPasses = " << louvainMaxPasses
+                  << std::endl;
+        std::cout << "[HYBRID-DCN][LOUVAIN] epsilon = " << louvainEpsilon << std::endl;
+        std::cout << "[HYBRID-DCN][LOUVAIN] passes = " << louvainResult.passes
+                  << std::endl;
+        std::cout << "[HYBRID-DCN][LOUVAIN] moved = "
+                  << (louvainResult.moved ? "true" : "false") << std::endl;
+        std::cout << "[HYBRID-DCN][LOUVAIN] modularityQ = "
+                  << louvainResult.modularityQ << std::endl;
+    }
+    if (trafficMatrixMode == "uniform" && communityMode == "preview")
     {
         std::cout
             << "[HYBRID-DCN][COMMUNITY] note = uniform matrix diagnostic preview only"
@@ -1624,7 +1823,7 @@ main(int argc, char* argv[])
     for (uint32_t leafIndex = 0; leafIndex < numLeaves; ++leafIndex)
     {
         std::cout << "[HYBRID-DCN][COMMUNITY] leaf-" << leafIndex
-                  << " community = " << communityPreview.labels[leafIndex] << std::endl;
+                  << " community = " << activeCommunityLabels[leafIndex] << std::endl;
     }
     std::cout << "[HYBRID-DCN][COMMUNITY] intraCandidateEdges = "
               << intraCandidateEdges << std::endl;
