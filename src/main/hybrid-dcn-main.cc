@@ -230,6 +230,7 @@ main(int argc, char* argv[])
     std::string ocsDelay = "5us";
     std::string routeMode = "global";
     bool enableMatrixSelect = true;
+    std::string trafficMatrixMode = "skewed";
     std::string selectionMetric = "excess";
     double eta = 1.0;
     uint32_t ocsPortK = 1;
@@ -281,6 +282,7 @@ main(int argc, char* argv[])
     cmd.AddValue("ocsDelay", "Static OCS lightpath delay.", ocsDelay);
     cmd.AddValue("routeMode", "Routing mode: global or ocs-forced.", routeMode);
     cmd.AddValue("enableMatrixSelect", "Select the static OCS Leaf pair from a built-in ToR traffic matrix.", enableMatrixSelect);
+    cmd.AddValue("trafficMatrixMode", "Built-in ToR traffic matrix mode: skewed, clustered, or uniform.", trafficMatrixMode);
     cmd.AddValue("selectionMetric", "OCS pair selection metric: absolute or excess.", selectionMetric);
     cmd.AddValue("eta", "Resolution parameter for modularity gain.", eta);
     cmd.AddValue("ocsPortK", "Per-Leaf OCS port budget for greedy candidate selection.", ocsPortK);
@@ -334,6 +336,15 @@ main(int argc, char* argv[])
         return 1;
     }
 
+    if (trafficMatrixMode != "skewed" && trafficMatrixMode != "clustered" &&
+        trafficMatrixMode != "uniform")
+    {
+        std::cerr
+            << "[HYBRID-DCN][ERROR] trafficMatrixMode must be skewed, clustered, or uniform."
+            << std::endl;
+        return 1;
+    }
+
     if (selectionMetric != "absolute" && selectionMetric != "excess")
     {
         std::cerr << "[HYBRID-DCN][ERROR] selectionMetric must be absolute or excess."
@@ -366,26 +377,63 @@ main(int argc, char* argv[])
         }
     }
 
-    std::vector<std::vector<double>> torTrafficMatrix(numLeaves,
-                                                      std::vector<double>(numLeaves, 0.0));
-    for (uint32_t i = 0; i < numLeaves; ++i)
-    {
-        for (uint32_t j = i + 1; j < numLeaves; ++j)
+    auto buildTrafficMatrix = [](const std::string& mode, uint32_t leafCount) {
+        std::vector<std::vector<double>> matrix(leafCount,
+                                                std::vector<double>(leafCount, 0.0));
+
+        if (mode == "skewed")
         {
-            torTrafficMatrix[i][j] = 10.0;
-            torTrafficMatrix[j][i] = 10.0;
+            for (uint32_t i = 0; i < leafCount; ++i)
+            {
+                for (uint32_t j = i + 1; j < leafCount; ++j)
+                {
+                    matrix[i][j] = 10.0;
+                    matrix[j][i] = 10.0;
+                }
+            }
+
+            if (leafCount >= 4)
+            {
+                matrix[0][3] = 100.0;
+                matrix[3][0] = 100.0;
+            }
+
+            if (leafCount >= 3)
+            {
+                matrix[1][2] = 30.0;
+                matrix[2][1] = 30.0;
+            }
         }
-    }
-    if (numLeaves >= 4)
-    {
-        torTrafficMatrix[0][3] = 100.0;
-        torTrafficMatrix[3][0] = 100.0;
-    }
-    if (numLeaves >= 3)
-    {
-        torTrafficMatrix[1][2] = 30.0;
-        torTrafficMatrix[2][1] = 30.0;
-    }
+        else if (mode == "clustered")
+        {
+            const uint32_t split = leafCount / 2;
+            for (uint32_t i = 0; i < leafCount; ++i)
+            {
+                for (uint32_t j = i + 1; j < leafCount; ++j)
+                {
+                    const bool sameCluster = (i < split && j < split) || (i >= split && j >= split);
+                    matrix[i][j] = sameCluster ? 80.0 : 10.0;
+                    matrix[j][i] = matrix[i][j];
+                }
+            }
+        }
+        else
+        {
+            for (uint32_t i = 0; i < leafCount; ++i)
+            {
+                for (uint32_t j = i + 1; j < leafCount; ++j)
+                {
+                    matrix[i][j] = 20.0;
+                    matrix[j][i] = 20.0;
+                }
+            }
+        }
+
+        return matrix;
+    };
+
+    std::vector<std::vector<double>> torTrafficMatrix =
+        buildTrafficMatrix(trafficMatrixMode, numLeaves);
 
     std::vector<double> nodeDegree(numLeaves, 0.0);
     for (uint32_t i = 0; i < numLeaves; ++i)
@@ -1417,6 +1465,8 @@ main(int argc, char* argv[])
 
     std::cout << "[HYBRID-DCN][MATRIX] enableMatrixSelect = "
               << (enableMatrixSelect ? "true" : "false") << std::endl;
+    std::cout << "[HYBRID-DCN][MATRIX] trafficMatrixMode = " << trafficMatrixMode
+              << std::endl;
     std::cout << "[HYBRID-DCN][MATRIX] selectionMetric = " << selectionMetric << std::endl;
     std::cout << "[HYBRID-DCN][MATRIX] eta             = " << eta << std::endl;
     std::cout << "[HYBRID-DCN][MATRIX] totalTraffic    = " << totalTraffic << std::endl;
@@ -1440,10 +1490,14 @@ main(int argc, char* argv[])
               << (enableMatrixSelect ? selectedModularityGain : 0.0) << std::endl;
     std::cout << "[HYBRID-DCN][MATRIX] selectedUtility  = "
               << (enableMatrixSelect ? selectedOcsUtility : 0.0) << std::endl;
+    std::cout << "[HYBRID-DCN][MATRIX] traffic[0][1]      = "
+              << (numLeaves >= 2 ? torTrafficMatrix[0][1] : 0.0) << std::endl;
     std::cout << "[HYBRID-DCN][MATRIX] traffic[0][3]      = "
               << (numLeaves >= 4 ? torTrafficMatrix[0][3] : 0.0) << std::endl;
     std::cout << "[HYBRID-DCN][MATRIX] traffic[1][2]      = "
               << (numLeaves >= 3 ? torTrafficMatrix[1][2] : 0.0) << std::endl;
+    std::cout << "[HYBRID-DCN][MATRIX] traffic[2][3]      = "
+              << (numLeaves >= 4 ? torTrafficMatrix[2][3] : 0.0) << std::endl;
     std::cout << "[HYBRID-DCN][MATRIX] candidateEdges     = " << candidateEdges.size()
               << std::endl;
     std::cout << "[HYBRID-DCN][MATRIX] selectedEdges      = " << selectedOcsEdges.size()
