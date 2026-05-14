@@ -9,6 +9,7 @@
 #include "ns3/netanim-module.h"
 #include "ns3/point-to-point-module.h"
 
+#include <algorithm>
 #include <iostream>
 #include <sstream>
 #include <string>
@@ -164,6 +165,8 @@ main(int argc, char* argv[])
     std::string ocsDelay = "5us";
     std::string routeMode = "global";
     bool enableMatrixSelect = true;
+    std::string selectionMetric = "excess";
+    double eta = 1.0;
 
     const uint32_t bulkSrcLeaf = 0;
     const uint32_t bulkSrcServer = 0;
@@ -199,6 +202,8 @@ main(int argc, char* argv[])
     cmd.AddValue("ocsDelay", "Static OCS lightpath delay.", ocsDelay);
     cmd.AddValue("routeMode", "Routing mode: global or ocs-forced.", routeMode);
     cmd.AddValue("enableMatrixSelect", "Select the static OCS Leaf pair from a built-in ToR traffic matrix.", enableMatrixSelect);
+    cmd.AddValue("selectionMetric", "OCS pair selection metric: absolute or excess.", selectionMetric);
+    cmd.AddValue("eta", "Resolution parameter for modularity gain.", eta);
     cmd.Parse(argc, argv);
 
     if (simTime <= 0)
@@ -228,6 +233,19 @@ main(int argc, char* argv[])
     if (routeMode != "global" && routeMode != "ocs-forced")
     {
         std::cerr << "[HYBRID-DCN][ERROR] routeMode must be global or ocs-forced." << std::endl;
+        return 1;
+    }
+
+    if (selectionMetric != "absolute" && selectionMetric != "excess")
+    {
+        std::cerr << "[HYBRID-DCN][ERROR] selectionMetric must be absolute or excess."
+                  << std::endl;
+        return 1;
+    }
+
+    if (eta <= 0)
+    {
+        std::cerr << "[HYBRID-DCN][ERROR] eta must be greater than 0." << std::endl;
         return 1;
     }
 
@@ -271,27 +289,85 @@ main(int argc, char* argv[])
         torTrafficMatrix[2][1] = 30.0;
     }
 
+    std::vector<double> nodeDegree(numLeaves, 0.0);
+    for (uint32_t i = 0; i < numLeaves; ++i)
+    {
+        for (uint32_t j = 0; j < numLeaves; ++j)
+        {
+            nodeDegree[i] += torTrafficMatrix[i][j];
+        }
+    }
+
+    double totalTraffic = 0.0;
+    for (uint32_t i = 0; i < numLeaves; ++i)
+    {
+        for (uint32_t j = 0; j < numLeaves; ++j)
+        {
+            totalTraffic += torTrafficMatrix[i][j];
+        }
+    }
+    totalTraffic *= 0.5;
+
+    if (enableMatrixSelect && selectionMetric == "excess" && totalTraffic <= 0)
+    {
+        std::cerr << "[HYBRID-DCN][ERROR] totalTraffic must be greater than 0 when selectionMetric=excess."
+                  << std::endl;
+        return 1;
+    }
+
+    std::vector<std::vector<double>> expectedTraffic(numLeaves,
+                                                     std::vector<double>(numLeaves, 0.0));
+    std::vector<std::vector<double>> modularityGain(numLeaves,
+                                                    std::vector<double>(numLeaves, 0.0));
+    std::vector<std::vector<double>> ocsUtility(numLeaves,
+                                                std::vector<double>(numLeaves, 0.0));
+    if (totalTraffic > 0)
+    {
+        for (uint32_t i = 0; i < numLeaves; ++i)
+        {
+            for (uint32_t j = 0; j < numLeaves; ++j)
+            {
+                if (i == j)
+                {
+                    continue;
+                }
+                expectedTraffic[i][j] = nodeDegree[i] * nodeDegree[j] / (2.0 * totalTraffic);
+                modularityGain[i][j] = torTrafficMatrix[i][j] - eta * expectedTraffic[i][j];
+                ocsUtility[i][j] = std::max(modularityGain[i][j], 0.0);
+            }
+        }
+    }
+
     double selectedOcsWeight = 0.0;
+    double selectedExpectedTraffic = 0.0;
+    double selectedModularityGain = 0.0;
+    double selectedOcsUtility = 0.0;
     if (enableMatrixSelect)
     {
         uint32_t bestI = 0;
         uint32_t bestJ = 1;
-        double bestWeight = torTrafficMatrix[bestI][bestJ];
+        double bestScore = selectionMetric == "absolute" ? torTrafficMatrix[bestI][bestJ]
+                                                         : ocsUtility[bestI][bestJ];
         for (uint32_t i = 0; i < numLeaves; ++i)
         {
             for (uint32_t j = i + 1; j < numLeaves; ++j)
             {
-                if (torTrafficMatrix[i][j] > bestWeight)
+                const double candidateScore =
+                    selectionMetric == "absolute" ? torTrafficMatrix[i][j] : ocsUtility[i][j];
+                if (candidateScore > bestScore)
                 {
                     bestI = i;
                     bestJ = j;
-                    bestWeight = torTrafficMatrix[i][j];
+                    bestScore = candidateScore;
                 }
             }
         }
         ocsLeafA = bestI;
         ocsLeafB = bestJ;
-        selectedOcsWeight = bestWeight;
+        selectedOcsWeight = torTrafficMatrix[bestI][bestJ];
+        selectedExpectedTraffic = expectedTraffic[bestI][bestJ];
+        selectedModularityGain = modularityGain[bestI][bestJ];
+        selectedOcsUtility = ocsUtility[bestI][bestJ];
 
         if (routeMode != "ocs-forced")
         {
@@ -880,10 +956,29 @@ main(int argc, char* argv[])
 
     std::cout << "[HYBRID-DCN][MATRIX] enableMatrixSelect = "
               << (enableMatrixSelect ? "true" : "false") << std::endl;
+    std::cout << "[HYBRID-DCN][MATRIX] selectionMetric = " << selectionMetric << std::endl;
+    std::cout << "[HYBRID-DCN][MATRIX] eta             = " << eta << std::endl;
+    std::cout << "[HYBRID-DCN][MATRIX] totalTraffic    = " << totalTraffic << std::endl;
+    std::cout << "[HYBRID-DCN][MATRIX] degree[0]       = "
+              << (numLeaves >= 1 ? nodeDegree[0] : 0.0) << std::endl;
+    std::cout << "[HYBRID-DCN][MATRIX] degree[3]       = "
+              << (numLeaves >= 4 ? nodeDegree[3] : 0.0) << std::endl;
+    std::cout << "[HYBRID-DCN][MATRIX] expected[0][3]  = "
+              << (numLeaves >= 4 ? expectedTraffic[0][3] : 0.0) << std::endl;
+    std::cout << "[HYBRID-DCN][MATRIX] B[0][3]         = "
+              << (numLeaves >= 4 ? modularityGain[0][3] : 0.0) << std::endl;
+    std::cout << "[HYBRID-DCN][MATRIX] U[0][3]         = "
+              << (numLeaves >= 4 ? ocsUtility[0][3] : 0.0) << std::endl;
     std::cout << "[HYBRID-DCN][MATRIX] selectedOcsLeafA   = " << ocsLeafA << std::endl;
     std::cout << "[HYBRID-DCN][MATRIX] selectedOcsLeafB   = " << ocsLeafB << std::endl;
     std::cout << "[HYBRID-DCN][MATRIX] selectedWeight     = "
               << (enableMatrixSelect ? selectedOcsWeight : 0.0) << std::endl;
+    std::cout << "[HYBRID-DCN][MATRIX] selectedExpected = "
+              << (enableMatrixSelect ? selectedExpectedTraffic : 0.0) << std::endl;
+    std::cout << "[HYBRID-DCN][MATRIX] selectedB        = "
+              << (enableMatrixSelect ? selectedModularityGain : 0.0) << std::endl;
+    std::cout << "[HYBRID-DCN][MATRIX] selectedUtility  = "
+              << (enableMatrixSelect ? selectedOcsUtility : 0.0) << std::endl;
     std::cout << "[HYBRID-DCN][MATRIX] traffic[0][3]      = "
               << (numLeaves >= 4 ? torTrafficMatrix[0][3] : 0.0) << std::endl;
     std::cout << "[HYBRID-DCN][MATRIX] traffic[1][2]      = "
