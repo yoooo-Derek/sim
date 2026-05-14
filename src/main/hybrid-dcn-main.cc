@@ -17,6 +17,16 @@
 
 using namespace ns3;
 
+struct OcsCandidateEdge
+{
+    uint32_t leafA;
+    uint32_t leafB;
+    double traffic;
+    double expected;
+    double modularityGain;
+    double utility;
+};
+
 uint64_t g_bulkRxBytes = 0;
 bool g_bulkSeenFirstRx = false;
 double g_bulkFirstRxTime = 0.0;
@@ -167,6 +177,8 @@ main(int argc, char* argv[])
     bool enableMatrixSelect = true;
     std::string selectionMetric = "excess";
     double eta = 1.0;
+    uint32_t ocsPortK = 1;
+    uint32_t maxSelectedOcsLinks = 1;
 
     const uint32_t bulkSrcLeaf = 0;
     const uint32_t bulkSrcServer = 0;
@@ -204,6 +216,8 @@ main(int argc, char* argv[])
     cmd.AddValue("enableMatrixSelect", "Select the static OCS Leaf pair from a built-in ToR traffic matrix.", enableMatrixSelect);
     cmd.AddValue("selectionMetric", "OCS pair selection metric: absolute or excess.", selectionMetric);
     cmd.AddValue("eta", "Resolution parameter for modularity gain.", eta);
+    cmd.AddValue("ocsPortK", "Per-Leaf OCS port budget for greedy candidate selection.", ocsPortK);
+    cmd.AddValue("maxSelectedOcsLinks", "Maximum number of OCS candidate links selected by the controller.", maxSelectedOcsLinks);
     cmd.Parse(argc, argv);
 
     if (simTime <= 0)
@@ -227,6 +241,19 @@ main(int argc, char* argv[])
     if (serversPerLeaf == 0)
     {
         std::cerr << "[HYBRID-DCN][ERROR] serversPerLeaf must be greater than 0." << std::endl;
+        return 1;
+    }
+
+    if (ocsPortK == 0)
+    {
+        std::cerr << "[HYBRID-DCN][ERROR] ocsPortK must be greater than 0." << std::endl;
+        return 1;
+    }
+
+    if (maxSelectedOcsLinks == 0)
+    {
+        std::cerr << "[HYBRID-DCN][ERROR] maxSelectedOcsLinks must be greater than 0."
+                  << std::endl;
         return 1;
     }
 
@@ -342,32 +369,77 @@ main(int argc, char* argv[])
     double selectedExpectedTraffic = 0.0;
     double selectedModularityGain = 0.0;
     double selectedOcsUtility = 0.0;
+    std::vector<OcsCandidateEdge> candidateEdges;
+    for (uint32_t i = 0; i < numLeaves; ++i)
+    {
+        for (uint32_t j = i + 1; j < numLeaves; ++j)
+        {
+            const double score =
+                selectionMetric == "absolute" ? torTrafficMatrix[i][j] : ocsUtility[i][j];
+            if (score <= 0)
+            {
+                continue;
+            }
+
+            candidateEdges.push_back({i,
+                                      j,
+                                      torTrafficMatrix[i][j],
+                                      expectedTraffic[i][j],
+                                      modularityGain[i][j],
+                                      ocsUtility[i][j]});
+        }
+    }
+
+    std::sort(candidateEdges.begin(),
+              candidateEdges.end(),
+              [&selectionMetric](const OcsCandidateEdge& lhs, const OcsCandidateEdge& rhs) {
+                  const double lhsScore =
+                      selectionMetric == "absolute" ? lhs.traffic : lhs.utility;
+                  const double rhsScore =
+                      selectionMetric == "absolute" ? rhs.traffic : rhs.utility;
+                  if (lhsScore != rhsScore)
+                  {
+                      return lhsScore > rhsScore;
+                  }
+                  if (lhs.leafA != rhs.leafA)
+                  {
+                      return lhs.leafA < rhs.leafA;
+                  }
+                  return lhs.leafB < rhs.leafB;
+              });
+
+    std::vector<uint32_t> ocsDegree(numLeaves, 0);
+    std::vector<OcsCandidateEdge> selectedOcsEdges;
+    for (const auto& edge : candidateEdges)
+    {
+        if (selectedOcsEdges.size() >= maxSelectedOcsLinks)
+        {
+            break;
+        }
+
+        if (ocsDegree[edge.leafA] < ocsPortK && ocsDegree[edge.leafB] < ocsPortK)
+        {
+            selectedOcsEdges.push_back(edge);
+            ocsDegree[edge.leafA]++;
+            ocsDegree[edge.leafB]++;
+        }
+    }
+
     if (enableMatrixSelect)
     {
-        uint32_t bestI = 0;
-        uint32_t bestJ = 1;
-        double bestScore = selectionMetric == "absolute" ? torTrafficMatrix[bestI][bestJ]
-                                                         : ocsUtility[bestI][bestJ];
-        for (uint32_t i = 0; i < numLeaves; ++i)
+        if (selectedOcsEdges.empty())
         {
-            for (uint32_t j = i + 1; j < numLeaves; ++j)
-            {
-                const double candidateScore =
-                    selectionMetric == "absolute" ? torTrafficMatrix[i][j] : ocsUtility[i][j];
-                if (candidateScore > bestScore)
-                {
-                    bestI = i;
-                    bestJ = j;
-                    bestScore = candidateScore;
-                }
-            }
+            std::cerr << "[HYBRID-DCN][ERROR] no OCS candidate edge selected." << std::endl;
+            return 1;
         }
-        ocsLeafA = bestI;
-        ocsLeafB = bestJ;
-        selectedOcsWeight = torTrafficMatrix[bestI][bestJ];
-        selectedExpectedTraffic = expectedTraffic[bestI][bestJ];
-        selectedModularityGain = modularityGain[bestI][bestJ];
-        selectedOcsUtility = ocsUtility[bestI][bestJ];
+
+        const OcsCandidateEdge& instantiatedEdge = selectedOcsEdges.front();
+        ocsLeafA = instantiatedEdge.leafA;
+        ocsLeafB = instantiatedEdge.leafB;
+        selectedOcsWeight = instantiatedEdge.traffic;
+        selectedExpectedTraffic = instantiatedEdge.expected;
+        selectedModularityGain = instantiatedEdge.modularityGain;
+        selectedOcsUtility = instantiatedEdge.utility;
 
         if (routeMode != "ocs-forced")
         {
@@ -983,6 +1055,36 @@ main(int argc, char* argv[])
               << (numLeaves >= 4 ? torTrafficMatrix[0][3] : 0.0) << std::endl;
     std::cout << "[HYBRID-DCN][MATRIX] traffic[1][2]      = "
               << (numLeaves >= 3 ? torTrafficMatrix[1][2] : 0.0) << std::endl;
+    std::cout << "[HYBRID-DCN][MATRIX] candidateEdges     = " << candidateEdges.size()
+              << std::endl;
+    std::cout << "[HYBRID-DCN][MATRIX] selectedEdges      = " << selectedOcsEdges.size()
+              << std::endl;
+    std::cout << "[HYBRID-DCN][MATRIX] ocsPortK           = " << ocsPortK << std::endl;
+    std::cout << "[HYBRID-DCN][MATRIX] maxSelectedOcsLinks = "
+              << maxSelectedOcsLinks << std::endl;
+
+    const uint32_t candidateLogCount =
+        static_cast<uint32_t>(std::min<size_t>(candidateEdges.size(), 3));
+    for (uint32_t edgeIndex = 0; edgeIndex < candidateLogCount; ++edgeIndex)
+    {
+        const auto& edge = candidateEdges[edgeIndex];
+        std::cout << "[HYBRID-DCN][MATRIX] candidate[" << edgeIndex << "] = " << edge.leafA
+                  << "-" << edge.leafB << " traffic=" << edge.traffic
+                  << " expected=" << edge.expected << " B=" << edge.modularityGain
+                  << " U=" << edge.utility << std::endl;
+    }
+
+    for (uint32_t edgeIndex = 0; edgeIndex < selectedOcsEdges.size(); ++edgeIndex)
+    {
+        const auto& edge = selectedOcsEdges[edgeIndex];
+        std::cout << "[HYBRID-DCN][MATRIX] selectedEdge[" << edgeIndex << "] = "
+                  << edge.leafA << "-" << edge.leafB << " traffic=" << edge.traffic
+                  << " expected=" << edge.expected << " B=" << edge.modularityGain
+                  << " U=" << edge.utility << std::endl;
+    }
+
+    std::cout << "[HYBRID-DCN][MATRIX] instantiatedOcsLeafA = " << ocsLeafA << std::endl;
+    std::cout << "[HYBRID-DCN][MATRIX] instantiatedOcsLeafB = " << ocsLeafB << std::endl;
 
     if (enableEcho && enableBulk)
     {
