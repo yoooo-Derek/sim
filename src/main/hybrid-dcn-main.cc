@@ -59,6 +59,12 @@ struct MatrixBulkFlowStats
     double lastRxTime;
 };
 
+struct CommunityPreview
+{
+    std::vector<uint32_t> labels;
+    uint32_t communityCount;
+};
+
 uint64_t g_bulkRxBytes = 0;
 bool g_bulkSeenFirstRx = false;
 double g_bulkFirstRxTime = 0.0;
@@ -435,6 +441,63 @@ main(int argc, char* argv[])
     std::vector<std::vector<double>> torTrafficMatrix =
         buildTrafficMatrix(trafficMatrixMode, numLeaves);
 
+    auto buildCommunityPreview = [](const std::string& mode, uint32_t leafCount) {
+        CommunityPreview preview;
+        preview.labels.assign(leafCount, 0);
+        preview.communityCount = 0;
+
+        if (mode == "clustered")
+        {
+            const uint32_t split = leafCount / 2;
+            for (uint32_t leafIndex = 0; leafIndex < leafCount; ++leafIndex)
+            {
+                preview.labels[leafIndex] = leafIndex < split ? 0 : 1;
+            }
+            preview.communityCount = leafCount == 0 ? 0 : 2;
+        }
+        else if (mode == "skewed")
+        {
+            if (leafCount >= 4)
+            {
+                preview.labels[0] = 0;
+                preview.labels[3] = 0;
+                preview.labels[1] = 1;
+                preview.labels[2] = 1;
+                uint32_t nextCommunity = 2;
+                for (uint32_t leafIndex = 4; leafIndex < leafCount; ++leafIndex)
+                {
+                    preview.labels[leafIndex] = nextCommunity++;
+                }
+                preview.communityCount = nextCommunity;
+            }
+            else
+            {
+                for (uint32_t leafIndex = 0; leafIndex < leafCount; ++leafIndex)
+                {
+                    preview.labels[leafIndex] = leafIndex;
+                }
+                preview.communityCount = leafCount;
+            }
+        }
+        else
+        {
+            for (uint32_t leafIndex = 0; leafIndex < leafCount; ++leafIndex)
+            {
+                preview.labels[leafIndex] = 0;
+            }
+            preview.communityCount = leafCount == 0 ? 0 : 1;
+        }
+
+        return preview;
+    };
+
+    const CommunityPreview communityPreview =
+        buildCommunityPreview(trafficMatrixMode, numLeaves);
+
+    auto isIntraCommunity = [&communityPreview](uint32_t leafA, uint32_t leafB) {
+        return communityPreview.labels[leafA] == communityPreview.labels[leafB];
+    };
+
     std::vector<double> nodeDegree(numLeaves, 0.0);
     for (uint32_t i = 0; i < numLeaves; ++i)
     {
@@ -541,6 +604,28 @@ main(int argc, char* argv[])
             selectedOcsEdges.push_back(edge);
             ocsDegree[edge.leafA]++;
             ocsDegree[edge.leafB]++;
+        }
+    }
+
+    uint32_t intraCandidateEdges = 0;
+    uint32_t interCandidateEdges = 0;
+    for (uint32_t leafA = 0; leafA < numLeaves; ++leafA)
+    {
+        for (uint32_t leafB = leafA + 1; leafB < numLeaves; ++leafB)
+        {
+            if (torTrafficMatrix[leafA][leafB] <= 0)
+            {
+                continue;
+            }
+
+            if (isIntraCommunity(leafA, leafB))
+            {
+                intraCandidateEdges++;
+            }
+            else
+            {
+                interCandidateEdges++;
+            }
         }
     }
 
@@ -1524,6 +1609,38 @@ main(int argc, char* argv[])
                   << edge.leafA << "-" << edge.leafB << " traffic=" << edge.traffic
                   << " expected=" << edge.expected << " B=" << edge.modularityGain
                   << " U=" << edge.utility << std::endl;
+    }
+
+    std::cout << "[HYBRID-DCN][COMMUNITY] previewEnabled = true" << std::endl;
+    std::cout << "[HYBRID-DCN][COMMUNITY] source = trafficMatrixMode" << std::endl;
+    std::cout << "[HYBRID-DCN][COMMUNITY] communityCount = "
+              << communityPreview.communityCount << std::endl;
+    if (trafficMatrixMode == "uniform")
+    {
+        std::cout
+            << "[HYBRID-DCN][COMMUNITY] note = uniform matrix diagnostic preview only"
+            << std::endl;
+    }
+    for (uint32_t leafIndex = 0; leafIndex < numLeaves; ++leafIndex)
+    {
+        std::cout << "[HYBRID-DCN][COMMUNITY] leaf-" << leafIndex
+                  << " community = " << communityPreview.labels[leafIndex] << std::endl;
+    }
+    std::cout << "[HYBRID-DCN][COMMUNITY] intraCandidateEdges = "
+              << intraCandidateEdges << std::endl;
+    std::cout << "[HYBRID-DCN][COMMUNITY] interCandidateEdges = "
+              << interCandidateEdges << std::endl;
+    if (selectedOcsEdges.empty())
+    {
+        std::cout << "[HYBRID-DCN][COMMUNITY] selectedEdges = 0" << std::endl;
+    }
+    for (uint32_t edgeIndex = 0; edgeIndex < selectedOcsEdges.size(); ++edgeIndex)
+    {
+        const auto& edge = selectedOcsEdges[edgeIndex];
+        std::cout << "[HYBRID-DCN][COMMUNITY] selectedEdge[" << edgeIndex
+                  << "] intraCommunity = "
+                  << (isIntraCommunity(edge.leafA, edge.leafB) ? "true" : "false")
+                  << std::endl;
     }
 
     std::cout << "[HYBRID-DCN][MATRIX] instantiatedOcsLeafA = " << ocsLeafA << std::endl;
