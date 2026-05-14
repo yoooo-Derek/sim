@@ -26,6 +26,10 @@ struct OcsCandidateEdge
     double expected;
     double modularityGain;
     double utility;
+    double baseUtility;
+    double communityFactor;
+    double communityUtility;
+    bool intraCommunity;
 };
 
 struct OcsInstalledLink
@@ -252,6 +256,7 @@ main(int argc, char* argv[])
     double louvainEpsilon = 1e-9;
     std::string selectionMetric = "excess";
     double eta = 1.0;
+    double communityAlpha = 0.5;
     uint32_t ocsPortK = 1;
     uint32_t maxSelectedOcsLinks = 1;
     bool enableMatrixFlows = true;
@@ -305,8 +310,9 @@ main(int argc, char* argv[])
     cmd.AddValue("communityMode", "Community label source: preview or louvain.", communityMode);
     cmd.AddValue("louvainMaxPasses", "Maximum passes for single-level Louvain local moving.", louvainMaxPasses);
     cmd.AddValue("louvainEpsilon", "Minimum modularity gain for Louvain local moving.", louvainEpsilon);
-    cmd.AddValue("selectionMetric", "OCS pair selection metric: absolute or excess.", selectionMetric);
+    cmd.AddValue("selectionMetric", "OCS pair selection metric: absolute, excess, or community-excess.", selectionMetric);
     cmd.AddValue("eta", "Resolution parameter for modularity gain.", eta);
+    cmd.AddValue("communityAlpha", "Cross-community utility discount factor for community-excess.", communityAlpha);
     cmd.AddValue("ocsPortK", "Per-Leaf OCS port budget for greedy candidate selection.", ocsPortK);
     cmd.AddValue("maxSelectedOcsLinks", "Maximum number of OCS candidate links selected by the controller.", maxSelectedOcsLinks);
     cmd.AddValue("enableMatrixFlows", "Enable Stage-12 matrix-driven multi-pair BulkSend flows.", enableMatrixFlows);
@@ -388,9 +394,11 @@ main(int argc, char* argv[])
         return 1;
     }
 
-    if (selectionMetric != "absolute" && selectionMetric != "excess")
+    if (selectionMetric != "absolute" && selectionMetric != "excess" &&
+        selectionMetric != "community-excess")
     {
-        std::cerr << "[HYBRID-DCN][ERROR] selectionMetric must be absolute or excess."
+        std::cerr
+            << "[HYBRID-DCN][ERROR] selectionMetric must be absolute, excess, or community-excess."
                   << std::endl;
         return 1;
     }
@@ -398,6 +406,12 @@ main(int argc, char* argv[])
     if (eta <= 0)
     {
         std::cerr << "[HYBRID-DCN][ERROR] eta must be greater than 0." << std::endl;
+        return 1;
+    }
+
+    if (communityAlpha <= 0 || communityAlpha >= 1)
+    {
+        std::cerr << "[HYBRID-DCN][ERROR] communityAlpha must be in (0, 1)." << std::endl;
         return 1;
     }
 
@@ -731,34 +745,63 @@ main(int argc, char* argv[])
     double selectedExpectedTraffic = 0.0;
     double selectedModularityGain = 0.0;
     double selectedOcsUtility = 0.0;
+    double selectedBaseUtility = 0.0;
+    double selectedCommunityFactor = 0.0;
+    double selectedCommunityUtility = 0.0;
+    bool selectedIntraCommunity = false;
+
+    auto edgeScore = [&selectionMetric](const OcsCandidateEdge& edge) {
+        if (selectionMetric == "absolute")
+        {
+            return edge.traffic;
+        }
+        if (selectionMetric == "excess")
+        {
+            return edge.baseUtility;
+        }
+        return edge.communityUtility;
+    };
+
+    auto makeCandidateEdge = [&](uint32_t leafA, uint32_t leafB) {
+        const double baseUtility = ocsUtility[leafA][leafB];
+        const bool intraCommunity = isIntraCommunity(leafA, leafB);
+        const double communityFactor = intraCommunity ? 1.0 : communityAlpha;
+        const double communityUtility = baseUtility * communityFactor;
+        OcsCandidateEdge edge{leafA,
+                              leafB,
+                              torTrafficMatrix[leafA][leafB],
+                              expectedTraffic[leafA][leafB],
+                              modularityGain[leafA][leafB],
+                              0.0,
+                              baseUtility,
+                              communityFactor,
+                              communityUtility,
+                              intraCommunity};
+        edge.utility = edgeScore(edge);
+        return edge;
+    };
+
     std::vector<OcsCandidateEdge> candidateEdges;
     for (uint32_t i = 0; i < numLeaves; ++i)
     {
         for (uint32_t j = i + 1; j < numLeaves; ++j)
         {
-            const double score =
-                selectionMetric == "absolute" ? torTrafficMatrix[i][j] : ocsUtility[i][j];
+            const OcsCandidateEdge edge = makeCandidateEdge(i, j);
+            const double score = edgeScore(edge);
             if (score <= 0)
             {
                 continue;
             }
 
-            candidateEdges.push_back({i,
-                                      j,
-                                      torTrafficMatrix[i][j],
-                                      expectedTraffic[i][j],
-                                      modularityGain[i][j],
-                                      ocsUtility[i][j]});
+            candidateEdges.push_back(edge);
         }
     }
 
     std::sort(candidateEdges.begin(),
               candidateEdges.end(),
-              [&selectionMetric](const OcsCandidateEdge& lhs, const OcsCandidateEdge& rhs) {
-                  const double lhsScore =
-                      selectionMetric == "absolute" ? lhs.traffic : lhs.utility;
-                  const double rhsScore =
-                      selectionMetric == "absolute" ? rhs.traffic : rhs.utility;
+              [&edgeScore](const OcsCandidateEdge& lhs, const OcsCandidateEdge& rhs) {
+                  const double lhsScore = edgeScore(lhs);
+                  const double rhsScore = edgeScore(rhs);
                   if (lhsScore != rhsScore)
                   {
                       return lhsScore > rhsScore;
@@ -824,6 +867,10 @@ main(int argc, char* argv[])
         selectedExpectedTraffic = instantiatedEdge.expected;
         selectedModularityGain = instantiatedEdge.modularityGain;
         selectedOcsUtility = instantiatedEdge.utility;
+        selectedBaseUtility = instantiatedEdge.baseUtility;
+        selectedCommunityFactor = instantiatedEdge.communityFactor;
+        selectedCommunityUtility = instantiatedEdge.communityUtility;
+        selectedIntraCommunity = instantiatedEdge.intraCommunity;
 
         if (routeMode != "ocs-forced")
         {
@@ -1260,12 +1307,7 @@ main(int argc, char* argv[])
         }
         else
         {
-            edgesToInstall.push_back({ocsLeafA,
-                                      ocsLeafB,
-                                      torTrafficMatrix[ocsLeafA][ocsLeafB],
-                                      expectedTraffic[ocsLeafA][ocsLeafB],
-                                      modularityGain[ocsLeafA][ocsLeafB],
-                                      ocsUtility[ocsLeafA][ocsLeafB]});
+            edgesToInstall.push_back(makeCandidateEdge(ocsLeafA, ocsLeafB));
         }
 
         for (const auto& edge : edgesToInstall)
@@ -1755,6 +1797,15 @@ main(int argc, char* argv[])
               << (enableMatrixSelect ? selectedModularityGain : 0.0) << std::endl;
     std::cout << "[HYBRID-DCN][MATRIX] selectedUtility  = "
               << (enableMatrixSelect ? selectedOcsUtility : 0.0) << std::endl;
+    std::cout << "[HYBRID-DCN][MATRIX] selectedBaseUtility = "
+              << (enableMatrixSelect ? selectedBaseUtility : 0.0) << std::endl;
+    std::cout << "[HYBRID-DCN][MATRIX] selectedCommunityFactor = "
+              << (enableMatrixSelect ? selectedCommunityFactor : 0.0) << std::endl;
+    std::cout << "[HYBRID-DCN][MATRIX] selectedCommunityUtility = "
+              << (enableMatrixSelect ? selectedCommunityUtility : 0.0) << std::endl;
+    std::cout << "[HYBRID-DCN][MATRIX] selectedIntraCommunity = "
+              << (enableMatrixSelect ? (selectedIntraCommunity ? "true" : "false") : "false")
+              << std::endl;
     std::cout << "[HYBRID-DCN][MATRIX] traffic[0][1]      = "
               << (numLeaves >= 2 ? torTrafficMatrix[0][1] : 0.0) << std::endl;
     std::cout << "[HYBRID-DCN][MATRIX] traffic[0][3]      = "
@@ -1779,6 +1830,9 @@ main(int argc, char* argv[])
         std::cout << "[HYBRID-DCN][MATRIX] candidate[" << edgeIndex << "] = " << edge.leafA
                   << "-" << edge.leafB << " traffic=" << edge.traffic
                   << " expected=" << edge.expected << " B=" << edge.modularityGain
+                  << " baseUtility=" << edge.baseUtility
+                  << " communityFactor=" << edge.communityFactor
+                  << " communityUtility=" << edge.communityUtility
                   << " U=" << edge.utility << std::endl;
     }
 
@@ -1789,10 +1843,24 @@ main(int argc, char* argv[])
                   << edge.leafA << "-" << edge.leafB << " traffic=" << edge.traffic
                   << " expected=" << edge.expected << " B=" << edge.modularityGain
                   << " U=" << edge.utility << std::endl;
+        std::cout << "[HYBRID-DCN][MATRIX] selectedEdge[" << edgeIndex
+                  << "] baseUtility = " << edge.baseUtility << std::endl;
+        std::cout << "[HYBRID-DCN][MATRIX] selectedEdge[" << edgeIndex
+                  << "] communityFactor = " << edge.communityFactor << std::endl;
+        std::cout << "[HYBRID-DCN][MATRIX] selectedEdge[" << edgeIndex
+                  << "] communityUtility = " << edge.communityUtility << std::endl;
+        std::cout << "[HYBRID-DCN][MATRIX] selectedEdge[" << edgeIndex
+                  << "] intraCommunity = " << (edge.intraCommunity ? "true" : "false")
+                  << std::endl;
     }
 
     std::cout << "[HYBRID-DCN][COMMUNITY] previewEnabled = true" << std::endl;
     std::cout << "[HYBRID-DCN][COMMUNITY] communityMode = " << communityMode << std::endl;
+    std::cout << "[HYBRID-DCN][COMMUNITY] communityAlpha = " << communityAlpha
+              << std::endl;
+    std::cout << "[HYBRID-DCN][COMMUNITY] intraCommunityFactor = 1" << std::endl;
+    std::cout << "[HYBRID-DCN][COMMUNITY] interCommunityFactor = " << communityAlpha
+              << std::endl;
     std::cout << "[HYBRID-DCN][COMMUNITY] source = "
               << (communityMode == "louvain" ? "louvain-single-level"
                                               : "trafficMatrixMode-preview")
