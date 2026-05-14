@@ -265,6 +265,8 @@ main(int argc, char* argv[])
     std::string previousOcsMode = "none";
     uint32_t previousOcsLeafA = 0;
     uint32_t previousOcsLeafB = 1;
+    bool enableConfigUpdateGate = false;
+    double configUpdateThreshold = 0.0;
     uint32_t ocsPortK = 1;
     uint32_t maxSelectedOcsLinks = 1;
     bool enableMatrixFlows = true;
@@ -326,6 +328,8 @@ main(int argc, char* argv[])
     cmd.AddValue("previousOcsMode", "Previous OCS state mode: none, same-as-manual, skewed-primary, clustered-primary, or custom.", previousOcsMode);
     cmd.AddValue("previousOcsLeafA", "First Leaf/ToR index for custom previous OCS state.", previousOcsLeafA);
     cmd.AddValue("previousOcsLeafB", "Second Leaf/ToR index for custom previous OCS state.", previousOcsLeafB);
+    cmd.AddValue("enableConfigUpdateGate", "Enable single-cycle OCS configuration update threshold gating.", enableConfigUpdateGate);
+    cmd.AddValue("configUpdateThreshold", "Configuration update threshold for candidate-vs-previous OCS selection.", configUpdateThreshold);
     cmd.AddValue("ocsPortK", "Per-Leaf OCS port budget for greedy candidate selection.", ocsPortK);
     cmd.AddValue("maxSelectedOcsLinks", "Maximum number of OCS candidate links selected by the controller.", maxSelectedOcsLinks);
     cmd.AddValue("enableMatrixFlows", "Enable Stage-12 matrix-driven multi-pair BulkSend flows.", enableMatrixFlows);
@@ -468,6 +472,14 @@ main(int argc, char* argv[])
     {
         std::cerr
             << "[HYBRID-DCN][ERROR] previousOcsMode=clustered-primary requires numLeaves >= 2."
+            << std::endl;
+        return 1;
+    }
+
+    if (configUpdateThreshold < 0)
+    {
+        std::cerr
+            << "[HYBRID-DCN][ERROR] configUpdateThreshold must be greater than or equal to 0."
             << std::endl;
         return 1;
     }
@@ -922,20 +934,49 @@ main(int argc, char* argv[])
               });
 
     std::vector<uint32_t> ocsDegree(numLeaves, 0);
-    std::vector<OcsCandidateEdge> selectedOcsEdges;
+    std::vector<OcsCandidateEdge> candidateOcsEdges;
     for (const auto& edge : candidateEdges)
     {
-        if (selectedOcsEdges.size() >= maxSelectedOcsLinks)
+        if (candidateOcsEdges.size() >= maxSelectedOcsLinks)
         {
             break;
         }
 
         if (ocsDegree[edge.leafA] < ocsPortK && ocsDegree[edge.leafB] < ocsPortK)
         {
-            selectedOcsEdges.push_back(edge);
+            candidateOcsEdges.push_back(edge);
             ocsDegree[edge.leafA]++;
             ocsDegree[edge.leafB]++;
         }
+    }
+
+    auto configScore = [](const std::vector<OcsCandidateEdge>& edges) {
+        double score = 0.0;
+        for (const auto& edge : edges)
+        {
+            score += edge.selectionScore;
+        }
+        return score;
+    };
+
+    const double candidateConfigScore = configScore(candidateOcsEdges);
+    const double previousConfigScore = configScore(previousOcsEdges);
+    const double configScoreImprovement = candidateConfigScore - previousConfigScore;
+    std::string configGateDecision = "disabled";
+    std::vector<OcsCandidateEdge> selectedOcsEdges;
+    if (!enableConfigUpdateGate)
+    {
+        selectedOcsEdges = candidateOcsEdges;
+    }
+    else if (configScoreImprovement > configUpdateThreshold)
+    {
+        selectedOcsEdges = candidateOcsEdges;
+        configGateDecision = "use-candidate";
+    }
+    else
+    {
+        selectedOcsEdges = previousOcsEdges;
+        configGateDecision = "keep-previous";
     }
 
     uint32_t intraCandidateEdges = 0;
@@ -962,9 +1003,15 @@ main(int argc, char* argv[])
 
     if (enableMatrixSelect)
     {
-        if (selectedOcsEdges.empty())
+        if (candidateOcsEdges.empty())
         {
             std::cerr << "[HYBRID-DCN][ERROR] no OCS candidate edge selected." << std::endl;
+            return 1;
+        }
+
+        if (selectedOcsEdges.empty())
+        {
+            std::cerr << "[HYBRID-DCN][ERROR] no final OCS edge selected." << std::endl;
             return 1;
         }
 
@@ -1953,6 +2000,39 @@ main(int argc, char* argv[])
     std::cout << "[HYBRID-DCN][MATRIX] ocsPortK           = " << ocsPortK << std::endl;
     std::cout << "[HYBRID-DCN][MATRIX] maxSelectedOcsLinks = "
               << maxSelectedOcsLinks << std::endl;
+
+    std::cout << "[HYBRID-DCN][CONFIG] enableConfigUpdateGate = "
+              << (enableConfigUpdateGate ? "true" : "false") << std::endl;
+    std::cout << "[HYBRID-DCN][CONFIG] configUpdateThreshold = "
+              << configUpdateThreshold << std::endl;
+    std::cout << "[HYBRID-DCN][CONFIG] candidateConfigScore = "
+              << candidateConfigScore << std::endl;
+    std::cout << "[HYBRID-DCN][CONFIG] previousConfigScore = "
+              << previousConfigScore << std::endl;
+    std::cout << "[HYBRID-DCN][CONFIG] configScoreImprovement = "
+              << configScoreImprovement << std::endl;
+    std::cout << "[HYBRID-DCN][CONFIG] decision = " << configGateDecision << std::endl;
+    std::cout << "[HYBRID-DCN][CONFIG] candidateEdges = "
+              << candidateOcsEdges.size() << std::endl;
+    std::cout << "[HYBRID-DCN][CONFIG] selectedEdges = "
+              << selectedOcsEdges.size() << std::endl;
+    if (configGateDecision == "keep-previous")
+    {
+        std::cout << "[HYBRID-DCN][CONFIG] note = keeping previous OCS configuration because improvement does not exceed threshold"
+                  << std::endl;
+    }
+    if (enableConfigUpdateGate && previousOcsEdges.empty())
+    {
+        std::cout << "[HYBRID-DCN][CONFIG] note = previous OCS configuration is empty"
+                  << std::endl;
+    }
+    for (uint32_t edgeIndex = 0; edgeIndex < candidateOcsEdges.size(); ++edgeIndex)
+    {
+        const auto& edge = candidateOcsEdges[edgeIndex];
+        std::cout << "[HYBRID-DCN][CONFIG] candidateEdge[" << edgeIndex
+                  << "] = " << edge.leafA << "-" << edge.leafB
+                  << " selectionScore=" << edge.selectionScore << std::endl;
+    }
 
     const uint32_t candidateLogCount =
         static_cast<uint32_t>(std::min<size_t>(candidateEdges.size(), 3));
