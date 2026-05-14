@@ -30,6 +30,9 @@ struct OcsCandidateEdge
     double communityFactor;
     double communityUtility;
     bool intraCommunity;
+    bool wasPreviouslyInstalled;
+    double stateHoldingGain;
+    double selectionScore;
 };
 
 struct OcsInstalledLink
@@ -257,6 +260,11 @@ main(int argc, char* argv[])
     std::string selectionMetric = "excess";
     double eta = 1.0;
     double communityAlpha = 0.5;
+    bool enableStateHolding = false;
+    double stateHoldingLambda = 0.0;
+    std::string previousOcsMode = "none";
+    uint32_t previousOcsLeafA = 0;
+    uint32_t previousOcsLeafB = 1;
     uint32_t ocsPortK = 1;
     uint32_t maxSelectedOcsLinks = 1;
     bool enableMatrixFlows = true;
@@ -313,6 +321,11 @@ main(int argc, char* argv[])
     cmd.AddValue("selectionMetric", "OCS pair selection metric: absolute, excess, or community-excess.", selectionMetric);
     cmd.AddValue("eta", "Resolution parameter for modularity gain.", eta);
     cmd.AddValue("communityAlpha", "Cross-community utility discount factor for community-excess.", communityAlpha);
+    cmd.AddValue("enableStateHolding", "Enable previous-cycle OCS state holding gain.", enableStateHolding);
+    cmd.AddValue("stateHoldingLambda", "State holding gain for previously installed OCS edges.", stateHoldingLambda);
+    cmd.AddValue("previousOcsMode", "Previous OCS state mode: none, same-as-manual, skewed-primary, clustered-primary, or custom.", previousOcsMode);
+    cmd.AddValue("previousOcsLeafA", "First Leaf/ToR index for custom previous OCS state.", previousOcsLeafA);
+    cmd.AddValue("previousOcsLeafB", "Second Leaf/ToR index for custom previous OCS state.", previousOcsLeafB);
     cmd.AddValue("ocsPortK", "Per-Leaf OCS port budget for greedy candidate selection.", ocsPortK);
     cmd.AddValue("maxSelectedOcsLinks", "Maximum number of OCS candidate links selected by the controller.", maxSelectedOcsLinks);
     cmd.AddValue("enableMatrixFlows", "Enable Stage-12 matrix-driven multi-pair BulkSend flows.", enableMatrixFlows);
@@ -412,6 +425,50 @@ main(int argc, char* argv[])
     if (communityAlpha <= 0 || communityAlpha >= 1)
     {
         std::cerr << "[HYBRID-DCN][ERROR] communityAlpha must be in (0, 1)." << std::endl;
+        return 1;
+    }
+
+    if (stateHoldingLambda < 0)
+    {
+        std::cerr
+            << "[HYBRID-DCN][ERROR] stateHoldingLambda must be greater than or equal to 0."
+            << std::endl;
+        return 1;
+    }
+
+    if (previousOcsMode != "none" && previousOcsMode != "same-as-manual" &&
+        previousOcsMode != "skewed-primary" && previousOcsMode != "clustered-primary" &&
+        previousOcsMode != "custom")
+    {
+        std::cerr << "[HYBRID-DCN][ERROR] previousOcsMode must be none, same-as-manual, "
+                     "skewed-primary, clustered-primary, or custom."
+                  << std::endl;
+        return 1;
+    }
+
+    if (previousOcsMode == "custom" &&
+        (previousOcsLeafA >= numLeaves || previousOcsLeafB >= numLeaves ||
+         previousOcsLeafA == previousOcsLeafB))
+    {
+        std::cerr
+            << "[HYBRID-DCN][ERROR] previousOcs custom leaves must be valid and different."
+            << std::endl;
+        return 1;
+    }
+
+    if (previousOcsMode == "skewed-primary" && numLeaves < 4)
+    {
+        std::cerr
+            << "[HYBRID-DCN][ERROR] previousOcsMode=skewed-primary requires numLeaves >= 4."
+            << std::endl;
+        return 1;
+    }
+
+    if (previousOcsMode == "clustered-primary" && numLeaves < 2)
+    {
+        std::cerr
+            << "[HYBRID-DCN][ERROR] previousOcsMode=clustered-primary requires numLeaves >= 2."
+            << std::endl;
         return 1;
     }
 
@@ -741,6 +798,39 @@ main(int argc, char* argv[])
         return activeCommunityLabels[leafA] == activeCommunityLabels[leafB];
     };
 
+    std::vector<std::vector<bool>> previousOcsState(numLeaves,
+                                                    std::vector<bool>(numLeaves, false));
+    std::vector<OcsCandidateEdge> previousOcsEdges;
+
+    auto markPreviousOcsEdge = [&](uint32_t leafA, uint32_t leafB) {
+        previousOcsState[leafA][leafB] = true;
+        previousOcsState[leafB][leafA] = true;
+    };
+
+    if (previousOcsMode == "same-as-manual")
+    {
+        if (ocsLeafA >= numLeaves || ocsLeafB >= numLeaves || ocsLeafA == ocsLeafB)
+        {
+            std::cerr
+                << "[HYBRID-DCN][ERROR] previousOcsMode=same-as-manual requires valid and different ocsLeafA/ocsLeafB."
+                << std::endl;
+            return 1;
+        }
+        markPreviousOcsEdge(ocsLeafA, ocsLeafB);
+    }
+    else if (previousOcsMode == "skewed-primary")
+    {
+        markPreviousOcsEdge(0, 3);
+    }
+    else if (previousOcsMode == "clustered-primary")
+    {
+        markPreviousOcsEdge(0, 1);
+    }
+    else if (previousOcsMode == "custom")
+    {
+        markPreviousOcsEdge(previousOcsLeafA, previousOcsLeafB);
+    }
+
     double selectedOcsWeight = 0.0;
     double selectedExpectedTraffic = 0.0;
     double selectedModularityGain = 0.0;
@@ -749,8 +839,11 @@ main(int argc, char* argv[])
     double selectedCommunityFactor = 0.0;
     double selectedCommunityUtility = 0.0;
     bool selectedIntraCommunity = false;
+    bool selectedWasPreviouslyInstalled = false;
+    double selectedStateHoldingGain = 0.0;
+    double selectedSelectionScore = 0.0;
 
-    auto edgeScore = [&selectionMetric](const OcsCandidateEdge& edge) {
+    auto edgeScoreWithoutState = [&selectionMetric](const OcsCandidateEdge& edge) {
         if (selectionMetric == "absolute")
         {
             return edge.traffic;
@@ -767,6 +860,9 @@ main(int argc, char* argv[])
         const bool intraCommunity = isIntraCommunity(leafA, leafB);
         const double communityFactor = intraCommunity ? 1.0 : communityAlpha;
         const double communityUtility = baseUtility * communityFactor;
+        const bool wasPreviouslyInstalled = previousOcsState[leafA][leafB];
+        const double stateHoldingGain =
+            enableStateHolding && wasPreviouslyInstalled ? stateHoldingLambda : 0.0;
         OcsCandidateEdge edge{leafA,
                               leafB,
                               torTrafficMatrix[leafA][leafB],
@@ -776,10 +872,25 @@ main(int argc, char* argv[])
                               baseUtility,
                               communityFactor,
                               communityUtility,
-                              intraCommunity};
-        edge.utility = edgeScore(edge);
+                              intraCommunity,
+                              wasPreviouslyInstalled,
+                              stateHoldingGain,
+                              0.0};
+        edge.utility = edgeScoreWithoutState(edge);
+        edge.selectionScore = edge.utility + edge.stateHoldingGain;
         return edge;
     };
+
+    for (uint32_t leafA = 0; leafA < numLeaves; ++leafA)
+    {
+        for (uint32_t leafB = leafA + 1; leafB < numLeaves; ++leafB)
+        {
+            if (previousOcsState[leafA][leafB])
+            {
+                previousOcsEdges.push_back(makeCandidateEdge(leafA, leafB));
+            }
+        }
+    }
 
     std::vector<OcsCandidateEdge> candidateEdges;
     for (uint32_t i = 0; i < numLeaves; ++i)
@@ -787,8 +898,7 @@ main(int argc, char* argv[])
         for (uint32_t j = i + 1; j < numLeaves; ++j)
         {
             const OcsCandidateEdge edge = makeCandidateEdge(i, j);
-            const double score = edgeScore(edge);
-            if (score <= 0)
+            if (edge.selectionScore <= 0)
             {
                 continue;
             }
@@ -799,12 +909,10 @@ main(int argc, char* argv[])
 
     std::sort(candidateEdges.begin(),
               candidateEdges.end(),
-              [&edgeScore](const OcsCandidateEdge& lhs, const OcsCandidateEdge& rhs) {
-                  const double lhsScore = edgeScore(lhs);
-                  const double rhsScore = edgeScore(rhs);
-                  if (lhsScore != rhsScore)
+              [](const OcsCandidateEdge& lhs, const OcsCandidateEdge& rhs) {
+                  if (lhs.selectionScore != rhs.selectionScore)
                   {
-                      return lhsScore > rhsScore;
+                      return lhs.selectionScore > rhs.selectionScore;
                   }
                   if (lhs.leafA != rhs.leafA)
                   {
@@ -871,6 +979,9 @@ main(int argc, char* argv[])
         selectedCommunityFactor = instantiatedEdge.communityFactor;
         selectedCommunityUtility = instantiatedEdge.communityUtility;
         selectedIntraCommunity = instantiatedEdge.intraCommunity;
+        selectedWasPreviouslyInstalled = instantiatedEdge.wasPreviouslyInstalled;
+        selectedStateHoldingGain = instantiatedEdge.stateHoldingGain;
+        selectedSelectionScore = instantiatedEdge.selectionScore;
 
         if (routeMode != "ocs-forced")
         {
@@ -1448,6 +1559,8 @@ main(int argc, char* argv[])
     std::vector<Ptr<PacketSink>> matrixFlowSinks;
     if (enableMatrixFlows)
     {
+        std::vector<std::vector<bool>> matrixFlowPairUsed(numLeaves,
+                                                          std::vector<bool>(numLeaves, false));
         for (const auto& link : installedOcsLinks)
         {
             std::ostringstream flowName;
@@ -1460,15 +1573,21 @@ main(int argc, char* argv[])
                                                              matrixFlowSpecs.size()),
                                        true,
                                        flowName.str()});
+            matrixFlowPairUsed[link.leafA][link.leafB] = true;
+            matrixFlowPairUsed[link.leafB][link.leafA] = true;
         }
 
-        bool residualMatrixFlowAdded = false;
-        for (uint32_t srcLeaf = 0; srcLeaf < numLeaves && !residualMatrixFlowAdded; ++srcLeaf)
+        const size_t minMatrixFlowCount = 3;
+        uint32_t residualMatrixFlowsAdded = 0;
+        for (uint32_t srcLeaf = 0;
+             srcLeaf < numLeaves && matrixFlowSpecs.size() < minMatrixFlowCount;
+             ++srcLeaf)
         {
             for (uint32_t dstLeaf = srcLeaf + 1; dstLeaf < numLeaves; ++dstLeaf)
             {
                 if (torTrafficMatrix[srcLeaf][dstLeaf] <= 0 ||
-                    isOcsPairInstalled(srcLeaf, dstLeaf))
+                    isOcsPairInstalled(srcLeaf, dstLeaf) ||
+                    matrixFlowPairUsed[srcLeaf][dstLeaf])
                 {
                     continue;
                 }
@@ -1483,12 +1602,17 @@ main(int argc, char* argv[])
                                                                  matrixFlowSpecs.size()),
                                            false,
                                            flowName.str()});
-                residualMatrixFlowAdded = true;
-                break;
+                matrixFlowPairUsed[srcLeaf][dstLeaf] = true;
+                matrixFlowPairUsed[dstLeaf][srcLeaf] = true;
+                residualMatrixFlowsAdded++;
+                if (matrixFlowSpecs.size() >= minMatrixFlowCount)
+                {
+                    break;
+                }
             }
         }
 
-        if (!residualMatrixFlowAdded)
+        if (residualMatrixFlowsAdded == 0)
         {
             std::cerr << "[HYBRID-DCN][ERROR] no residual matrix flow candidate found."
                       << std::endl;
@@ -1806,6 +1930,14 @@ main(int argc, char* argv[])
     std::cout << "[HYBRID-DCN][MATRIX] selectedIntraCommunity = "
               << (enableMatrixSelect ? (selectedIntraCommunity ? "true" : "false") : "false")
               << std::endl;
+    std::cout << "[HYBRID-DCN][MATRIX] selectedWasPreviouslyInstalled = "
+              << (enableMatrixSelect ? (selectedWasPreviouslyInstalled ? "true" : "false")
+                                     : "false")
+              << std::endl;
+    std::cout << "[HYBRID-DCN][MATRIX] selectedStateHoldingGain = "
+              << (enableMatrixSelect ? selectedStateHoldingGain : 0.0) << std::endl;
+    std::cout << "[HYBRID-DCN][MATRIX] selectedSelectionScore = "
+              << (enableMatrixSelect ? selectedSelectionScore : 0.0) << std::endl;
     std::cout << "[HYBRID-DCN][MATRIX] traffic[0][1]      = "
               << (numLeaves >= 2 ? torTrafficMatrix[0][1] : 0.0) << std::endl;
     std::cout << "[HYBRID-DCN][MATRIX] traffic[0][3]      = "
@@ -1833,7 +1965,11 @@ main(int argc, char* argv[])
                   << " baseUtility=" << edge.baseUtility
                   << " communityFactor=" << edge.communityFactor
                   << " communityUtility=" << edge.communityUtility
-                  << " U=" << edge.utility << std::endl;
+                  << " U=" << edge.utility
+                  << " wasPreviouslyInstalled="
+                  << (edge.wasPreviouslyInstalled ? "true" : "false")
+                  << " stateHoldingGain=" << edge.stateHoldingGain
+                  << " selectionScore=" << edge.selectionScore << std::endl;
     }
 
     for (uint32_t edgeIndex = 0; edgeIndex < selectedOcsEdges.size(); ++edgeIndex)
@@ -1852,6 +1988,27 @@ main(int argc, char* argv[])
         std::cout << "[HYBRID-DCN][MATRIX] selectedEdge[" << edgeIndex
                   << "] intraCommunity = " << (edge.intraCommunity ? "true" : "false")
                   << std::endl;
+        std::cout << "[HYBRID-DCN][MATRIX] selectedEdge[" << edgeIndex
+                  << "] wasPreviouslyInstalled = "
+                  << (edge.wasPreviouslyInstalled ? "true" : "false") << std::endl;
+        std::cout << "[HYBRID-DCN][MATRIX] selectedEdge[" << edgeIndex
+                  << "] stateHoldingGain = " << edge.stateHoldingGain << std::endl;
+        std::cout << "[HYBRID-DCN][MATRIX] selectedEdge[" << edgeIndex
+                  << "] selectionScore = " << edge.selectionScore << std::endl;
+    }
+
+    std::cout << "[HYBRID-DCN][STATE] enableStateHolding = "
+              << (enableStateHolding ? "true" : "false") << std::endl;
+    std::cout << "[HYBRID-DCN][STATE] stateHoldingLambda = " << stateHoldingLambda
+              << std::endl;
+    std::cout << "[HYBRID-DCN][STATE] previousOcsMode = " << previousOcsMode << std::endl;
+    std::cout << "[HYBRID-DCN][STATE] previousOcsEdges = " << previousOcsEdges.size()
+              << std::endl;
+    for (uint32_t edgeIndex = 0; edgeIndex < previousOcsEdges.size(); ++edgeIndex)
+    {
+        const auto& edge = previousOcsEdges[edgeIndex];
+        std::cout << "[HYBRID-DCN][STATE] previousEdge[" << edgeIndex
+                  << "] = " << edge.leafA << "-" << edge.leafB << std::endl;
     }
 
     std::cout << "[HYBRID-DCN][COMMUNITY] previewEnabled = true" << std::endl;
