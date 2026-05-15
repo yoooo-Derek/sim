@@ -2061,6 +2061,100 @@ main(int argc, char* argv[])
                   << " selectionScore=" << edge.selectionScore << std::endl;
     }
 
+    std::cout << "[HYBRID-DCN][CONTROL] algorithmStage = stage-20-control-summary"
+              << std::endl;
+    std::cout << "[HYBRID-DCN][CONTROL] trafficMatrixMode = " << trafficMatrixMode
+              << std::endl;
+    std::cout << "[HYBRID-DCN][CONTROL] communityMode = " << communityMode << std::endl;
+    std::cout << "[HYBRID-DCN][CONTROL] selectionMetric = " << selectionMetric
+              << std::endl;
+    std::cout << "[HYBRID-DCN][CONTROL] eta = " << eta << std::endl;
+    std::cout << "[HYBRID-DCN][CONTROL] communityAlpha = " << communityAlpha
+              << std::endl;
+    std::cout << "[HYBRID-DCN][CONTROL] enableStateHolding = "
+              << (enableStateHolding ? "true" : "false") << std::endl;
+    std::cout << "[HYBRID-DCN][CONTROL] stateHoldingLambda = " << stateHoldingLambda
+              << std::endl;
+    std::cout << "[HYBRID-DCN][CONTROL] previousOcsMode = " << previousOcsMode
+              << std::endl;
+    std::cout << "[HYBRID-DCN][CONTROL] enableConfigUpdateGate = "
+              << (enableConfigUpdateGate ? "true" : "false") << std::endl;
+    std::cout << "[HYBRID-DCN][CONTROL] configUpdateThreshold = "
+              << configUpdateThreshold << std::endl;
+    std::cout << "[HYBRID-DCN][CONTROL] enableHoldTimeGate = "
+              << (enableHoldTimeGate ? "true" : "false") << std::endl;
+    std::cout << "[HYBRID-DCN][CONTROL] minHoldCycles = " << minHoldCycles
+              << std::endl;
+    std::cout << "[HYBRID-DCN][CONTROL] previousConfigAge = " << previousConfigAge
+              << std::endl;
+    std::cout << "[HYBRID-DCN][CONTROL] ocsPortK = " << ocsPortK << std::endl;
+    std::cout << "[HYBRID-DCN][CONTROL] maxSelectedOcsLinks = "
+              << maxSelectedOcsLinks << std::endl;
+    std::cout << "[HYBRID-DCN][CONTROL] routeMode = " << routeMode << std::endl;
+    std::cout << "[HYBRID-DCN][CONTROL] totalTraffic = " << totalTraffic << std::endl;
+    std::cout << "[HYBRID-DCN][CONTROL] candidateEdgeCount = "
+              << candidateEdges.size() << std::endl;
+    std::cout << "[HYBRID-DCN][CONTROL] candidateOcsEdges = "
+              << candidateOcsEdges.size() << std::endl;
+    std::cout << "[HYBRID-DCN][CONTROL] previousOcsEdges = "
+              << previousOcsEdges.size() << std::endl;
+    std::cout << "[HYBRID-DCN][CONTROL] finalSelectedOcsEdges = "
+              << selectedOcsEdges.size() << std::endl;
+    std::cout << "[HYBRID-DCN][CONTROL] configGateDecision = "
+              << configGateDecision << std::endl;
+    std::cout << "[HYBRID-DCN][CONTROL] holdTimeActive = "
+              << (holdTimeActive ? "true" : "false") << std::endl;
+    std::cout << "[HYBRID-DCN][CONTROL] candidateConfigScore = "
+              << candidateConfigScore << std::endl;
+    std::cout << "[HYBRID-DCN][CONTROL] previousConfigScore = "
+              << previousConfigScore << std::endl;
+    std::cout << "[HYBRID-DCN][CONTROL] configScoreImprovement = "
+              << configScoreImprovement << std::endl;
+    std::cout << "[HYBRID-DCN][CONTROL] hasTrafficMatrix = true" << std::endl;
+    std::cout << "[HYBRID-DCN][CONTROL] hasCommunityLabels = true" << std::endl;
+    std::cout << "[HYBRID-DCN][CONTROL] hasCommunityUtility = "
+              << (selectionMetric == "community-excess" ? "true" : "false")
+              << std::endl;
+    std::cout << "[HYBRID-DCN][CONTROL] hasStateHolding = "
+              << (enableStateHolding ? "true" : "false") << std::endl;
+    std::cout << "[HYBRID-DCN][CONTROL] hasConfigGate = "
+              << (enableConfigUpdateGate ? "true" : "false") << std::endl;
+    std::cout << "[HYBRID-DCN][CONTROL] hasHoldGate = "
+              << (enableHoldTimeGate ? "true" : "false") << std::endl;
+    std::cout << "[HYBRID-DCN][CONTROL] finalConfigInstalled = "
+              << (installedOcsLinks.size() == selectedOcsEdges.size() ? "true" : "false")
+              << std::endl;
+    for (uint32_t edgeIndex = 0; edgeIndex < selectedOcsEdges.size(); ++edgeIndex)
+    {
+        const auto& edge = selectedOcsEdges[edgeIndex];
+        std::cout << "[HYBRID-DCN][CONTROL] finalEdge[" << edgeIndex
+                  << "] = " << edge.leafA << "-" << edge.leafB
+                  << " score=" << edge.selectionScore
+                  << " utility=" << edge.utility
+                  << " baseUtility=" << edge.baseUtility
+                  << " communityUtility=" << edge.communityUtility
+                  << " stateHoldingGain=" << edge.stateHoldingGain << std::endl;
+    }
+
+    std::cout << "[HYBRID-DCN][EXPERIMENT] experimentName = " << experimentName
+              << std::endl;
+    std::cout << "[HYBRID-DCN][EXPERIMENT] simTime = " << simTime << std::endl;
+    std::cout << "[HYBRID-DCN][EXPERIMENT] numSpines = " << numSpines << std::endl;
+    std::cout << "[HYBRID-DCN][EXPERIMENT] numLeaves = " << numLeaves << std::endl;
+    std::cout << "[HYBRID-DCN][EXPERIMENT] serversPerLeaf = " << serversPerLeaf
+              << std::endl;
+    std::cout << "[HYBRID-DCN][EXPERIMENT] ocsDataRate = " << ocsDataRate
+              << std::endl;
+    std::cout << "[HYBRID-DCN][EXPERIMENT] ocsDelay = " << ocsDelay << std::endl;
+    std::cout << "[HYBRID-DCN][EXPERIMENT] enableMatrixFlows = "
+              << (enableMatrixFlows ? "true" : "false") << std::endl;
+    std::cout << "[HYBRID-DCN][EXPERIMENT] matrixFlowMaxBytes = "
+              << matrixFlowMaxBytes << std::endl;
+    std::cout << "[HYBRID-DCN][EXPERIMENT] matrixFlowStart = " << matrixFlowStart
+              << std::endl;
+    std::cout << "[HYBRID-DCN][EXPERIMENT] matrixFlowPortBase = "
+              << matrixFlowPortBase << std::endl;
+
     const uint32_t candidateLogCount =
         static_cast<uint32_t>(std::min<size_t>(candidateEdges.size(), 3));
     for (uint32_t edgeIndex = 0; edgeIndex < candidateLogCount; ++edgeIndex)
