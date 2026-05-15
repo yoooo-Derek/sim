@@ -302,6 +302,8 @@ main(int argc, char* argv[])
     uint64_t matrixFlowMaxBytes = 524288;
     double matrixFlowStart = 0.35;
     uint16_t matrixFlowPortBase = 11000;
+    bool enableResultValidation = true;
+    std::string validationMode = "warn";
 
     const uint32_t bulkSrcLeaf = 0;
     const uint32_t bulkSrcServer = 0;
@@ -428,6 +430,10 @@ main(int argc, char* argv[])
     cmd.AddValue("matrixFlowMaxBytes", "MaxBytes for each matrix-generated BulkSend flow.", matrixFlowMaxBytes);
     cmd.AddValue("matrixFlowStart", "Start time for matrix-generated BulkSend flows in seconds.", matrixFlowStart);
     cmd.AddValue("matrixFlowPortBase", "Base TCP port for matrix-generated PacketSink applications.", matrixFlowPortBase);
+    cmd.AddValue("enableResultValidation",
+                 "Enable Stage-24 result consistency validation logs.",
+                 enableResultValidation);
+    cmd.AddValue("validationMode", "Result validation mode: warn or silent.", validationMode);
     cmd.Parse(static_cast<int>(normalizedArgv.size()), normalizedArgv.data());
 
     const bool presetApplied = presetScenario != "manual";
@@ -444,6 +450,13 @@ main(int argc, char* argv[])
         presetScenario != "full-control")
     {
         std::cerr << "[HYBRID-DCN][ERROR] presetScenario must be manual, baseline-excess, community-aware, state-aware, config-gated, hold-gated, or full-control."
+                  << std::endl;
+        return 1;
+    }
+
+    if (validationMode != "warn" && validationMode != "silent")
+    {
+        std::cerr << "[HYBRID-DCN][ERROR] validationMode must be warn or silent."
                   << std::endl;
         return 1;
     }
@@ -3260,6 +3273,142 @@ main(int argc, char* argv[])
               << (ocsAndEpsBothObserved ? "true" : "false") << std::endl;
     std::cout << "[HYBRID-DCN][RESULT] dataPlaneValidationPass = "
               << (dataPlaneValidationPass ? "true" : "false") << std::endl;
+
+    std::cout << "[HYBRID-DCN][VALIDATION] enabled = "
+              << (enableResultValidation ? "true" : "false") << std::endl;
+    std::cout << "[HYBRID-DCN][VALIDATION] validationMode = " << validationMode
+              << std::endl;
+    if (enableResultValidation && validationMode == "warn")
+    {
+        auto passFail = [](bool passed) {
+            return passed ? "pass" : "fail";
+        };
+
+        const bool finalConfigInstalledCheck =
+            installedOcsLinks.size() == selectedOcsEdges.size();
+        const bool matrixCompletionCheck =
+            enableMatrixFlows && !matrixFlowSpecs.empty() &&
+            resultCompletedFlows == matrixFlowSpecs.size();
+        const bool coveredResidualMixCheck =
+            enableMatrixFlows && resultCoveredFlows > 0 && resultResidualFlows > 0;
+        const bool ocsEpsObservationCheck = resultOcsObservedUse && resultEpsObservedUse;
+        const bool dataPlaneValidationCheck = dataPlaneValidationPass;
+        const bool presetExpectationAdjustedByExplicitArgs =
+            presetOverrideMode == "explicit-wins" && !explicitArgNames.empty();
+
+        bool presetExpectationKnown = false;
+        bool presetExpectationPass = true;
+        std::string presetExpectation = "none";
+        std::string presetExpectationCheck = "skipped";
+
+        if (presetScenario == "manual")
+        {
+            presetExpectation = "manual-no-fixed-expectation";
+        }
+        else if (presetExpectationAdjustedByExplicitArgs)
+        {
+            presetExpectation = presetScenario;
+            presetExpectationCheck = "skipped-explicit-overrides";
+        }
+        else if (presetScenario == "baseline-excess")
+        {
+            presetExpectationKnown = true;
+            presetExpectation = "baseline-excess";
+            presetExpectationPass = selectionMetric == "excess" &&
+                                    configGateDecision == "disabled" &&
+                                    selectedOcsEdges.size() == 2 &&
+                                    installedOcsLinks.size() == 2 &&
+                                    resultCompletedFlows == matrixFlowSpecs.size();
+        }
+        else if (presetScenario == "community-aware")
+        {
+            presetExpectationKnown = true;
+            presetExpectation = "community-aware";
+            presetExpectationPass = selectionMetric == "community-excess" &&
+                                    communityMode == "louvain" &&
+                                    !enableStateHolding &&
+                                    selectedOcsEdges.size() == 2 &&
+                                    dataPlaneValidationPass;
+        }
+        else if (presetScenario == "state-aware")
+        {
+            presetExpectationKnown = true;
+            presetExpectation = "state-aware";
+            presetExpectationPass = enableStateHolding &&
+                                    !enableConfigUpdateGate &&
+                                    configGateDecision == "disabled" &&
+                                    selectedOcsEdges.size() == 2 &&
+                                    dataPlaneValidationPass;
+        }
+        else if (presetScenario == "config-gated")
+        {
+            presetExpectationKnown = true;
+            presetExpectation = "config-gated";
+            presetExpectationPass = enableConfigUpdateGate &&
+                                    configGateDecision == "use-candidate" &&
+                                    selectedOcsEdges.size() == 2 &&
+                                    dataPlaneValidationPass;
+        }
+        else if (presetScenario == "hold-gated")
+        {
+            presetExpectationKnown = true;
+            presetExpectation = "hold-gated";
+            presetExpectationPass = enableHoldTimeGate &&
+                                    holdTimeActive &&
+                                    configGateDecision == "hold-previous" &&
+                                    selectedOcsEdges.size() == 1 &&
+                                    dataPlaneValidationPass;
+        }
+        else if (presetScenario == "full-control")
+        {
+            presetExpectationKnown = true;
+            presetExpectation = "full-control";
+            presetExpectationPass = enableHoldTimeGate &&
+                                    previousConfigAge >= minHoldCycles &&
+                                    !holdTimeActive &&
+                                    configGateDecision == "use-candidate" &&
+                                    selectedOcsEdges.size() == 2 &&
+                                    dataPlaneValidationPass;
+        }
+
+        if (presetExpectationKnown)
+        {
+            presetExpectationCheck = passFail(presetExpectationPass);
+        }
+
+        const bool includePresetExpectation =
+            presetExpectationCheck != "skipped" &&
+            presetExpectationCheck != "skipped-explicit-overrides";
+        const bool overallResultConsistency =
+            finalConfigInstalledCheck &&
+            matrixCompletionCheck &&
+            coveredResidualMixCheck &&
+            ocsEpsObservationCheck &&
+            dataPlaneValidationCheck &&
+            (!includePresetExpectation || presetExpectationPass);
+
+        std::cout << "[HYBRID-DCN][VALIDATION] validationStage = stage-24-result-consistency"
+                  << std::endl;
+        std::cout << "[HYBRID-DCN][VALIDATION] finalConfigInstalledCheck = "
+                  << passFail(finalConfigInstalledCheck) << std::endl;
+        std::cout << "[HYBRID-DCN][VALIDATION] matrixCompletionCheck = "
+                  << passFail(matrixCompletionCheck) << std::endl;
+        std::cout << "[HYBRID-DCN][VALIDATION] coveredResidualMixCheck = "
+                  << passFail(coveredResidualMixCheck) << std::endl;
+        std::cout << "[HYBRID-DCN][VALIDATION] ocsEpsObservationCheck = "
+                  << passFail(ocsEpsObservationCheck) << std::endl;
+        std::cout << "[HYBRID-DCN][VALIDATION] dataPlaneValidationCheck = "
+                  << passFail(dataPlaneValidationCheck) << std::endl;
+        std::cout << "[HYBRID-DCN][VALIDATION] presetExpectation = "
+                  << presetExpectation << std::endl;
+        std::cout << "[HYBRID-DCN][VALIDATION] presetExpectationAdjustedByExplicitArgs = "
+                  << (presetExpectationAdjustedByExplicitArgs ? "true" : "false")
+                  << std::endl;
+        std::cout << "[HYBRID-DCN][VALIDATION] presetExpectationCheck = "
+                  << presetExpectationCheck << std::endl;
+        std::cout << "[HYBRID-DCN][VALIDATION] overallResultConsistency = "
+                  << passFail(overallResultConsistency) << std::endl;
+    }
 
     std::cout << "[OK] Hybrid Core DCN topology build completed." << std::endl;
 
