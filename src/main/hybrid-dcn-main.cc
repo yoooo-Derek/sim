@@ -62,6 +62,9 @@ struct MatrixBulkFlowSpec
     double estimatedDemand;
     double ocsLoadBefore;
     double ocsLoadAfter;
+    double plannedResidualDemand;
+    double realResidualDemand;
+    double wecmpResidualDemand;
     std::string name;
 };
 
@@ -75,6 +78,9 @@ struct OcsAdmissionEvent
     double estimatedDemand;
     double ocsLoadBefore;
     double ocsLoadAfter;
+    double plannedResidualDemand;
+    double realResidualDemand;
+    double wecmpResidualDemand;
 };
 
 struct MatrixBulkFlowStats
@@ -195,6 +201,7 @@ struct EpsWecmpDecision
     bool enabled;
     uint32_t srcLeaf;
     uint32_t dstLeaf;
+    double residualDemand;
     uint32_t selectedSpine;
     std::vector<EpsWecmpLinkState> linkStates;
 };
@@ -2920,9 +2927,18 @@ main(int argc, char* argv[])
     std::vector<std::vector<double>> ocsAdmittedLoad(numLeaves,
                                                      std::vector<double>(numLeaves, 0.0));
 
+    auto computePlannedResidualDemand = [&](uint32_t srcLeaf, uint32_t dstLeaf) {
+        const double demand = torTrafficMatrix[srcLeaf][dstLeaf];
+        const bool pairAvailable = isOcsPairInstalled(srcLeaf, dstLeaf);
+        const double theta = enableOcsAdmissionControl ? ocsAdmissionThreshold : demand;
+        const double plannedResidual = demand - (pairAvailable ? theta : 0.0);
+        return std::max(plannedResidual, 0.0);
+    };
+
     auto applyOcsAdmission = [&](uint32_t srcLeaf, uint32_t dstLeaf) {
         const bool pairAvailable = isOcsPairInstalled(srcLeaf, dstLeaf);
         const double loadBefore = ocsAdmittedLoad[srcLeaf][dstLeaf];
+        const double plannedResidualDemand = computePlannedResidualDemand(srcLeaf, dstLeaf);
         bool admitted = false;
         bool fallback = false;
         double loadAfter = loadBefore;
@@ -2951,6 +2967,9 @@ main(int argc, char* argv[])
             ocsAdmittedLoad[dstLeaf][srcLeaf] = loadAfter;
         }
 
+        const double realResidualDemand = admitted ? 0.0 : matrixFlowDemand;
+        const double wecmpResidualDemand = std::max(plannedResidualDemand, realResidualDemand);
+
         return OcsAdmissionEvent{srcLeaf,
                                  dstLeaf,
                                  pairAvailable,
@@ -2958,7 +2977,10 @@ main(int argc, char* argv[])
                                  fallback,
                                  matrixFlowDemand,
                                  loadBefore,
-                                 loadAfter};
+                                 loadAfter,
+                                 plannedResidualDemand,
+                                 realResidualDemand,
+                                 wecmpResidualDemand};
     };
 
     if (enableMatrixFlows)
@@ -2991,6 +3013,9 @@ main(int argc, char* argv[])
                                        admission.estimatedDemand,
                                        admission.ocsLoadBefore,
                                        admission.ocsLoadAfter,
+                                       admission.plannedResidualDemand,
+                                       admission.realResidualDemand,
+                                       admission.wecmpResidualDemand,
                                        flowName.str()});
         }
 
@@ -3027,6 +3052,9 @@ main(int argc, char* argv[])
                                            admission.estimatedDemand,
                                            admission.ocsLoadBefore,
                                            admission.ocsLoadAfter,
+                                           admission.plannedResidualDemand,
+                                           admission.realResidualDemand,
+                                           admission.wecmpResidualDemand,
                                            flowName.str()});
                 matrixFlowPairUsed[srcLeaf][dstLeaf] = true;
                 matrixFlowPairUsed[dstLeaf][srcLeaf] = true;
@@ -3048,14 +3076,16 @@ main(int argc, char* argv[])
         matrixFlowStats.resize(matrixFlowSpecs.size(), {0, false, 0.0, 0.0});
     }
 
-    auto runEpsWecmpForResidualPair = [&](uint32_t srcLeaf, uint32_t dstLeaf) {
-        EpsWecmpDecision decision{enableEpsWecmp, srcLeaf, dstLeaf, 0, {}};
-        if (!enableEpsWecmp || numSpines == 0)
+    auto runEpsWecmpForResidualPair = [&](uint32_t srcLeaf,
+                                          uint32_t dstLeaf,
+                                          double residualDemand) {
+        EpsWecmpDecision decision{enableEpsWecmp, srcLeaf, dstLeaf, residualDemand, 0, {}};
+        if (!enableEpsWecmp || numSpines == 0 || residualDemand <= 0)
         {
             return decision;
         }
 
-        const double baseResidualDemand = torTrafficMatrix[srcLeaf][dstLeaf];
+        const double baseResidualDemand = residualDemand;
         const double initialProbability = 1.0 / static_cast<double>(numSpines);
         decision.linkStates.reserve(numSpines);
         for (uint32_t spineIndex = 0; spineIndex < numSpines; ++spineIndex)
@@ -3159,9 +3189,15 @@ main(int argc, char* argv[])
             {
                 continue;
             }
+            if (spec.wecmpResidualDemand <= 0)
+            {
+                continue;
+            }
 
             EpsWecmpDecision decision =
-                runEpsWecmpForResidualPair(spec.srcLeaf, spec.dstLeaf);
+                runEpsWecmpForResidualPair(spec.srcLeaf,
+                                           spec.dstLeaf,
+                                           spec.wecmpResidualDemand);
             matrixFlowWecmpDecisionIndex[flowIndex] =
                 static_cast<int32_t>(epsWecmpDecisions.size());
             epsWecmpDecisions.push_back(decision);
@@ -3498,6 +3534,13 @@ main(int argc, char* argv[])
                   << "] ocsLoadBefore = " << event.ocsLoadBefore << std::endl;
         std::cout << "[HYBRID-DCN][ADMISSION] matrixFlow[" << eventIndex
                   << "] ocsLoadAfter = " << event.ocsLoadAfter << std::endl;
+        std::cout << "[HYBRID-DCN][ADMISSION] matrixFlow[" << eventIndex
+                  << "] plannedResidualDemand = " << event.plannedResidualDemand
+                  << std::endl;
+        std::cout << "[HYBRID-DCN][ADMISSION] matrixFlow[" << eventIndex
+                  << "] realResidualDemand = " << event.realResidualDemand << std::endl;
+        std::cout << "[HYBRID-DCN][ADMISSION] matrixFlow[" << eventIndex
+                  << "] wecmpResidualDemand = " << event.wecmpResidualDemand << std::endl;
     }
 
     std::cout << "[HYBRID-DCN][WECMP] enabled = "
@@ -3523,6 +3566,12 @@ main(int argc, char* argv[])
                           << "] skipped = ocs-covered" << std::endl;
                 continue;
             }
+            if (spec.wecmpResidualDemand <= 0)
+            {
+                std::cout << "[HYBRID-DCN][WECMP] matrixFlow[" << flowIndex
+                          << "] skipped = no-residual-demand" << std::endl;
+                continue;
+            }
 
             const int32_t decisionIndex = matrixFlowWecmpDecisionIndex[flowIndex];
             if (decisionIndex < 0)
@@ -3537,6 +3586,8 @@ main(int argc, char* argv[])
                       << std::endl;
             std::cout << "[HYBRID-DCN][WECMP] decision[" << decisionIndex
                       << "] selectedSpine = " << decision.selectedSpine << std::endl;
+            std::cout << "[HYBRID-DCN][WECMP] decision[" << decisionIndex
+                      << "] residualDemand = " << decision.residualDemand << std::endl;
             std::cout << "[HYBRID-DCN][WECMP] decision[" << decisionIndex
                       << "] candidateSpines = " << decision.linkStates.size() << std::endl;
             for (const auto& state : decision.linkStates)
