@@ -206,6 +206,17 @@ struct EpsWecmpDecision
     std::vector<EpsWecmpLinkState> linkStates;
 };
 
+struct EpsWecmpRouteBinding
+{
+    uint32_t flowIndex;
+    uint32_t srcLeaf;
+    uint32_t dstLeaf;
+    uint32_t selectedSpine;
+    Ipv4Address srcServerAddress;
+    Ipv4Address dstServerAddress;
+    bool installed;
+};
+
 uint64_t g_bulkRxBytes = 0;
 bool g_bulkSeenFirstRx = false;
 double g_bulkFirstRxTime = 0.0;
@@ -418,6 +429,7 @@ main(int argc, char* argv[])
     double epsWecmpMaxDelta = 0.25;
     uint32_t epsWecmpEpochs = 3;
     double epsWecmpCapacity = 100.0;
+    bool enableEpsWecmpRouting = false;
     bool enableResultValidation = true;
     std::string validationMode = "warn";
 
@@ -632,6 +644,9 @@ main(int argc, char* argv[])
     cmd.AddValue("epsWecmpCapacity",
                  "EPS-WECMP abstract link capacity in traffic-matrix units.",
                  epsWecmpCapacity);
+    cmd.AddValue("enableEpsWecmpRouting",
+                 "Bind residual matrix-flow EPS paths to EPS-WECMP selected spines using static routes.",
+                 enableEpsWecmpRouting);
     cmd.AddValue("enableResultValidation",
                  "Enable Stage-24 result consistency validation logs.",
                  enableResultValidation);
@@ -1084,6 +1099,14 @@ main(int argc, char* argv[])
     {
         std::cerr << "[HYBRID-DCN][ERROR] epsWecmpCapacity must be greater than 0."
                   << std::endl;
+        return 1;
+    }
+
+    if (enableEpsWecmpRouting && !enableEpsWecmp)
+    {
+        std::cerr
+            << "[HYBRID-DCN][ERROR] enableEpsWecmpRouting requires enableEpsWecmp=true."
+            << std::endl;
         return 1;
     }
 
@@ -2737,6 +2760,16 @@ main(int argc, char* argv[])
     std::vector<std::vector<uint32_t>> leafServerIfIndex(
         numLeaves,
         std::vector<uint32_t>(serversPerLeaf));
+    std::vector<std::vector<Ipv4Address>> leafToSpineNextHop(
+        numLeaves,
+        std::vector<Ipv4Address>(numSpines, Ipv4Address("0.0.0.0")));
+    std::vector<std::vector<Ipv4Address>> spineToLeafNextHop(
+        numSpines,
+        std::vector<Ipv4Address>(numLeaves, Ipv4Address("0.0.0.0")));
+    std::vector<std::vector<uint32_t>> leafToSpineIfIndex(numLeaves,
+                                                          std::vector<uint32_t>(numSpines, 0));
+    std::vector<std::vector<uint32_t>> spineToLeafIfIndex(numSpines,
+                                                          std::vector<uint32_t>(numLeaves, 0));
 
     Ipv4AddressHelper ipv4;
     ipv4.SetBase("10.0.0.0", "255.255.255.252");
@@ -2765,7 +2798,11 @@ main(int argc, char* argv[])
             NetDeviceContainer devices = leafSpineP2p.Install(pair);
             devices.Get(0)->TraceConnectWithoutContext("MacTx", MakeCallback(&EpsTxTrace));
             devices.Get(1)->TraceConnectWithoutContext("MacTx", MakeCallback(&EpsTxTrace));
-            ipv4.Assign(devices);
+            Ipv4InterfaceContainer interfaces = ipv4.Assign(devices);
+            leafToSpineNextHop[leafIndex][spineIndex] = interfaces.GetAddress(1);
+            spineToLeafNextHop[spineIndex][leafIndex] = interfaces.GetAddress(0);
+            leafToSpineIfIndex[leafIndex][spineIndex] = interfaces.Get(0).second;
+            spineToLeafIfIndex[spineIndex][leafIndex] = interfaces.Get(1).second;
             ipv4.NewNetwork();
         }
     }
@@ -2924,6 +2961,7 @@ main(int argc, char* argv[])
     std::vector<OcsAdmissionEvent> ocsAdmissionEvents;
     std::vector<EpsWecmpDecision> epsWecmpDecisions;
     std::vector<int32_t> matrixFlowWecmpDecisionIndex;
+    std::vector<EpsWecmpRouteBinding> epsWecmpRouteBindings;
     std::vector<std::vector<double>> ocsAdmittedLoad(numLeaves,
                                                      std::vector<double>(numLeaves, 0.0));
 
@@ -3201,6 +3239,65 @@ main(int argc, char* argv[])
             matrixFlowWecmpDecisionIndex[flowIndex] =
                 static_cast<int32_t>(epsWecmpDecisions.size());
             epsWecmpDecisions.push_back(decision);
+        }
+    }
+
+    if (enableEpsWecmpRouting && enableMatrixFlows && enableEpsWecmp)
+    {
+        Ipv4StaticRoutingHelper staticRoutingHelper;
+        for (uint32_t flowIndex = 0; flowIndex < matrixFlowSpecs.size(); ++flowIndex)
+        {
+            const auto& spec = matrixFlowSpecs[flowIndex];
+            if (spec.ocsCovered || spec.wecmpResidualDemand <= 0)
+            {
+                continue;
+            }
+
+            const int32_t decisionIndex = matrixFlowWecmpDecisionIndex[flowIndex];
+            if (decisionIndex < 0)
+            {
+                continue;
+            }
+
+            const auto& decision =
+                epsWecmpDecisions[static_cast<std::size_t>(decisionIndex)];
+            const uint32_t selectedSpine = decision.selectedSpine;
+            const Ipv4Address srcServerAddress = serverIpv4[spec.srcLeaf][spec.srcServer];
+            const Ipv4Address dstServerAddress = serverIpv4[spec.dstLeaf][spec.dstServer];
+            bool installed = false;
+
+            if (selectedSpine < numSpines)
+            {
+                Ptr<Ipv4StaticRouting> srcLeafRouting = staticRoutingHelper.GetStaticRouting(
+                    leaves.Get(spec.srcLeaf)->GetObject<Ipv4>());
+                Ptr<Ipv4StaticRouting> dstLeafRouting = staticRoutingHelper.GetStaticRouting(
+                    leaves.Get(spec.dstLeaf)->GetObject<Ipv4>());
+                Ptr<Ipv4StaticRouting> spineRouting = staticRoutingHelper.GetStaticRouting(
+                    spines.Get(selectedSpine)->GetObject<Ipv4>());
+
+                srcLeafRouting->AddHostRouteTo(dstServerAddress,
+                                               leafToSpineNextHop[spec.srcLeaf][selectedSpine],
+                                               leafToSpineIfIndex[spec.srcLeaf][selectedSpine]);
+                spineRouting->AddHostRouteTo(dstServerAddress,
+                                             spineToLeafNextHop[selectedSpine][spec.dstLeaf],
+                                             spineToLeafIfIndex[selectedSpine][spec.dstLeaf]);
+
+                dstLeafRouting->AddHostRouteTo(srcServerAddress,
+                                               leafToSpineNextHop[spec.dstLeaf][selectedSpine],
+                                               leafToSpineIfIndex[spec.dstLeaf][selectedSpine]);
+                spineRouting->AddHostRouteTo(srcServerAddress,
+                                             spineToLeafNextHop[selectedSpine][spec.srcLeaf],
+                                             spineToLeafIfIndex[selectedSpine][spec.srcLeaf]);
+                installed = true;
+            }
+
+            epsWecmpRouteBindings.push_back({flowIndex,
+                                             spec.srcLeaf,
+                                             spec.dstLeaf,
+                                             selectedSpine,
+                                             srcServerAddress,
+                                             dstServerAddress,
+                                             installed});
         }
     }
 
@@ -3611,6 +3708,24 @@ main(int argc, char* argv[])
                           << std::endl;
             }
         }
+    }
+
+    std::cout << "[HYBRID-DCN][WECMP-ROUTE] enabled = "
+              << (enableEpsWecmpRouting ? "true" : "false") << std::endl;
+    std::cout << "[HYBRID-DCN][WECMP-ROUTE] bindings = "
+              << epsWecmpRouteBindings.size() << std::endl;
+    for (uint32_t bindingIndex = 0; bindingIndex < epsWecmpRouteBindings.size(); ++bindingIndex)
+    {
+        const auto& binding = epsWecmpRouteBindings[bindingIndex];
+        std::cout << "[HYBRID-DCN][WECMP-ROUTE] binding[" << bindingIndex
+                  << "] flowIndex = " << binding.flowIndex << std::endl;
+        std::cout << "[HYBRID-DCN][WECMP-ROUTE] binding[" << bindingIndex
+                  << "] pair = " << binding.srcLeaf << "-" << binding.dstLeaf << std::endl;
+        std::cout << "[HYBRID-DCN][WECMP-ROUTE] binding[" << bindingIndex
+                  << "] selectedSpine = " << binding.selectedSpine << std::endl;
+        std::cout << "[HYBRID-DCN][WECMP-ROUTE] binding[" << bindingIndex
+                  << "] installed = " << (binding.installed ? "true" : "false")
+                  << std::endl;
     }
 
     std::cout << "[HYBRID-DCN][MATRIX] enableMatrixSelect = "
