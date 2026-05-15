@@ -227,6 +227,7 @@ main(int argc, char* argv[])
 {
     double simTime = 1.0;
     std::string experimentName = "stage-1-topology";
+    std::string presetScenario = "manual";
     uint32_t numSpines = 2;
     uint32_t numLeaves = 4;
     uint32_t serversPerLeaf = 4;
@@ -293,6 +294,9 @@ main(int argc, char* argv[])
     CommandLine cmd(__FILE__);
     cmd.AddValue("simTime", "Simulation time in seconds.", simTime);
     cmd.AddValue("experimentName", "Experiment name.", experimentName);
+    cmd.AddValue("presetScenario",
+                 "Experiment preset: manual, baseline-excess, community-aware, state-aware, config-gated, hold-gated, or full-control.",
+                 presetScenario);
     cmd.AddValue("numSpines", "Number of EPS electrical core spine switches.", numSpines);
     cmd.AddValue("numLeaves", "Number of Leaf/ToR switches.", numLeaves);
     cmd.AddValue("serversPerLeaf", "Number of servers attached to each Leaf/ToR.", serversPerLeaf);
@@ -343,6 +347,109 @@ main(int argc, char* argv[])
     cmd.AddValue("matrixFlowStart", "Start time for matrix-generated BulkSend flows in seconds.", matrixFlowStart);
     cmd.AddValue("matrixFlowPortBase", "Base TCP port for matrix-generated PacketSink applications.", matrixFlowPortBase);
     cmd.Parse(argc, argv);
+
+    const bool presetApplied = presetScenario != "manual";
+    if (presetScenario != "manual" && presetScenario != "baseline-excess" &&
+        presetScenario != "community-aware" && presetScenario != "state-aware" &&
+        presetScenario != "config-gated" && presetScenario != "hold-gated" &&
+        presetScenario != "full-control")
+    {
+        std::cerr << "[HYBRID-DCN][ERROR] presetScenario must be manual, baseline-excess, community-aware, state-aware, config-gated, hold-gated, or full-control."
+                  << std::endl;
+        return 1;
+    }
+
+    auto applyPresetCommon = [&]() {
+        communityAlpha = 0.5;
+        ocsPortK = 1;
+        maxSelectedOcsLinks = 2;
+        enableMatrixSelect = true;
+        enableStaticOcs = true;
+        routeMode = "ocs-forced";
+        enableMatrixFlows = true;
+        enableEcho = false;
+        enableBulk = false;
+        enableSecondBulk = false;
+        enableResidualBulk = false;
+    };
+
+    if (presetScenario == "baseline-excess")
+    {
+        applyPresetCommon();
+        trafficMatrixMode = "clustered";
+        communityMode = "preview";
+        selectionMetric = "excess";
+        enableStateHolding = false;
+        previousOcsMode = "none";
+        enableConfigUpdateGate = false;
+        enableHoldTimeGate = false;
+    }
+    else if (presetScenario == "community-aware")
+    {
+        applyPresetCommon();
+        trafficMatrixMode = "clustered";
+        communityMode = "louvain";
+        selectionMetric = "community-excess";
+        enableStateHolding = false;
+        previousOcsMode = "none";
+        enableConfigUpdateGate = false;
+        enableHoldTimeGate = false;
+    }
+    else if (presetScenario == "state-aware")
+    {
+        applyPresetCommon();
+        trafficMatrixMode = "skewed";
+        communityMode = "louvain";
+        selectionMetric = "community-excess";
+        enableStateHolding = true;
+        stateHoldingLambda = 5.0;
+        previousOcsMode = "skewed-primary";
+        enableConfigUpdateGate = false;
+        enableHoldTimeGate = false;
+    }
+    else if (presetScenario == "config-gated")
+    {
+        applyPresetCommon();
+        trafficMatrixMode = "skewed";
+        communityMode = "louvain";
+        selectionMetric = "community-excess";
+        enableStateHolding = true;
+        stateHoldingLambda = 5.0;
+        previousOcsMode = "skewed-primary";
+        enableConfigUpdateGate = true;
+        configUpdateThreshold = 0.0;
+        enableHoldTimeGate = false;
+    }
+    else if (presetScenario == "hold-gated")
+    {
+        applyPresetCommon();
+        trafficMatrixMode = "skewed";
+        communityMode = "louvain";
+        selectionMetric = "community-excess";
+        enableStateHolding = true;
+        stateHoldingLambda = 5.0;
+        previousOcsMode = "skewed-primary";
+        enableConfigUpdateGate = true;
+        configUpdateThreshold = 0.0;
+        enableHoldTimeGate = true;
+        minHoldCycles = 3;
+        previousConfigAge = 1;
+    }
+    else if (presetScenario == "full-control")
+    {
+        applyPresetCommon();
+        trafficMatrixMode = "skewed";
+        communityMode = "louvain";
+        selectionMetric = "community-excess";
+        enableStateHolding = true;
+        stateHoldingLambda = 5.0;
+        previousOcsMode = "skewed-primary";
+        enableConfigUpdateGate = true;
+        configUpdateThreshold = 0.0;
+        enableHoldTimeGate = true;
+        minHoldCycles = 3;
+        previousConfigAge = 3;
+    }
 
     if (simTime <= 0)
     {
@@ -2063,6 +2170,12 @@ main(int argc, char* argv[])
 
     std::cout << "[HYBRID-DCN][CONTROL] algorithmStage = stage-20-control-summary"
               << std::endl;
+    std::cout << "[HYBRID-DCN][CONTROL] presetScenario = " << presetScenario
+              << std::endl;
+    std::cout << "[HYBRID-DCN][CONTROL] presetApplied = "
+              << (presetApplied ? "true" : "false") << std::endl;
+    std::cout << "[HYBRID-DCN][CONTROL] presetApplicationOrder = after-command-line-parse"
+              << std::endl;
     std::cout << "[HYBRID-DCN][CONTROL] trafficMatrixMode = " << trafficMatrixMode
               << std::endl;
     std::cout << "[HYBRID-DCN][CONTROL] communityMode = " << communityMode << std::endl;
@@ -2137,6 +2250,8 @@ main(int argc, char* argv[])
     }
 
     std::cout << "[HYBRID-DCN][EXPERIMENT] experimentName = " << experimentName
+              << std::endl;
+    std::cout << "[HYBRID-DCN][EXPERIMENT] presetScenario = " << presetScenario
               << std::endl;
     std::cout << "[HYBRID-DCN][EXPERIMENT] simTime = " << simTime << std::endl;
     std::cout << "[HYBRID-DCN][EXPERIMENT] numSpines = " << numSpines << std::endl;
