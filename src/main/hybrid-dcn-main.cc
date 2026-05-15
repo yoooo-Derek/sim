@@ -56,7 +56,25 @@ struct MatrixBulkFlowSpec
     uint32_t dstServer;
     uint16_t port;
     bool ocsCovered;
+    bool ocsPairAvailable;
+    bool ocsAdmitted;
+    bool epsFallback;
+    double estimatedDemand;
+    double ocsLoadBefore;
+    double ocsLoadAfter;
     std::string name;
+};
+
+struct OcsAdmissionEvent
+{
+    uint32_t srcLeaf;
+    uint32_t dstLeaf;
+    bool ocsPairAvailable;
+    bool ocsAdmitted;
+    bool epsFallback;
+    double estimatedDemand;
+    double ocsLoadBefore;
+    double ocsLoadAfter;
 };
 
 struct MatrixBulkFlowStats
@@ -382,6 +400,9 @@ main(int argc, char* argv[])
     uint64_t matrixFlowMaxBytes = 524288;
     double matrixFlowStart = 0.35;
     uint16_t matrixFlowPortBase = 11000;
+    bool enableOcsAdmissionControl = false;
+    double ocsAdmissionThreshold = 100.0;
+    double matrixFlowDemand = 40.0;
     bool enableEpsWecmp = false;
     double epsWecmpRho = 0.7;
     double epsWecmpGamma = 2.0;
@@ -579,6 +600,15 @@ main(int argc, char* argv[])
     cmd.AddValue("matrixFlowMaxBytes", "MaxBytes for each matrix-generated BulkSend flow.", matrixFlowMaxBytes);
     cmd.AddValue("matrixFlowStart", "Start time for matrix-generated BulkSend flows in seconds.", matrixFlowStart);
     cmd.AddValue("matrixFlowPortBase", "Base TCP port for matrix-generated PacketSink applications.", matrixFlowPortBase);
+    cmd.AddValue("enableOcsAdmissionControl",
+                 "Enable OCS matrix-flow capacity admission control.",
+                 enableOcsAdmissionControl);
+    cmd.AddValue("ocsAdmissionThreshold",
+                 "OCS per-lightpath admission threshold in traffic-matrix units.",
+                 ocsAdmissionThreshold);
+    cmd.AddValue("matrixFlowDemand",
+                 "Abstract matrix-flow demand used for OCS admission control.",
+                 matrixFlowDemand);
     cmd.AddValue("enableEpsWecmp",
                  "Enable EPS residual-flow WECMP control-plane next-hop selection.",
                  enableEpsWecmp);
@@ -984,6 +1014,20 @@ main(int argc, char* argv[])
         std::cerr
             << "[HYBRID-DCN][ERROR] controlEpochs must be greater than 0 when enableMultiPeriodControl is true."
             << std::endl;
+        return 1;
+    }
+
+    if (ocsAdmissionThreshold <= 0)
+    {
+        std::cerr << "[HYBRID-DCN][ERROR] ocsAdmissionThreshold must be greater than 0."
+                  << std::endl;
+        return 1;
+    }
+
+    if (matrixFlowDemand <= 0)
+    {
+        std::cerr << "[HYBRID-DCN][ERROR] matrixFlowDemand must be greater than 0."
+                  << std::endl;
         return 1;
     }
 
@@ -2870,14 +2914,68 @@ main(int argc, char* argv[])
     std::vector<MatrixBulkFlowSpec> matrixFlowSpecs;
     std::vector<MatrixBulkFlowStats> matrixFlowStats;
     std::vector<Ptr<PacketSink>> matrixFlowSinks;
+    std::vector<OcsAdmissionEvent> ocsAdmissionEvents;
     std::vector<EpsWecmpDecision> epsWecmpDecisions;
     std::vector<int32_t> matrixFlowWecmpDecisionIndex;
+    std::vector<std::vector<double>> ocsAdmittedLoad(numLeaves,
+                                                     std::vector<double>(numLeaves, 0.0));
+
+    auto applyOcsAdmission = [&](uint32_t srcLeaf, uint32_t dstLeaf) {
+        const bool pairAvailable = isOcsPairInstalled(srcLeaf, dstLeaf);
+        const double loadBefore = ocsAdmittedLoad[srcLeaf][dstLeaf];
+        bool admitted = false;
+        bool fallback = false;
+        double loadAfter = loadBefore;
+
+        if (!enableOcsAdmissionControl)
+        {
+            admitted = pairAvailable;
+            if (admitted)
+            {
+                loadAfter = loadBefore + matrixFlowDemand;
+            }
+        }
+        else if (pairAvailable && loadBefore + matrixFlowDemand <= ocsAdmissionThreshold)
+        {
+            admitted = true;
+            loadAfter = loadBefore + matrixFlowDemand;
+        }
+        else
+        {
+            fallback = pairAvailable;
+        }
+
+        if (admitted)
+        {
+            ocsAdmittedLoad[srcLeaf][dstLeaf] = loadAfter;
+            ocsAdmittedLoad[dstLeaf][srcLeaf] = loadAfter;
+        }
+
+        return OcsAdmissionEvent{srcLeaf,
+                                 dstLeaf,
+                                 pairAvailable,
+                                 admitted,
+                                 fallback,
+                                 matrixFlowDemand,
+                                 loadBefore,
+                                 loadAfter};
+    };
+
     if (enableMatrixFlows)
     {
         std::vector<std::vector<bool>> matrixFlowPairUsed(numLeaves,
                                                           std::vector<bool>(numLeaves, false));
         for (const auto& link : installedOcsLinks)
         {
+            OcsAdmissionEvent admission = applyOcsAdmission(link.leafA, link.leafB);
+            ocsAdmissionEvents.push_back(admission);
+            matrixFlowPairUsed[link.leafA][link.leafB] = true;
+            matrixFlowPairUsed[link.leafB][link.leafA] = true;
+            if (!admission.ocsAdmitted)
+            {
+                continue;
+            }
+
             std::ostringstream flowName;
             flowName << "matrix-flow-" << matrixFlowSpecs.size();
             matrixFlowSpecs.push_back({link.leafA,
@@ -2886,10 +2984,14 @@ main(int argc, char* argv[])
                                        0,
                                        static_cast<uint16_t>(matrixFlowPortBase +
                                                              matrixFlowSpecs.size()),
-                                       true,
+                                       admission.ocsAdmitted,
+                                       admission.ocsPairAvailable,
+                                       admission.ocsAdmitted,
+                                       admission.epsFallback,
+                                       admission.estimatedDemand,
+                                       admission.ocsLoadBefore,
+                                       admission.ocsLoadAfter,
                                        flowName.str()});
-            matrixFlowPairUsed[link.leafA][link.leafB] = true;
-            matrixFlowPairUsed[link.leafB][link.leafA] = true;
         }
 
         const size_t minMatrixFlowCount = 3;
@@ -2910,13 +3012,21 @@ main(int argc, char* argv[])
 
                 std::ostringstream flowName;
                 flowName << "matrix-flow-" << matrixFlowSpecs.size();
+                OcsAdmissionEvent admission = applyOcsAdmission(srcLeaf, dstLeaf);
+                ocsAdmissionEvents.push_back(admission);
                 matrixFlowSpecs.push_back({srcLeaf,
                                            dstLeaf,
                                            1,
                                            0,
                                            static_cast<uint16_t>(matrixFlowPortBase +
                                                                  matrixFlowSpecs.size()),
-                                           false,
+                                           admission.ocsAdmitted,
+                                           admission.ocsPairAvailable,
+                                           admission.ocsAdmitted,
+                                           admission.epsFallback,
+                                           admission.estimatedDemand,
+                                           admission.ocsLoadBefore,
+                                           admission.ocsLoadAfter,
                                            flowName.str()});
                 matrixFlowPairUsed[srcLeaf][dstLeaf] = true;
                 matrixFlowPairUsed[dstLeaf][srcLeaf] = true;
@@ -2938,21 +3048,9 @@ main(int argc, char* argv[])
         matrixFlowStats.resize(matrixFlowSpecs.size(), {0, false, 0.0, 0.0});
     }
 
-    auto isSelectedOcsPair = [&selectedOcsEdges](uint32_t leafA, uint32_t leafB) {
-        for (const auto& edge : selectedOcsEdges)
-        {
-            if ((edge.leafA == leafA && edge.leafB == leafB) ||
-                (edge.leafA == leafB && edge.leafB == leafA))
-            {
-                return true;
-            }
-        }
-        return false;
-    };
-
     auto runEpsWecmpForResidualPair = [&](uint32_t srcLeaf, uint32_t dstLeaf) {
         EpsWecmpDecision decision{enableEpsWecmp, srcLeaf, dstLeaf, 0, {}};
-        if (!enableEpsWecmp || numSpines == 0 || isSelectedOcsPair(srcLeaf, dstLeaf))
+        if (!enableEpsWecmp || numSpines == 0)
         {
             return decision;
         }
@@ -3057,7 +3155,7 @@ main(int argc, char* argv[])
         for (uint32_t flowIndex = 0; flowIndex < matrixFlowSpecs.size(); ++flowIndex)
         {
             const auto& spec = matrixFlowSpecs[flowIndex];
-            if (spec.ocsCovered || isSelectedOcsPair(spec.srcLeaf, spec.dstLeaf))
+            if (spec.ocsCovered)
             {
                 continue;
             }
@@ -3345,6 +3443,63 @@ main(int argc, char* argv[])
     std::cout << "[HYBRID-DCN] matrixFlowPortBase     = "
               << (enableMatrixFlows ? matrixFlowPortBase : 0) << std::endl;
 
+    uint32_t admissionAdmittedFlows = 0;
+    uint32_t admissionFallbackFlows = 0;
+    uint32_t admissionResidualFlows = 0;
+    for (const auto& event : ocsAdmissionEvents)
+    {
+        if (event.ocsAdmitted)
+        {
+            admissionAdmittedFlows++;
+        }
+        if (event.epsFallback)
+        {
+            admissionFallbackFlows++;
+        }
+    }
+    for (const auto& spec : matrixFlowSpecs)
+    {
+        if (!spec.ocsCovered)
+        {
+            admissionResidualFlows++;
+        }
+    }
+    admissionResidualFlows += admissionFallbackFlows;
+
+    std::cout << "[HYBRID-DCN][ADMISSION] enabled = "
+              << (enableOcsAdmissionControl ? "true" : "false") << std::endl;
+    std::cout << "[HYBRID-DCN][ADMISSION] threshold = " << ocsAdmissionThreshold
+              << std::endl;
+    std::cout << "[HYBRID-DCN][ADMISSION] matrixFlowDemand = " << matrixFlowDemand
+              << std::endl;
+    std::cout << "[HYBRID-DCN][ADMISSION] admittedFlows = " << admissionAdmittedFlows
+              << std::endl;
+    std::cout << "[HYBRID-DCN][ADMISSION] fallbackFlows = " << admissionFallbackFlows
+              << std::endl;
+    std::cout << "[HYBRID-DCN][ADMISSION] residualFlows = " << admissionResidualFlows
+              << std::endl;
+    for (uint32_t eventIndex = 0; eventIndex < ocsAdmissionEvents.size(); ++eventIndex)
+    {
+        const auto& event = ocsAdmissionEvents[eventIndex];
+        std::cout << "[HYBRID-DCN][ADMISSION] matrixFlow[" << eventIndex
+                  << "] pair = " << event.srcLeaf << "-" << event.dstLeaf << std::endl;
+        std::cout << "[HYBRID-DCN][ADMISSION] matrixFlow[" << eventIndex
+                  << "] ocsPairAvailable = "
+                  << (event.ocsPairAvailable ? "true" : "false") << std::endl;
+        std::cout << "[HYBRID-DCN][ADMISSION] matrixFlow[" << eventIndex
+                  << "] ocsAdmitted = " << (event.ocsAdmitted ? "true" : "false")
+                  << std::endl;
+        std::cout << "[HYBRID-DCN][ADMISSION] matrixFlow[" << eventIndex
+                  << "] epsFallback = " << (event.epsFallback ? "true" : "false")
+                  << std::endl;
+        std::cout << "[HYBRID-DCN][ADMISSION] matrixFlow[" << eventIndex
+                  << "] estimatedDemand = " << event.estimatedDemand << std::endl;
+        std::cout << "[HYBRID-DCN][ADMISSION] matrixFlow[" << eventIndex
+                  << "] ocsLoadBefore = " << event.ocsLoadBefore << std::endl;
+        std::cout << "[HYBRID-DCN][ADMISSION] matrixFlow[" << eventIndex
+                  << "] ocsLoadAfter = " << event.ocsLoadAfter << std::endl;
+    }
+
     std::cout << "[HYBRID-DCN][WECMP] enabled = "
               << (enableEpsWecmp ? "true" : "false") << std::endl;
     std::cout << "[HYBRID-DCN][WECMP] source = residual-demand-estimate" << std::endl;
@@ -3362,7 +3517,7 @@ main(int argc, char* argv[])
         for (uint32_t flowIndex = 0; flowIndex < matrixFlowSpecs.size(); ++flowIndex)
         {
             const auto& spec = matrixFlowSpecs[flowIndex];
-            if (spec.ocsCovered || isSelectedOcsPair(spec.srcLeaf, spec.dstLeaf))
+            if (spec.ocsCovered)
             {
                 std::cout << "[HYBRID-DCN][WECMP] matrixFlow[" << flowIndex
                           << "] skipped = ocs-covered" << std::endl;
@@ -4389,12 +4544,18 @@ main(int argc, char* argv[])
         return false;
     };
 
+    const bool admissionFallbackOnlyDataPlane =
+        enableOcsAdmissionControl && admissionFallbackFlows > 0 && admissionAdmittedFlows == 0 &&
+        resultResidualFlows > 0;
     const bool hasCoveredAndResidualFlows =
         resultCoveredFlows > 0 && resultResidualFlows > 0;
     const bool allMatrixFlowsCompleted =
         !matrixFlowSpecs.empty() && resultCompletedFlows == matrixFlowSpecs.size();
     const bool ocsAndEpsBothObserved = resultOcsObservedUse && resultEpsObservedUse;
-    const bool dataPlaneValidationPass = allMatrixFlowsCompleted && ocsAndEpsBothObserved;
+    const bool dataPlanePathObservationPass =
+        ocsAndEpsBothObserved || (admissionFallbackOnlyDataPlane && resultEpsObservedUse);
+    const bool dataPlaneValidationPass =
+        allMatrixFlowsCompleted && dataPlanePathObservationPass;
 
     std::cout << "[HYBRID-DCN][RESULT] resultStage = stage-23-result-summary"
               << std::endl;
@@ -4518,8 +4679,10 @@ main(int argc, char* argv[])
             enableMatrixFlows && !matrixFlowSpecs.empty() &&
             resultCompletedFlows == matrixFlowSpecs.size();
         const bool coveredResidualMixCheck =
-            enableMatrixFlows && resultCoveredFlows > 0 && resultResidualFlows > 0;
-        const bool ocsEpsObservationCheck = resultOcsObservedUse && resultEpsObservedUse;
+            enableMatrixFlows &&
+            ((resultCoveredFlows > 0 && resultResidualFlows > 0) ||
+             admissionFallbackOnlyDataPlane);
+        const bool ocsEpsObservationCheck = dataPlanePathObservationPass;
         const bool dataPlaneValidationCheck = dataPlaneValidationPass;
         const bool presetExpectationAdjustedByExplicitArgs =
             presetOverrideMode == "explicit-wins" && !explicitControlArgNames.empty();
