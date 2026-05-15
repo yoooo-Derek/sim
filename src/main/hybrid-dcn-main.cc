@@ -67,6 +67,30 @@ struct MatrixBulkFlowStats
     double lastRxTime;
 };
 
+void
+MatrixBulkSinkRxTrace(std::vector<MatrixBulkFlowStats>* stats,
+                      uint32_t flowIndex,
+                      Ptr<const Packet> packet,
+                      const Address& from)
+{
+    (void)from;
+    if (stats == nullptr || flowIndex >= stats->size())
+    {
+        return;
+    }
+
+    MatrixBulkFlowStats& flowStats = stats->at(flowIndex);
+    flowStats.rxBytes += packet->GetSize();
+
+    const double now = Simulator::Now().GetSeconds();
+    if (!flowStats.seenFirstRx)
+    {
+        flowStats.seenFirstRx = true;
+        flowStats.firstRxTime = now;
+    }
+    flowStats.lastRxTime = now;
+}
+
 struct CommunityPreview
 {
     std::vector<uint32_t> labels;
@@ -2177,6 +2201,9 @@ main(int argc, char* argv[])
                 servers.Get(serverIndex(spec.dstLeaf, spec.dstServer)));
             Ptr<PacketSink> sink = DynamicCast<PacketSink>(sinkApps.Get(0));
             matrixFlowSinks.push_back(sink);
+            sinkApps.Get(0)->TraceConnectWithoutContext(
+                "Rx",
+                MakeBoundCallback(&MatrixBulkSinkRxTrace, &matrixFlowStats, flowIndex));
             sinkApps.Start(Seconds(0.1));
             sinkApps.Stop(Seconds(simTime));
 
@@ -3070,6 +3097,169 @@ main(int argc, char* argv[])
     std::cout << "[HYBRID-DCN][EPS] txBytes     = " << g_epsTxBytes << std::endl;
     std::cout << "[HYBRID-DCN][EPS] observedUse = "
               << (g_epsTxPackets > 0 ? "true" : "false") << std::endl;
+
+    uint32_t resultCoveredFlows = 0;
+    uint32_t resultResidualFlows = 0;
+    uint32_t resultCompletedFlows = 0;
+    uint64_t resultTotalMatrixRxBytes = 0;
+    uint64_t resultCoveredMatrixRxBytes = 0;
+    uint64_t resultResidualMatrixRxBytes = 0;
+    for (uint32_t flowIndex = 0; flowIndex < matrixFlowSpecs.size(); ++flowIndex)
+    {
+        const auto& spec = matrixFlowSpecs[flowIndex];
+        const auto& stats = matrixFlowStats[flowIndex];
+        if (spec.ocsCovered)
+        {
+            resultCoveredFlows++;
+            resultCoveredMatrixRxBytes += stats.rxBytes;
+        }
+        else
+        {
+            resultResidualFlows++;
+            resultResidualMatrixRxBytes += stats.rxBytes;
+        }
+
+        if (stats.rxBytes >= matrixFlowMaxBytes)
+        {
+            resultCompletedFlows++;
+        }
+        resultTotalMatrixRxBytes += stats.rxBytes;
+    }
+
+    const double resultEffectiveDuration =
+        simTime > matrixFlowStart ? (simTime - matrixFlowStart) : 0.0;
+    const double resultMatrixAggregateGoodputMbps =
+        resultEffectiveDuration > 0
+            ? static_cast<double>(resultTotalMatrixRxBytes) * 8.0 / resultEffectiveDuration / 1e6
+            : 0.0;
+    const bool resultOcsObservedUse = g_ocsTxPackets > 0;
+    const bool resultEpsObservedUse = g_epsTxPackets > 0;
+    std::string ocsToEpsByteRatio = "0";
+    if (g_epsTxBytes > 0)
+    {
+        std::ostringstream ratioStream;
+        ratioStream << (static_cast<double>(g_ocsTxBytes) / static_cast<double>(g_epsTxBytes));
+        ocsToEpsByteRatio = ratioStream.str();
+    }
+    else if (g_ocsTxBytes > 0)
+    {
+        ocsToEpsByteRatio = "inf";
+    }
+
+    auto isFinalEdgeInstalled = [&installedOcsLinks](uint32_t leafA, uint32_t leafB) {
+        for (const auto& link : installedOcsLinks)
+        {
+            if ((link.leafA == leafA && link.leafB == leafB) ||
+                (link.leafA == leafB && link.leafB == leafA))
+            {
+                return true;
+            }
+        }
+        return false;
+    };
+
+    const bool hasCoveredAndResidualFlows =
+        resultCoveredFlows > 0 && resultResidualFlows > 0;
+    const bool allMatrixFlowsCompleted =
+        !matrixFlowSpecs.empty() && resultCompletedFlows == matrixFlowSpecs.size();
+    const bool ocsAndEpsBothObserved = resultOcsObservedUse && resultEpsObservedUse;
+    const bool dataPlaneValidationPass = allMatrixFlowsCompleted && ocsAndEpsBothObserved;
+
+    std::cout << "[HYBRID-DCN][RESULT] resultStage = stage-23-result-summary"
+              << std::endl;
+    std::cout << "[HYBRID-DCN][RESULT] experimentName = " << experimentName << std::endl;
+    std::cout << "[HYBRID-DCN][RESULT] presetScenario = " << presetScenario << std::endl;
+    std::cout << "[HYBRID-DCN][RESULT] presetOverrideMode = " << presetOverrideMode
+              << std::endl;
+    std::cout << "[HYBRID-DCN][RESULT] trafficMatrixMode = " << trafficMatrixMode
+              << std::endl;
+    std::cout << "[HYBRID-DCN][RESULT] communityMode = " << communityMode << std::endl;
+    std::cout << "[HYBRID-DCN][RESULT] selectionMetric = " << selectionMetric
+              << std::endl;
+    std::cout << "[HYBRID-DCN][RESULT] configGateDecision = "
+              << configGateDecision << std::endl;
+    std::cout << "[HYBRID-DCN][RESULT] holdTimeActive = "
+              << (holdTimeActive ? "true" : "false") << std::endl;
+    std::cout << "[HYBRID-DCN][RESULT] finalSelectedOcsEdges = "
+              << selectedOcsEdges.size() << std::endl;
+    std::cout << "[HYBRID-DCN][RESULT] installedOcsLinks = "
+              << installedOcsLinks.size() << std::endl;
+    std::cout << "[HYBRID-DCN][RESULT] finalConfigInstalled = "
+              << (installedOcsLinks.size() == selectedOcsEdges.size() ? "true" : "false")
+              << std::endl;
+    std::cout << "[HYBRID-DCN][RESULT] matrixFlowCount = "
+              << matrixFlowSpecs.size() << std::endl;
+    std::cout << "[HYBRID-DCN][RESULT] coveredFlows = " << resultCoveredFlows
+              << std::endl;
+    std::cout << "[HYBRID-DCN][RESULT] residualFlows = " << resultResidualFlows
+              << std::endl;
+    std::cout << "[HYBRID-DCN][RESULT] completedFlows = " << resultCompletedFlows
+              << std::endl;
+    std::cout << "[HYBRID-DCN][RESULT] matrixTotalRxBytes = "
+              << resultTotalMatrixRxBytes << std::endl;
+    std::cout << "[HYBRID-DCN][RESULT] matrixCoveredRxBytes = "
+              << resultCoveredMatrixRxBytes << std::endl;
+    std::cout << "[HYBRID-DCN][RESULT] matrixResidualRxBytes = "
+              << resultResidualMatrixRxBytes << std::endl;
+    std::cout << "[HYBRID-DCN][RESULT] matrixAggregateGoodputMbps = "
+              << resultMatrixAggregateGoodputMbps << std::endl;
+
+    for (uint32_t flowIndex = 0; flowIndex < matrixFlowSpecs.size(); ++flowIndex)
+    {
+        const auto& spec = matrixFlowSpecs[flowIndex];
+        const auto& stats = matrixFlowStats[flowIndex];
+        const bool completed = stats.rxBytes >= matrixFlowMaxBytes;
+        const double firstRx = stats.seenFirstRx ? stats.firstRxTime : 0.0;
+        const double lastRx = stats.seenFirstRx ? stats.lastRxTime : 0.0;
+        const double duration = lastRx > firstRx ? (lastRx - firstRx) : 0.0;
+        const double goodputMbps =
+            duration > 0 ? static_cast<double>(stats.rxBytes) * 8.0 / duration / 1e6 : 0.0;
+        std::cout << "[HYBRID-DCN][RESULT] matrixFlow[" << flowIndex
+                  << "] name=" << spec.name
+                  << " pair=" << spec.srcLeaf << "-" << spec.dstLeaf
+                  << " ocsCovered=" << (spec.ocsCovered ? "true" : "false")
+                  << " rxBytes=" << stats.rxBytes
+                  << " completed=" << (completed ? "true" : "false")
+                  << " firstRx=" << firstRx
+                  << " lastRx=" << lastRx
+                  << " duration=" << duration
+                  << " goodputMbps=" << goodputMbps << std::endl;
+    }
+
+    std::cout << "[HYBRID-DCN][RESULT] ocsTxPackets = " << g_ocsTxPackets
+              << std::endl;
+    std::cout << "[HYBRID-DCN][RESULT] ocsTxBytes = " << g_ocsTxBytes << std::endl;
+    std::cout << "[HYBRID-DCN][RESULT] epsTxPackets = " << g_epsTxPackets
+              << std::endl;
+    std::cout << "[HYBRID-DCN][RESULT] epsTxBytes = " << g_epsTxBytes << std::endl;
+    std::cout << "[HYBRID-DCN][RESULT] ocsObservedUse = "
+              << (resultOcsObservedUse ? "true" : "false") << std::endl;
+    std::cout << "[HYBRID-DCN][RESULT] epsObservedUse = "
+              << (resultEpsObservedUse ? "true" : "false") << std::endl;
+    std::cout << "[HYBRID-DCN][RESULT] ocsToEpsByteRatio = "
+              << ocsToEpsByteRatio << std::endl;
+
+    for (uint32_t edgeIndex = 0; edgeIndex < selectedOcsEdges.size(); ++edgeIndex)
+    {
+        const auto& edge = selectedOcsEdges[edgeIndex];
+        std::cout << "[HYBRID-DCN][RESULT] finalEdge[" << edgeIndex
+                  << "] = " << edge.leafA << "-" << edge.leafB
+                  << " score=" << edge.selectionScore
+                  << " utility=" << edge.utility
+                  << " stateHoldingGain=" << edge.stateHoldingGain
+                  << " installed="
+                  << (isFinalEdgeInstalled(edge.leafA, edge.leafB) ? "true" : "false")
+                  << std::endl;
+    }
+
+    std::cout << "[HYBRID-DCN][RESULT] hasCoveredAndResidualFlows = "
+              << (hasCoveredAndResidualFlows ? "true" : "false") << std::endl;
+    std::cout << "[HYBRID-DCN][RESULT] allMatrixFlowsCompleted = "
+              << (allMatrixFlowsCompleted ? "true" : "false") << std::endl;
+    std::cout << "[HYBRID-DCN][RESULT] ocsAndEpsBothObserved = "
+              << (ocsAndEpsBothObserved ? "true" : "false") << std::endl;
+    std::cout << "[HYBRID-DCN][RESULT] dataPlaneValidationPass = "
+              << (dataPlaneValidationPass ? "true" : "false") << std::endl;
 
     std::cout << "[OK] Hybrid Core DCN topology build completed." << std::endl;
 
