@@ -2521,8 +2521,102 @@ main(int argc, char* argv[])
                   << " selectionScore=" << edge.selectionScore << std::endl;
     }
 
+    std::string experimentGroup = "manual";
+    uint32_t ablationLevel = 0;
+    if (presetScenario == "baseline-excess")
+    {
+        experimentGroup = "baseline";
+        ablationLevel = 0;
+    }
+    else if (presetScenario == "community-aware")
+    {
+        experimentGroup = "community-ablation";
+        ablationLevel = 1;
+    }
+    else if (presetScenario == "state-aware")
+    {
+        experimentGroup = "state-ablation";
+        ablationLevel = 2;
+    }
+    else if (presetScenario == "config-gated")
+    {
+        experimentGroup = "config-gate-ablation";
+        ablationLevel = 3;
+    }
+    else if (presetScenario == "hold-gated")
+    {
+        experimentGroup = "hold-gate-ablation";
+        ablationLevel = 4;
+    }
+    else if (presetScenario == "full-control")
+    {
+        experimentGroup = "full-method";
+        ablationLevel = 5;
+    }
+
+    if (presetScenario != "manual" && presetOverrideMode == "explicit-wins" &&
+        !explicitControlArgNames.empty())
+    {
+        experimentGroup = "customized-preset";
+        ablationLevel = 99;
+    }
+
+    const bool isMainMethod =
+        presetScenario == "full-control" &&
+        (presetOverrideMode == "preset-wins" ||
+         (presetOverrideMode == "explicit-wins" && explicitControlArgNames.empty()));
+    const bool isBaseline =
+        presetScenario == "baseline-excess" &&
+        !(presetOverrideMode == "explicit-wins" && !explicitControlArgNames.empty());
+
+    std::ostringstream enabledModuleSummaryStream;
+    enabledModuleSummaryStream << "matrix,"
+                               << (communityMode == "louvain" ? "louvain" : "preview")
+                               << ","
+                               << (selectionMetric == "community-excess"
+                                       ? "communityUtility"
+                                       : "noCommunityUtility")
+                               << ","
+                               << (enableStateHolding ? "stateHolding" : "noStateHolding")
+                               << ","
+                               << (enableConfigUpdateGate ? "configGate" : "noConfigGate")
+                               << ","
+                               << (enableHoldTimeGate ? "holdGate" : "noHoldGate")
+                               << ","
+                               << (enableResultValidation ? "resultValidation"
+                                                          : "noResultValidation");
+    const std::string enabledModuleSummary = enabledModuleSummaryStream.str();
+
+    std::cout << "[HYBRID-DCN][PAPER] paperStage = stage-26-experiment-group-summary"
+              << std::endl;
+    std::cout << "[HYBRID-DCN][PAPER] experimentGroup = " << experimentGroup
+              << std::endl;
+    std::cout << "[HYBRID-DCN][PAPER] ablationLevel = " << ablationLevel << std::endl;
+    std::cout << "[HYBRID-DCN][PAPER] isMainMethod = "
+              << (isMainMethod ? "true" : "false") << std::endl;
+    std::cout << "[HYBRID-DCN][PAPER] isBaseline = " << (isBaseline ? "true" : "false")
+              << std::endl;
+    std::cout << "[HYBRID-DCN][PAPER] presetScenario = " << presetScenario
+              << std::endl;
+    std::cout << "[HYBRID-DCN][PAPER] presetOverrideMode = " << presetOverrideMode
+              << std::endl;
+    std::cout << "[HYBRID-DCN][PAPER] explicitControlArgCount = "
+              << explicitControlArgNames.size() << std::endl;
+    std::cout << "[HYBRID-DCN][PAPER] enabledModuleSummary = "
+              << enabledModuleSummary << std::endl;
+
     std::cout << "[HYBRID-DCN][CONTROL] algorithmStage = stage-20-control-summary"
               << std::endl;
+    std::cout << "[HYBRID-DCN][CONTROL] experimentGroup = " << experimentGroup
+              << std::endl;
+    std::cout << "[HYBRID-DCN][CONTROL] ablationLevel = " << ablationLevel
+              << std::endl;
+    std::cout << "[HYBRID-DCN][CONTROL] isMainMethod = "
+              << (isMainMethod ? "true" : "false") << std::endl;
+    std::cout << "[HYBRID-DCN][CONTROL] isBaseline = "
+              << (isBaseline ? "true" : "false") << std::endl;
+    std::cout << "[HYBRID-DCN][CONTROL] enabledModuleSummary = "
+              << enabledModuleSummary << std::endl;
     std::cout << "[HYBRID-DCN][CONTROL] presetScenario = " << presetScenario
               << std::endl;
     std::cout << "[HYBRID-DCN][CONTROL] presetOverrideMode = " << presetOverrideMode
@@ -3240,6 +3334,16 @@ main(int argc, char* argv[])
     std::cout << "[HYBRID-DCN][RESULT] presetScenario = " << presetScenario << std::endl;
     std::cout << "[HYBRID-DCN][RESULT] presetOverrideMode = " << presetOverrideMode
               << std::endl;
+    std::cout << "[HYBRID-DCN][RESULT] experimentGroup = " << experimentGroup
+              << std::endl;
+    std::cout << "[HYBRID-DCN][RESULT] ablationLevel = " << ablationLevel
+              << std::endl;
+    std::cout << "[HYBRID-DCN][RESULT] isMainMethod = "
+              << (isMainMethod ? "true" : "false") << std::endl;
+    std::cout << "[HYBRID-DCN][RESULT] isBaseline = "
+              << (isBaseline ? "true" : "false") << std::endl;
+    std::cout << "[HYBRID-DCN][RESULT] enabledModuleSummary = "
+              << enabledModuleSummary << std::endl;
     std::cout << "[HYBRID-DCN][RESULT] trafficMatrixMode = " << trafficMatrixMode
               << std::endl;
     std::cout << "[HYBRID-DCN][RESULT] communityMode = " << communityMode << std::endl;
@@ -3451,9 +3555,34 @@ main(int argc, char* argv[])
             ocsEpsObservationCheck &&
             dataPlaneValidationCheck &&
             (!includePresetExpectation || presetExpectationPass);
+        const bool mainMethodConsistencyPass =
+            presetScenario == "full-control" &&
+            selectionMetric == "community-excess" &&
+            communityMode == "louvain" &&
+            enableStateHolding &&
+            enableConfigUpdateGate &&
+            enableHoldTimeGate &&
+            selectedOcsEdges.size() == 2 &&
+            dataPlaneValidationPass;
+        const bool baselineConsistencyPass =
+            presetScenario == "baseline-excess" &&
+            selectionMetric == "excess" &&
+            !enableStateHolding &&
+            !enableConfigUpdateGate &&
+            !enableHoldTimeGate &&
+            selectedOcsEdges.size() == 2 &&
+            dataPlaneValidationPass;
+        const std::string mainMethodConsistency =
+            isMainMethod ? passFail(mainMethodConsistencyPass) : "skipped";
+        const std::string baselineConsistency =
+            isBaseline ? passFail(baselineConsistencyPass) : "skipped";
 
         std::cout << "[HYBRID-DCN][VALIDATION] validationStage = stage-24-result-consistency"
                   << std::endl;
+        std::cout << "[HYBRID-DCN][VALIDATION] experimentGroup = "
+                  << experimentGroup << std::endl;
+        std::cout << "[HYBRID-DCN][VALIDATION] ablationLevel = "
+                  << ablationLevel << std::endl;
         std::cout << "[HYBRID-DCN][VALIDATION] finalConfigInstalledCheck = "
                   << passFail(finalConfigInstalledCheck) << std::endl;
         std::cout << "[HYBRID-DCN][VALIDATION] matrixCompletionCheck = "
@@ -3475,6 +3604,10 @@ main(int argc, char* argv[])
                   << presetExpectationSkipReason << std::endl;
         std::cout << "[HYBRID-DCN][VALIDATION] presetExpectationCheck = "
                   << presetExpectationCheck << std::endl;
+        std::cout << "[HYBRID-DCN][VALIDATION] mainMethodConsistency = "
+                  << mainMethodConsistency << std::endl;
+        std::cout << "[HYBRID-DCN][VALIDATION] baselineConsistency = "
+                  << baselineConsistency << std::endl;
         std::cout << "[HYBRID-DCN][VALIDATION] overallResultConsistency = "
                   << passFail(overallResultConsistency) << std::endl;
     }
