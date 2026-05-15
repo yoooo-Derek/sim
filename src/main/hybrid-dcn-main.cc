@@ -328,6 +328,42 @@ main(int argc, char* argv[])
         }
     };
 
+    auto isControlAffectingArg = [](const std::string& name) {
+        const std::vector<std::string> controlArgs = {
+            "trafficMatrixMode",
+            "communityMode",
+            "louvainMaxPasses",
+            "louvainEpsilon",
+            "selectionMetric",
+            "eta",
+            "communityAlpha",
+            "enableStateHolding",
+            "stateHoldingLambda",
+            "previousOcsMode",
+            "previousOcsLeafA",
+            "previousOcsLeafB",
+            "enableConfigUpdateGate",
+            "configUpdateThreshold",
+            "enableHoldTimeGate",
+            "minHoldCycles",
+            "previousConfigAge",
+            "ocsPortK",
+            "maxSelectedOcsLinks",
+            "enableMatrixSelect",
+            "enableStaticOcs",
+            "routeMode",
+            "enableMatrixFlows",
+            "matrixFlowMaxBytes",
+            "matrixFlowStart",
+            "matrixFlowPortBase",
+            "numLeaves",
+            "serversPerLeaf",
+            "numSpines",
+            "ocsDataRate",
+            "ocsDelay"};
+        return std::find(controlArgs.begin(), controlArgs.end(), name) != controlArgs.end();
+    };
+
     for (int argIndex = 1; argIndex < argc; ++argIndex)
     {
         std::string arg(argv[argIndex]);
@@ -343,6 +379,17 @@ main(int argc, char* argv[])
             name = name.substr(0, equalsPos);
         }
         addExplicitArgName(name);
+    }
+
+    std::vector<std::string> explicitControlArgNames;
+    for (const auto& name : explicitArgNames)
+    {
+        if (isControlAffectingArg(name) &&
+            std::find(explicitControlArgNames.begin(), explicitControlArgNames.end(), name) ==
+                explicitControlArgNames.end())
+        {
+            explicitControlArgNames.push_back(name);
+        }
     }
 
     std::vector<std::string> normalizedArgs;
@@ -2493,6 +2540,15 @@ main(int argc, char* argv[])
         std::cout << "[HYBRID-DCN][CONTROL] explicitArg[" << argIndex
                   << "] = " << explicitArgNames[argIndex] << std::endl;
     }
+    std::cout << "[HYBRID-DCN][CONTROL] explicitControlArgCount = "
+              << explicitControlArgNames.size() << std::endl;
+    const uint32_t explicitControlArgLogCount =
+        static_cast<uint32_t>(std::min<size_t>(explicitControlArgNames.size(), 20));
+    for (uint32_t argIndex = 0; argIndex < explicitControlArgLogCount; ++argIndex)
+    {
+        std::cout << "[HYBRID-DCN][CONTROL] explicitControlArg[" << argIndex
+                  << "] = " << explicitControlArgNames[argIndex] << std::endl;
+    }
     std::cout << "[HYBRID-DCN][CONTROL] trafficMatrixMode = " << trafficMatrixMode
               << std::endl;
     std::cout << "[HYBRID-DCN][CONTROL] communityMode = " << communityMode << std::endl;
@@ -3294,26 +3350,30 @@ main(int argc, char* argv[])
         const bool ocsEpsObservationCheck = resultOcsObservedUse && resultEpsObservedUse;
         const bool dataPlaneValidationCheck = dataPlaneValidationPass;
         const bool presetExpectationAdjustedByExplicitArgs =
-            presetOverrideMode == "explicit-wins" && !explicitArgNames.empty();
+            presetOverrideMode == "explicit-wins" && !explicitControlArgNames.empty();
 
         bool presetExpectationKnown = false;
         bool presetExpectationPass = true;
         std::string presetExpectation = "none";
         std::string presetExpectationCheck = "skipped";
+        std::string presetExpectationSkipReason = "unknown-preset";
 
         if (presetScenario == "manual")
         {
             presetExpectation = "manual-no-fixed-expectation";
+            presetExpectationSkipReason = "manual";
         }
         else if (presetExpectationAdjustedByExplicitArgs)
         {
             presetExpectation = presetScenario;
             presetExpectationCheck = "skipped-explicit-overrides";
+            presetExpectationSkipReason = "explicit-control-overrides";
         }
         else if (presetScenario == "baseline-excess")
         {
             presetExpectationKnown = true;
             presetExpectation = "baseline-excess";
+            presetExpectationSkipReason = "none";
             presetExpectationPass = selectionMetric == "excess" &&
                                     configGateDecision == "disabled" &&
                                     selectedOcsEdges.size() == 2 &&
@@ -3324,6 +3384,7 @@ main(int argc, char* argv[])
         {
             presetExpectationKnown = true;
             presetExpectation = "community-aware";
+            presetExpectationSkipReason = "none";
             presetExpectationPass = selectionMetric == "community-excess" &&
                                     communityMode == "louvain" &&
                                     !enableStateHolding &&
@@ -3334,6 +3395,7 @@ main(int argc, char* argv[])
         {
             presetExpectationKnown = true;
             presetExpectation = "state-aware";
+            presetExpectationSkipReason = "none";
             presetExpectationPass = enableStateHolding &&
                                     !enableConfigUpdateGate &&
                                     configGateDecision == "disabled" &&
@@ -3344,6 +3406,7 @@ main(int argc, char* argv[])
         {
             presetExpectationKnown = true;
             presetExpectation = "config-gated";
+            presetExpectationSkipReason = "none";
             presetExpectationPass = enableConfigUpdateGate &&
                                     configGateDecision == "use-candidate" &&
                                     selectedOcsEdges.size() == 2 &&
@@ -3353,6 +3416,7 @@ main(int argc, char* argv[])
         {
             presetExpectationKnown = true;
             presetExpectation = "hold-gated";
+            presetExpectationSkipReason = "none";
             presetExpectationPass = enableHoldTimeGate &&
                                     holdTimeActive &&
                                     configGateDecision == "hold-previous" &&
@@ -3363,6 +3427,7 @@ main(int argc, char* argv[])
         {
             presetExpectationKnown = true;
             presetExpectation = "full-control";
+            presetExpectationSkipReason = "none";
             presetExpectationPass = enableHoldTimeGate &&
                                     previousConfigAge >= minHoldCycles &&
                                     !holdTimeActive &&
@@ -3401,9 +3466,13 @@ main(int argc, char* argv[])
                   << passFail(dataPlaneValidationCheck) << std::endl;
         std::cout << "[HYBRID-DCN][VALIDATION] presetExpectation = "
                   << presetExpectation << std::endl;
+        std::cout << "[HYBRID-DCN][VALIDATION] explicitControlArgCount = "
+                  << explicitControlArgNames.size() << std::endl;
         std::cout << "[HYBRID-DCN][VALIDATION] presetExpectationAdjustedByExplicitArgs = "
                   << (presetExpectationAdjustedByExplicitArgs ? "true" : "false")
                   << std::endl;
+        std::cout << "[HYBRID-DCN][VALIDATION] presetExpectationSkipReason = "
+                  << presetExpectationSkipReason << std::endl;
         std::cout << "[HYBRID-DCN][VALIDATION] presetExpectationCheck = "
                   << presetExpectationCheck << std::endl;
         std::cout << "[HYBRID-DCN][VALIDATION] overallResultConsistency = "
