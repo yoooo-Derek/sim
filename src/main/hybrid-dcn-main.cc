@@ -206,6 +206,15 @@ struct EpsWecmpDecision
     std::vector<EpsWecmpLinkState> linkStates;
 };
 
+struct EpsWecmpPairState
+{
+    uint32_t srcLeaf;
+    uint32_t dstLeaf;
+    std::vector<double> probabilities;
+    std::vector<double> smoothedUtilizations;
+    bool initialized;
+};
+
 struct EpsWecmpRouteBinding
 {
     uint32_t flowIndex;
@@ -2961,6 +2970,7 @@ main(int argc, char* argv[])
     std::vector<OcsAdmissionEvent> ocsAdmissionEvents;
     std::vector<EpsWecmpDecision> epsWecmpDecisions;
     std::vector<int32_t> matrixFlowWecmpDecisionIndex;
+    std::vector<EpsWecmpPairState> epsWecmpPairStates;
     std::vector<EpsWecmpRouteBinding> epsWecmpRouteBindings;
     std::vector<std::vector<double>> ocsAdmittedLoad(numLeaves,
                                                      std::vector<double>(numLeaves, 0.0));
@@ -3114,6 +3124,36 @@ main(int argc, char* argv[])
         matrixFlowStats.resize(matrixFlowSpecs.size(), {0, false, 0.0, 0.0});
     }
 
+    auto getOrCreateEpsWecmpPairState = [&](uint32_t srcLeaf,
+                                            uint32_t dstLeaf) -> EpsWecmpPairState& {
+        const uint32_t pairA = std::min(srcLeaf, dstLeaf);
+        const uint32_t pairB = std::max(srcLeaf, dstLeaf);
+        const double initialProbability =
+            numSpines > 0 ? 1.0 / static_cast<double>(numSpines) : 0.0;
+
+        for (auto& state : epsWecmpPairStates)
+        {
+            if (state.srcLeaf == pairA && state.dstLeaf == pairB)
+            {
+                if (state.probabilities.size() != numSpines ||
+                    state.smoothedUtilizations.size() != numSpines)
+                {
+                    state.probabilities.assign(numSpines, initialProbability);
+                    state.smoothedUtilizations.assign(numSpines, 0.0);
+                    state.initialized = true;
+                }
+                return state;
+            }
+        }
+
+        epsWecmpPairStates.push_back({pairA,
+                                      pairB,
+                                      std::vector<double>(numSpines, initialProbability),
+                                      std::vector<double>(numSpines, 0.0),
+                                      true});
+        return epsWecmpPairStates.back();
+    };
+
     auto runEpsWecmpForResidualPair = [&](uint32_t srcLeaf,
                                           uint32_t dstLeaf,
                                           double residualDemand) {
@@ -3123,19 +3163,21 @@ main(int argc, char* argv[])
             return decision;
         }
 
+        EpsWecmpPairState& pairState = getOrCreateEpsWecmpPairState(srcLeaf, dstLeaf);
         const double baseResidualDemand = residualDemand;
         const double initialProbability = 1.0 / static_cast<double>(numSpines);
+        std::vector<double> currentProbabilities = pairState.probabilities;
         decision.linkStates.reserve(numSpines);
         for (uint32_t spineIndex = 0; spineIndex < numSpines; ++spineIndex)
         {
             decision.linkStates.push_back({spineIndex,
                                            0.0,
                                            0.0,
-                                           0.0,
+                                           pairState.smoothedUtilizations[spineIndex],
                                            0.0,
                                            initialProbability,
-                                           initialProbability,
-                                           initialProbability});
+                                           currentProbabilities[spineIndex],
+                                           currentProbabilities[spineIndex]});
         }
 
         for (uint32_t epsEpoch = 0; epsEpoch < epsWecmpEpochs; ++epsEpoch)
@@ -3169,14 +3211,15 @@ main(int argc, char* argv[])
             double probabilitySum = 0.0;
             for (auto& state : decision.linkStates)
             {
+                const double previousProbability = currentProbabilities[state.spineIndex];
                 state.targetProbability =
                     sumAttractiveness > 0 ? state.attractiveness / sumAttractiveness
                                           : initialProbability;
                 const double rawUpdated =
-                    (1.0 - epsWecmpKappa) * state.previousProbability +
+                    (1.0 - epsWecmpKappa) * previousProbability +
                     epsWecmpKappa * state.targetProbability;
-                const double lower = state.previousProbability - epsWecmpMaxDelta;
-                const double upper = state.previousProbability + epsWecmpMaxDelta;
+                const double lower = previousProbability - epsWecmpMaxDelta;
+                const double upper = previousProbability + epsWecmpMaxDelta;
                 state.updatedProbability = std::max(0.0, std::min(rawUpdated, upper));
                 state.updatedProbability = std::max(state.updatedProbability, lower);
                 probabilitySum += state.updatedProbability;
@@ -3199,8 +3242,14 @@ main(int argc, char* argv[])
 
             for (auto& state : decision.linkStates)
             {
-                state.previousProbability = state.updatedProbability;
+                currentProbabilities[state.spineIndex] = state.updatedProbability;
             }
+        }
+
+        for (const auto& state : decision.linkStates)
+        {
+            pairState.probabilities[state.spineIndex] = state.updatedProbability;
+            pairState.smoothedUtilizations[state.spineIndex] = state.smoothedUtilization;
         }
 
         for (const auto& state : decision.linkStates)
@@ -3652,6 +3701,8 @@ main(int argc, char* argv[])
     std::cout << "[HYBRID-DCN][WECMP] capacity = " << epsWecmpCapacity << std::endl;
     std::cout << "[HYBRID-DCN][WECMP] residualDecisions = "
               << epsWecmpDecisions.size() << std::endl;
+    std::cout << "[HYBRID-DCN][WECMP] pairStates = " << epsWecmpPairStates.size()
+              << std::endl;
     if (enableEpsWecmp)
     {
         for (uint32_t flowIndex = 0; flowIndex < matrixFlowSpecs.size(); ++flowIndex)
@@ -3704,9 +3755,36 @@ main(int argc, char* argv[])
                           << "] targetProbability = " << state.targetProbability << std::endl;
                 std::cout << "[HYBRID-DCN][WECMP] decision[" << decisionIndex
                           << "] spine[" << state.spineIndex
+                          << "] previousProbability = " << state.previousProbability
+                          << std::endl;
+                std::cout << "[HYBRID-DCN][WECMP] decision[" << decisionIndex
+                          << "] spine[" << state.spineIndex
                           << "] updatedProbability = " << state.updatedProbability
                           << std::endl;
             }
+        }
+    }
+    for (uint32_t pairStateIndex = 0; pairStateIndex < epsWecmpPairStates.size();
+         ++pairStateIndex)
+    {
+        const auto& pairState = epsWecmpPairStates[pairStateIndex];
+        std::cout << "[HYBRID-DCN][WECMP] pairState[" << pairStateIndex
+                  << "] pair = " << pairState.srcLeaf << "-" << pairState.dstLeaf
+                  << std::endl;
+        std::cout << "[HYBRID-DCN][WECMP] pairState[" << pairStateIndex
+                  << "] initialized = " << (pairState.initialized ? "true" : "false")
+                  << std::endl;
+        for (uint32_t spineIndex = 0; spineIndex < pairState.probabilities.size();
+             ++spineIndex)
+        {
+            std::cout << "[HYBRID-DCN][WECMP] pairState[" << pairStateIndex
+                      << "] spine[" << spineIndex
+                      << "] probability = " << pairState.probabilities[spineIndex]
+                      << std::endl;
+            std::cout << "[HYBRID-DCN][WECMP] pairState[" << pairStateIndex
+                      << "] spine[" << spineIndex
+                      << "] smoothedUtilization = "
+                      << pairState.smoothedUtilizations[spineIndex] << std::endl;
         }
     }
 
