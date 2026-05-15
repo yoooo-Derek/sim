@@ -14,6 +14,7 @@
 #include <iostream>
 #include <sstream>
 #include <string>
+#include <tuple>
 #include <vector>
 
 using namespace ns3;
@@ -118,6 +119,24 @@ struct LouvainResult
     uint32_t levels;
     bool foldedGraph;
     std::vector<LouvainLevelSummary> levelSummaries;
+};
+
+struct ControlEpochSummary
+{
+    uint32_t epoch;
+    std::string trafficMatrixMode;
+    uint32_t communityCount;
+    uint32_t candidateEdges;
+    uint32_t candidateOcsEdges;
+    uint32_t previousOcsEdges;
+    uint32_t selectedOcsEdges;
+    double candidateConfigScore;
+    double previousConfigScore;
+    double configScoreImprovement;
+    bool holdTimeActive;
+    std::string decision;
+    uint32_t previousConfigAgeBefore;
+    uint32_t previousConfigAgeAfter;
 };
 
 uint64_t g_bulkRxBytes = 0;
@@ -299,6 +318,9 @@ main(int argc, char* argv[])
     uint32_t louvainMaxPasses = 10;
     uint32_t louvainMaxLevels = 10;
     double louvainEpsilon = 1e-9;
+    bool enableMultiPeriodControl = false;
+    uint32_t controlEpochs = 3;
+    std::string trafficMatrixSequence = "static";
     std::string selectionMetric = "excess";
     double eta = 1.0;
     double communityAlpha = 0.5;
@@ -352,6 +374,9 @@ main(int argc, char* argv[])
             "louvainMaxPasses",
             "louvainMaxLevels",
             "louvainEpsilon",
+            "enableMultiPeriodControl",
+            "controlEpochs",
+            "trafficMatrixSequence",
             "selectionMetric",
             "eta",
             "communityAlpha",
@@ -478,6 +503,13 @@ main(int argc, char* argv[])
     cmd.AddValue("louvainMaxPasses", "Maximum passes per Louvain local-moving level.", louvainMaxPasses);
     cmd.AddValue("louvainMaxLevels", "Maximum graph-folding levels for multi-level Louvain.", louvainMaxLevels);
     cmd.AddValue("louvainEpsilon", "Minimum modularity gain for Louvain local moving.", louvainEpsilon);
+    cmd.AddValue("enableMultiPeriodControl",
+                 "Enable multi-period OCS controller decision simulation.",
+                 enableMultiPeriodControl);
+    cmd.AddValue("controlEpochs", "Number of multi-period control epochs.", controlEpochs);
+    cmd.AddValue("trafficMatrixSequence",
+                 "Traffic matrix sequence: static, skewed-to-clustered, clustered-to-skewed, or alternating.",
+                 trafficMatrixSequence);
     cmd.AddValue("selectionMetric", "OCS pair selection metric: absolute, excess, or community-excess.", selectionMetric);
     cmd.AddValue("eta", "Resolution parameter for modularity gain.", eta);
     cmd.AddValue("communityAlpha", "Cross-community utility discount factor for community-excess.", communityAlpha);
@@ -869,6 +901,22 @@ main(int argc, char* argv[])
     {
         std::cerr
             << "[HYBRID-DCN][ERROR] trafficMatrixMode must be skewed, clustered, or uniform."
+            << std::endl;
+        return 1;
+    }
+
+    if (trafficMatrixSequence != "static" && trafficMatrixSequence != "skewed-to-clustered" &&
+        trafficMatrixSequence != "clustered-to-skewed" && trafficMatrixSequence != "alternating")
+    {
+        std::cerr << "[HYBRID-DCN][ERROR] trafficMatrixSequence must be static, skewed-to-clustered, clustered-to-skewed, or alternating."
+                  << std::endl;
+        return 1;
+    }
+
+    if (enableMultiPeriodControl && controlEpochs == 0)
+    {
+        std::cerr
+            << "[HYBRID-DCN][ERROR] controlEpochs must be greater than 0 when enableMultiPeriodControl is true."
             << std::endl;
         return 1;
     }
@@ -1452,9 +1500,9 @@ main(int argc, char* argv[])
         louvainResult =
             louvainMode == "multi-level" ? runMultiLevelLouvain() : runSingleLevelLouvain();
     }
-    const std::vector<uint32_t>& activeCommunityLabels =
+    std::vector<uint32_t> activeCommunityLabels =
         communityMode == "louvain" ? louvainResult.labels : communityPreview.labels;
-    const uint32_t activeCommunityCount =
+    uint32_t activeCommunityCount =
         communityMode == "louvain" ? louvainResult.communityCount
                                    : communityPreview.communityCount;
 
@@ -1611,11 +1659,11 @@ main(int argc, char* argv[])
         return score;
     };
 
-    const double candidateConfigScore = configScore(candidateOcsEdges);
-    const double previousConfigScore = configScore(previousOcsEdges);
-    const double configScoreImprovement = candidateConfigScore - previousConfigScore;
-    const bool previousConfigAvailable = !previousOcsEdges.empty();
-    const bool holdTimeActive =
+    double candidateConfigScore = configScore(candidateOcsEdges);
+    double previousConfigScore = configScore(previousOcsEdges);
+    double configScoreImprovement = candidateConfigScore - previousConfigScore;
+    bool previousConfigAvailable = !previousOcsEdges.empty();
+    bool holdTimeActive =
         enableHoldTimeGate && previousConfigAvailable && previousConfigAge < minHoldCycles;
     std::string configGateDecision = "disabled";
     std::vector<OcsCandidateEdge> selectedOcsEdges;
@@ -1657,6 +1705,351 @@ main(int argc, char* argv[])
             else
             {
                 interCandidateEdges++;
+            }
+        }
+    }
+
+    std::vector<ControlEpochSummary> controlEpochSummaries;
+    std::string finalEpochMatrixMode = trafficMatrixMode;
+
+    auto areEdgeSetsEqual = [](const std::vector<OcsCandidateEdge>& lhs,
+                               const std::vector<OcsCandidateEdge>& rhs) {
+        if (lhs.size() != rhs.size())
+        {
+            return false;
+        }
+
+        std::vector<std::pair<uint32_t, uint32_t>> lhsPairs;
+        std::vector<std::pair<uint32_t, uint32_t>> rhsPairs;
+        for (const auto& edge : lhs)
+        {
+            lhsPairs.push_back({std::min(edge.leafA, edge.leafB),
+                                std::max(edge.leafA, edge.leafB)});
+        }
+        for (const auto& edge : rhs)
+        {
+            rhsPairs.push_back({std::min(edge.leafA, edge.leafB),
+                                std::max(edge.leafA, edge.leafB)});
+        }
+        std::sort(lhsPairs.begin(), lhsPairs.end());
+        std::sort(rhsPairs.begin(), rhsPairs.end());
+        return lhsPairs == rhsPairs;
+    };
+
+    auto getEpochMatrixMode = [&](uint32_t epoch) {
+        if (trafficMatrixSequence == "static")
+        {
+            return trafficMatrixMode;
+        }
+        if (trafficMatrixSequence == "skewed-to-clustered")
+        {
+            return epoch < (controlEpochs / 2) ? std::string("skewed")
+                                               : std::string("clustered");
+        }
+        if (trafficMatrixSequence == "clustered-to-skewed")
+        {
+            return epoch < (controlEpochs / 2) ? std::string("clustered")
+                                               : std::string("skewed");
+        }
+        return epoch % 2 == 0 ? std::string("skewed") : std::string("clustered");
+    };
+
+    auto recomputeTrafficMetrics = [&](const WeightedMatrix& matrix) {
+        nodeDegree.assign(numLeaves, 0.0);
+        for (uint32_t i = 0; i < numLeaves; ++i)
+        {
+            for (uint32_t j = 0; j < numLeaves; ++j)
+            {
+                nodeDegree[i] += matrix[i][j];
+            }
+        }
+
+        totalTraffic = computeTotalTraffic(matrix);
+        expectedTraffic.assign(numLeaves, std::vector<double>(numLeaves, 0.0));
+        modularityGain.assign(numLeaves, std::vector<double>(numLeaves, 0.0));
+        ocsUtility.assign(numLeaves, std::vector<double>(numLeaves, 0.0));
+        if (totalTraffic <= 0)
+        {
+            return;
+        }
+
+        for (uint32_t i = 0; i < numLeaves; ++i)
+        {
+            for (uint32_t j = 0; j < numLeaves; ++j)
+            {
+                if (i == j)
+                {
+                    continue;
+                }
+                expectedTraffic[i][j] = nodeDegree[i] * nodeDegree[j] / (2.0 * totalTraffic);
+                modularityGain[i][j] = matrix[i][j] - eta * expectedTraffic[i][j];
+                ocsUtility[i][j] = std::max(modularityGain[i][j], 0.0);
+            }
+        }
+    };
+
+    auto buildPreviousStateFromEdges = [&](const std::vector<OcsCandidateEdge>& edges) {
+        std::vector<std::vector<bool>> state(numLeaves, std::vector<bool>(numLeaves, false));
+        for (const auto& edge : edges)
+        {
+            state[edge.leafA][edge.leafB] = true;
+            state[edge.leafB][edge.leafA] = true;
+        }
+        return state;
+    };
+
+    auto runControlDecisionForMatrix =
+        [&](const WeightedMatrix& matrix,
+            const std::string& matrixModeName,
+            const std::vector<OcsCandidateEdge>& epochPreviousEdges,
+            uint32_t epochPreviousAge,
+            uint32_t epoch) {
+            std::vector<double> epochDegree = computeNodeDegree(matrix);
+            const double epochTotalTraffic = computeTotalTraffic(matrix);
+            WeightedMatrix epochExpected(numLeaves, std::vector<double>(numLeaves, 0.0));
+            WeightedMatrix epochGain(numLeaves, std::vector<double>(numLeaves, 0.0));
+            WeightedMatrix epochUtility(numLeaves, std::vector<double>(numLeaves, 0.0));
+            if (epochTotalTraffic > 0)
+            {
+                for (uint32_t i = 0; i < numLeaves; ++i)
+                {
+                    for (uint32_t j = 0; j < numLeaves; ++j)
+                    {
+                        if (i == j)
+                        {
+                            continue;
+                        }
+                        epochExpected[i][j] =
+                            epochDegree[i] * epochDegree[j] / (2.0 * epochTotalTraffic);
+                        epochGain[i][j] = matrix[i][j] - eta * epochExpected[i][j];
+                        epochUtility[i][j] = std::max(epochGain[i][j], 0.0);
+                    }
+                }
+            }
+
+            const CommunityPreview epochPreview =
+                buildCommunityPreview(matrixModeName, numLeaves);
+            const WeightedMatrix savedMatrix = torTrafficMatrix;
+            torTrafficMatrix = matrix;
+            LouvainResult epochLouvain{epochPreview.labels,
+                                       epochPreview.communityCount,
+                                       0,
+                                       false,
+                                       computeModularityQ(matrix, epochPreview.labels),
+                                       0,
+                                       false,
+                                       {}};
+            if (communityMode == "louvain")
+            {
+                epochLouvain = louvainMode == "multi-level" ? runMultiLevelLouvain()
+                                                            : runSingleLevelLouvain();
+            }
+            torTrafficMatrix = savedMatrix;
+
+            std::vector<uint32_t> epochLabels =
+                communityMode == "louvain" ? epochLouvain.labels : epochPreview.labels;
+            const uint32_t epochCommunityCount =
+                communityMode == "louvain" ? epochLouvain.communityCount
+                                           : epochPreview.communityCount;
+            auto epochIsIntraCommunity = [&epochLabels](uint32_t leafA, uint32_t leafB) {
+                return epochLabels[leafA] == epochLabels[leafB];
+            };
+            const std::vector<std::vector<bool>> epochPreviousState =
+                buildPreviousStateFromEdges(epochPreviousEdges);
+
+            auto makeEpochCandidateEdge = [&](uint32_t leafA, uint32_t leafB) {
+                const double baseUtility = epochUtility[leafA][leafB];
+                const bool intraCommunity = epochIsIntraCommunity(leafA, leafB);
+                const double communityFactor = intraCommunity ? 1.0 : communityAlpha;
+                const double communityUtility = baseUtility * communityFactor;
+                const bool wasPreviouslyInstalled = epochPreviousState[leafA][leafB];
+                const double stateHoldingGain =
+                    enableStateHolding && wasPreviouslyInstalled ? stateHoldingLambda : 0.0;
+                OcsCandidateEdge edge{leafA,
+                                      leafB,
+                                      matrix[leafA][leafB],
+                                      epochExpected[leafA][leafB],
+                                      epochGain[leafA][leafB],
+                                      0.0,
+                                      baseUtility,
+                                      communityFactor,
+                                      communityUtility,
+                                      intraCommunity,
+                                      wasPreviouslyInstalled,
+                                      stateHoldingGain,
+                                      0.0};
+                edge.utility = edgeScoreWithoutState(edge);
+                edge.selectionScore = edge.utility + edge.stateHoldingGain;
+                return edge;
+            };
+
+            std::vector<OcsCandidateEdge> epochCandidateEdges;
+            for (uint32_t leafA = 0; leafA < numLeaves; ++leafA)
+            {
+                for (uint32_t leafB = leafA + 1; leafB < numLeaves; ++leafB)
+                {
+                    const OcsCandidateEdge edge = makeEpochCandidateEdge(leafA, leafB);
+                    if (edge.selectionScore > 0)
+                    {
+                        epochCandidateEdges.push_back(edge);
+                    }
+                }
+            }
+            std::sort(epochCandidateEdges.begin(),
+                      epochCandidateEdges.end(),
+                      [](const OcsCandidateEdge& lhs, const OcsCandidateEdge& rhs) {
+                          if (lhs.selectionScore != rhs.selectionScore)
+                          {
+                              return lhs.selectionScore > rhs.selectionScore;
+                          }
+                          if (lhs.leafA != rhs.leafA)
+                          {
+                              return lhs.leafA < rhs.leafA;
+                          }
+                          return lhs.leafB < rhs.leafB;
+                      });
+
+            std::vector<uint32_t> epochOcsDegree(numLeaves, 0);
+            std::vector<OcsCandidateEdge> epochCandidateOcsEdges;
+            for (const auto& edge : epochCandidateEdges)
+            {
+                if (epochCandidateOcsEdges.size() >= maxSelectedOcsLinks)
+                {
+                    break;
+                }
+                if (epochOcsDegree[edge.leafA] < ocsPortK &&
+                    epochOcsDegree[edge.leafB] < ocsPortK)
+                {
+                    epochCandidateOcsEdges.push_back(edge);
+                    epochOcsDegree[edge.leafA]++;
+                    epochOcsDegree[edge.leafB]++;
+                }
+            }
+
+            const double epochCandidateConfigScore = configScore(epochCandidateOcsEdges);
+            const double epochPreviousConfigScore = configScore(epochPreviousEdges);
+            const double epochConfigScoreImprovement =
+                epochCandidateConfigScore - epochPreviousConfigScore;
+            const bool epochPreviousConfigAvailable = !epochPreviousEdges.empty();
+            const bool epochHoldTimeActive = enableHoldTimeGate &&
+                                             epochPreviousConfigAvailable &&
+                                             epochPreviousAge < minHoldCycles;
+            std::string epochDecision = "disabled";
+            std::vector<OcsCandidateEdge> epochSelectedEdges;
+            if (epochHoldTimeActive)
+            {
+                epochSelectedEdges = epochPreviousEdges;
+                epochDecision = "hold-previous";
+            }
+            else if (!enableConfigUpdateGate)
+            {
+                epochSelectedEdges = epochCandidateOcsEdges;
+            }
+            else if (epochConfigScoreImprovement > configUpdateThreshold)
+            {
+                epochSelectedEdges = epochCandidateOcsEdges;
+                epochDecision = "use-candidate";
+            }
+            else
+            {
+                epochSelectedEdges = epochPreviousEdges;
+                epochDecision = "keep-previous";
+            }
+
+            const uint32_t epochAgeAfter =
+                areEdgeSetsEqual(epochSelectedEdges, epochPreviousEdges) ? epochPreviousAge + 1 : 1;
+
+            ControlEpochSummary summary{epoch,
+                                        matrixModeName,
+                                        epochCommunityCount,
+                                        static_cast<uint32_t>(epochCandidateEdges.size()),
+                                        static_cast<uint32_t>(epochCandidateOcsEdges.size()),
+                                        static_cast<uint32_t>(epochPreviousEdges.size()),
+                                        static_cast<uint32_t>(epochSelectedEdges.size()),
+                                        epochCandidateConfigScore,
+                                        epochPreviousConfigScore,
+                                        epochConfigScoreImprovement,
+                                        epochHoldTimeActive,
+                                        epochDecision,
+                                        epochPreviousAge,
+                                        epochAgeAfter};
+
+            return std::make_tuple(epochCandidateEdges,
+                                   epochCandidateOcsEdges,
+                                   epochPreviousEdges,
+                                   epochSelectedEdges,
+                                   epochLouvain,
+                                   epochPreview,
+                                   epochLabels,
+                                   epochCommunityCount,
+                                   epochCandidateConfigScore,
+                                   epochPreviousConfigScore,
+                                   epochConfigScoreImprovement,
+                                   epochHoldTimeActive,
+                                   epochDecision,
+                                   epochAgeAfter,
+                                   summary);
+        };
+
+    if (enableMultiPeriodControl)
+    {
+        std::vector<OcsCandidateEdge> epochPreviousEdges = previousOcsEdges;
+        uint32_t epochPreviousAge = previousConfigAge;
+        for (uint32_t epoch = 0; epoch < controlEpochs; ++epoch)
+        {
+            const std::string epochMatrixMode = getEpochMatrixMode(epoch);
+            const WeightedMatrix epochMatrix = buildTrafficMatrix(epochMatrixMode, numLeaves);
+            auto epochResult = runControlDecisionForMatrix(epochMatrix,
+                                                           epochMatrixMode,
+                                                           epochPreviousEdges,
+                                                           epochPreviousAge,
+                                                           epoch);
+
+            candidateEdges = std::get<0>(epochResult);
+            candidateOcsEdges = std::get<1>(epochResult);
+            previousOcsEdges = std::get<2>(epochResult);
+            selectedOcsEdges = std::get<3>(epochResult);
+            louvainResult = std::get<4>(epochResult);
+            activeCommunityLabels = std::get<6>(epochResult);
+            activeCommunityCount = std::get<7>(epochResult);
+            candidateConfigScore = std::get<8>(epochResult);
+            previousConfigScore = std::get<9>(epochResult);
+            configScoreImprovement = std::get<10>(epochResult);
+            holdTimeActive = std::get<11>(epochResult);
+            configGateDecision = std::get<12>(epochResult);
+            epochPreviousAge = std::get<13>(epochResult);
+            controlEpochSummaries.push_back(std::get<14>(epochResult));
+
+            epochPreviousEdges = selectedOcsEdges;
+            finalEpochMatrixMode = epochMatrixMode;
+            torTrafficMatrix = epochMatrix;
+        }
+
+        trafficMatrixMode = finalEpochMatrixMode;
+        previousConfigAge =
+            controlEpochSummaries.empty() ? previousConfigAge
+                                          : controlEpochSummaries.back().previousConfigAgeBefore;
+        recomputeTrafficMetrics(torTrafficMatrix);
+        previousConfigAvailable = !previousOcsEdges.empty();
+
+        intraCandidateEdges = 0;
+        interCandidateEdges = 0;
+        for (uint32_t leafA = 0; leafA < numLeaves; ++leafA)
+        {
+            for (uint32_t leafB = leafA + 1; leafB < numLeaves; ++leafB)
+            {
+                if (torTrafficMatrix[leafA][leafB] <= 0)
+                {
+                    continue;
+                }
+                if (isIntraCommunity(leafA, leafB))
+                {
+                    intraCandidateEdges++;
+                }
+                else
+                {
+                    interCandidateEdges++;
+                }
             }
         }
     }
@@ -2767,6 +3160,52 @@ main(int argc, char* argv[])
                                << (enableResultValidation ? "resultValidation"
                                                           : "noResultValidation");
     const std::string enabledModuleSummary = enabledModuleSummaryStream.str();
+
+    std::cout << "[HYBRID-DCN][MULTI] enabled = "
+              << (enableMultiPeriodControl ? "true" : "false") << std::endl;
+    std::cout << "[HYBRID-DCN][MULTI] controlEpochs = " << controlEpochs << std::endl;
+    std::cout << "[HYBRID-DCN][MULTI] trafficMatrixSequence = "
+              << trafficMatrixSequence << std::endl;
+    std::cout << "[HYBRID-DCN][MULTI] finalEpoch = "
+              << (controlEpochSummaries.empty() ? 0 : controlEpochSummaries.back().epoch)
+              << std::endl;
+    std::cout << "[HYBRID-DCN][MULTI] finalSelectedOcsEdges = "
+              << selectedOcsEdges.size() << std::endl;
+    if (enableMultiPeriodControl)
+    {
+        for (const auto& summary : controlEpochSummaries)
+        {
+            std::cout << "[HYBRID-DCN][MULTI] epoch[" << summary.epoch
+                      << "] trafficMatrixMode = " << summary.trafficMatrixMode << std::endl;
+            std::cout << "[HYBRID-DCN][MULTI] epoch[" << summary.epoch
+                      << "] communityCount = " << summary.communityCount << std::endl;
+            std::cout << "[HYBRID-DCN][MULTI] epoch[" << summary.epoch
+                      << "] candidateOcsEdges = " << summary.candidateOcsEdges << std::endl;
+            std::cout << "[HYBRID-DCN][MULTI] epoch[" << summary.epoch
+                      << "] previousOcsEdges = " << summary.previousOcsEdges << std::endl;
+            std::cout << "[HYBRID-DCN][MULTI] epoch[" << summary.epoch
+                      << "] selectedOcsEdges = " << summary.selectedOcsEdges << std::endl;
+            std::cout << "[HYBRID-DCN][MULTI] epoch[" << summary.epoch
+                      << "] candidateConfigScore = " << summary.candidateConfigScore
+                      << std::endl;
+            std::cout << "[HYBRID-DCN][MULTI] epoch[" << summary.epoch
+                      << "] previousConfigScore = " << summary.previousConfigScore << std::endl;
+            std::cout << "[HYBRID-DCN][MULTI] epoch[" << summary.epoch
+                      << "] configScoreImprovement = " << summary.configScoreImprovement
+                      << std::endl;
+            std::cout << "[HYBRID-DCN][MULTI] epoch[" << summary.epoch
+                      << "] holdTimeActive = "
+                      << (summary.holdTimeActive ? "true" : "false") << std::endl;
+            std::cout << "[HYBRID-DCN][MULTI] epoch[" << summary.epoch
+                      << "] decision = " << summary.decision << std::endl;
+            std::cout << "[HYBRID-DCN][MULTI] epoch[" << summary.epoch
+                      << "] previousConfigAgeBefore = "
+                      << summary.previousConfigAgeBefore << std::endl;
+            std::cout << "[HYBRID-DCN][MULTI] epoch[" << summary.epoch
+                      << "] previousConfigAgeAfter = "
+                      << summary.previousConfigAgeAfter << std::endl;
+        }
+    }
 
     std::cout << "[HYBRID-DCN][PAPER] paperStage = stage-26-experiment-group-summary"
               << std::endl;
