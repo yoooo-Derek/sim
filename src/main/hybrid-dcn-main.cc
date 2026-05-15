@@ -215,6 +215,16 @@ struct EpsWecmpPairState
     bool initialized;
 };
 
+struct EpsWecmpEpochSummary
+{
+    uint32_t epoch;
+    std::string trafficMatrixMode;
+    uint32_t residualPairs;
+    uint32_t updatedPairs;
+    double totalPlannedResidualDemand;
+    double totalRealResidualDemand;
+};
+
 struct EpsWecmpRouteBinding
 {
     uint32_t flowIndex;
@@ -439,6 +449,7 @@ main(int argc, char* argv[])
     uint32_t epsWecmpEpochs = 3;
     double epsWecmpCapacity = 100.0;
     bool enableEpsWecmpRouting = false;
+    bool enableMultiPeriodWecmpState = true;
     bool enableResultValidation = true;
     std::string validationMode = "warn";
 
@@ -498,6 +509,7 @@ main(int argc, char* argv[])
             "matrixFlowMaxBytes",
             "matrixFlowStart",
             "matrixFlowPortBase",
+            "enableMultiPeriodWecmpState",
             "numLeaves",
             "serversPerLeaf",
             "numSpines",
@@ -656,6 +668,9 @@ main(int argc, char* argv[])
     cmd.AddValue("enableEpsWecmpRouting",
                  "Bind residual matrix-flow EPS paths to EPS-WECMP selected spines using static routes.",
                  enableEpsWecmpRouting);
+    cmd.AddValue("enableMultiPeriodWecmpState",
+                 "Update EPS-WECMP pair state after each multi-period OCS control epoch.",
+                 enableMultiPeriodWecmpState);
     cmd.AddValue("enableResultValidation",
                  "Enable Stage-24 result consistency validation logs.",
                  enableResultValidation);
@@ -1932,7 +1947,176 @@ main(int argc, char* argv[])
     }
 
     std::vector<ControlEpochSummary> controlEpochSummaries;
+    std::vector<EpsWecmpEpochSummary> epsWecmpEpochSummaries;
+    std::vector<EpsWecmpPairState> epsWecmpPairStates;
     std::string finalEpochMatrixMode = trafficMatrixMode;
+
+    auto getOrCreateEpsWecmpPairState = [&](uint32_t srcLeaf,
+                                            uint32_t dstLeaf) -> EpsWecmpPairState& {
+        const uint32_t pairA = std::min(srcLeaf, dstLeaf);
+        const uint32_t pairB = std::max(srcLeaf, dstLeaf);
+        const double initialProbability =
+            numSpines > 0 ? 1.0 / static_cast<double>(numSpines) : 0.0;
+
+        for (auto& state : epsWecmpPairStates)
+        {
+            if (state.srcLeaf == pairA && state.dstLeaf == pairB)
+            {
+                if (state.probabilities.size() != numSpines ||
+                    state.smoothedUtilizations.size() != numSpines)
+                {
+                    state.probabilities.assign(numSpines, initialProbability);
+                    state.smoothedUtilizations.assign(numSpines, 0.0);
+                    state.initialized = true;
+                }
+                return state;
+            }
+        }
+
+        epsWecmpPairStates.push_back({pairA,
+                                      pairB,
+                                      std::vector<double>(numSpines, initialProbability),
+                                      std::vector<double>(numSpines, 0.0),
+                                      true});
+        return epsWecmpPairStates.back();
+    };
+
+    auto runEpsWecmpUpdateForPair = [&](uint32_t srcLeaf,
+                                        uint32_t dstLeaf,
+                                        double residualDemand,
+                                        bool recordDecision) {
+        EpsWecmpDecision decision{enableEpsWecmp && recordDecision,
+                                  srcLeaf,
+                                  dstLeaf,
+                                  residualDemand,
+                                  0,
+                                  {}};
+        if (!enableEpsWecmp || numSpines == 0 || residualDemand <= 0)
+        {
+            return decision;
+        }
+
+        EpsWecmpPairState& pairState = getOrCreateEpsWecmpPairState(srcLeaf, dstLeaf);
+        const double baseResidualDemand = residualDemand;
+        const double initialProbability = 1.0 / static_cast<double>(numSpines);
+        std::vector<double> currentProbabilities = pairState.probabilities;
+        decision.linkStates.reserve(numSpines);
+        for (uint32_t spineIndex = 0; spineIndex < numSpines; ++spineIndex)
+        {
+            decision.linkStates.push_back({spineIndex,
+                                           0.0,
+                                           0.0,
+                                           pairState.smoothedUtilizations[spineIndex],
+                                           0.0,
+                                           initialProbability,
+                                           currentProbabilities[spineIndex],
+                                           currentProbabilities[spineIndex]});
+        }
+
+        for (uint32_t epsEpoch = 0; epsEpoch < epsWecmpEpochs; ++epsEpoch)
+        {
+            double sumAttractiveness = 0.0;
+            for (auto& state : decision.linkStates)
+            {
+                double deterministicBias = 0.0;
+                if (state.spineIndex == 0)
+                {
+                    deterministicBias = 0.30 * baseResidualDemand;
+                }
+                else if (state.spineIndex >= 2)
+                {
+                    deterministicBias =
+                        0.10 * baseResidualDemand / static_cast<double>(state.spineIndex + 1);
+                }
+
+                state.observedTraffic =
+                    baseResidualDemand / static_cast<double>(numSpines) + deterministicBias;
+                state.utilization = state.observedTraffic / epsWecmpCapacity;
+                state.smoothedUtilization =
+                    epsWecmpRho * state.smoothedUtilization +
+                    (1.0 - epsWecmpRho) * state.utilization;
+                state.attractiveness =
+                    1.0 /
+                    (std::pow(state.smoothedUtilization, epsWecmpGamma) + epsWecmpEpsilon);
+                sumAttractiveness += state.attractiveness;
+            }
+
+            double probabilitySum = 0.0;
+            for (auto& state : decision.linkStates)
+            {
+                const double previousProbability = currentProbabilities[state.spineIndex];
+                state.targetProbability =
+                    sumAttractiveness > 0 ? state.attractiveness / sumAttractiveness
+                                          : initialProbability;
+                const double rawUpdated =
+                    (1.0 - epsWecmpKappa) * previousProbability +
+                    epsWecmpKappa * state.targetProbability;
+                const double lower = previousProbability - epsWecmpMaxDelta;
+                const double upper = previousProbability + epsWecmpMaxDelta;
+                state.updatedProbability = std::max(0.0, std::min(rawUpdated, upper));
+                state.updatedProbability = std::max(state.updatedProbability, lower);
+                probabilitySum += state.updatedProbability;
+            }
+
+            if (probabilitySum > 0)
+            {
+                for (auto& state : decision.linkStates)
+                {
+                    state.updatedProbability /= probabilitySum;
+                }
+            }
+            else
+            {
+                for (auto& state : decision.linkStates)
+                {
+                    state.updatedProbability = initialProbability;
+                }
+            }
+
+            for (auto& state : decision.linkStates)
+            {
+                currentProbabilities[state.spineIndex] = state.updatedProbability;
+            }
+        }
+
+        for (const auto& state : decision.linkStates)
+        {
+            pairState.probabilities[state.spineIndex] = state.updatedProbability;
+            pairState.smoothedUtilizations[state.spineIndex] = state.smoothedUtilization;
+        }
+
+        for (const auto& state : decision.linkStates)
+        {
+            const auto& selectedState = decision.linkStates[decision.selectedSpine];
+            if (state.updatedProbability > selectedState.updatedProbability ||
+                (state.updatedProbability == selectedState.updatedProbability &&
+                 state.spineIndex < selectedState.spineIndex))
+            {
+                decision.selectedSpine = state.spineIndex;
+            }
+        }
+
+        if (!recordDecision)
+        {
+            decision.linkStates.clear();
+        }
+
+        return decision;
+    };
+
+    auto isEdgeInSet = [](const std::vector<OcsCandidateEdge>& edges,
+                          uint32_t leafA,
+                          uint32_t leafB) {
+        for (const auto& edge : edges)
+        {
+            if ((edge.leafA == leafA && edge.leafB == leafB) ||
+                (edge.leafA == leafB && edge.leafB == leafA))
+            {
+                return true;
+            }
+        }
+        return false;
+    };
 
     auto areEdgeSetsEqual = [](const std::vector<OcsCandidateEdge>& lhs,
                                const std::vector<OcsCandidateEdge>& rhs) {
@@ -2281,6 +2465,9 @@ main(int argc, char* argv[])
                                          true};
         };
 
+    const bool multiPeriodWecmpStateEnabled =
+        enableMultiPeriodControl && enableMultiPeriodWecmpState && enableEpsWecmp;
+
     if (enableMultiPeriodControl)
     {
         std::vector<OcsCandidateEdge> epochPreviousEdges = previousOcsEdges;
@@ -2315,6 +2502,53 @@ main(int argc, char* argv[])
             configGateDecision = epochDecision.decision;
             epochPreviousAge = epochDecision.selectedConfigAge;
             controlEpochSummaries.push_back(epochDecision.summary);
+
+            if (multiPeriodWecmpStateEnabled)
+            {
+                EpsWecmpEpochSummary wecmpSummary{epoch, epochMatrixMode, 0, 0, 0.0, 0.0};
+                for (uint32_t leafA = 0; leafA < numLeaves; ++leafA)
+                {
+                    for (uint32_t leafB = leafA + 1; leafB < numLeaves; ++leafB)
+                    {
+                        const double demand = epochMatrix[leafA][leafB];
+                        const bool pairSelected =
+                            isEdgeInSet(epochDecision.selectedOcsEdges, leafA, leafB);
+                        double plannedResidualDemand = 0.0;
+                        if (pairSelected)
+                        {
+                            plannedResidualDemand =
+                                enableOcsAdmissionControl
+                                    ? std::max(demand - ocsAdmissionThreshold, 0.0)
+                                    : 0.0;
+                        }
+                        else
+                        {
+                            plannedResidualDemand = demand;
+                        }
+
+                        const double realResidualDemand = plannedResidualDemand;
+                        if (plannedResidualDemand <= 0)
+                        {
+                            continue;
+                        }
+
+                        wecmpSummary.residualPairs++;
+                        wecmpSummary.totalPlannedResidualDemand += plannedResidualDemand;
+                        wecmpSummary.totalRealResidualDemand += realResidualDemand;
+
+                        const EpsWecmpDecision wecmpDecision =
+                            runEpsWecmpUpdateForPair(leafA,
+                                                     leafB,
+                                                     plannedResidualDemand,
+                                                     false);
+                        if (!wecmpDecision.linkStates.empty() || numSpines > 0)
+                        {
+                            wecmpSummary.updatedPairs++;
+                        }
+                    }
+                }
+                epsWecmpEpochSummaries.push_back(wecmpSummary);
+            }
 
             epochPreviousEdges = selectedOcsEdges;
             finalEpochMatrixMode = epochMatrixMode;
@@ -2970,7 +3204,6 @@ main(int argc, char* argv[])
     std::vector<OcsAdmissionEvent> ocsAdmissionEvents;
     std::vector<EpsWecmpDecision> epsWecmpDecisions;
     std::vector<int32_t> matrixFlowWecmpDecisionIndex;
-    std::vector<EpsWecmpPairState> epsWecmpPairStates;
     std::vector<EpsWecmpRouteBinding> epsWecmpRouteBindings;
     std::vector<std::vector<double>> ocsAdmittedLoad(numLeaves,
                                                      std::vector<double>(numLeaves, 0.0));
@@ -3124,148 +3357,6 @@ main(int argc, char* argv[])
         matrixFlowStats.resize(matrixFlowSpecs.size(), {0, false, 0.0, 0.0});
     }
 
-    auto getOrCreateEpsWecmpPairState = [&](uint32_t srcLeaf,
-                                            uint32_t dstLeaf) -> EpsWecmpPairState& {
-        const uint32_t pairA = std::min(srcLeaf, dstLeaf);
-        const uint32_t pairB = std::max(srcLeaf, dstLeaf);
-        const double initialProbability =
-            numSpines > 0 ? 1.0 / static_cast<double>(numSpines) : 0.0;
-
-        for (auto& state : epsWecmpPairStates)
-        {
-            if (state.srcLeaf == pairA && state.dstLeaf == pairB)
-            {
-                if (state.probabilities.size() != numSpines ||
-                    state.smoothedUtilizations.size() != numSpines)
-                {
-                    state.probabilities.assign(numSpines, initialProbability);
-                    state.smoothedUtilizations.assign(numSpines, 0.0);
-                    state.initialized = true;
-                }
-                return state;
-            }
-        }
-
-        epsWecmpPairStates.push_back({pairA,
-                                      pairB,
-                                      std::vector<double>(numSpines, initialProbability),
-                                      std::vector<double>(numSpines, 0.0),
-                                      true});
-        return epsWecmpPairStates.back();
-    };
-
-    auto runEpsWecmpForResidualPair = [&](uint32_t srcLeaf,
-                                          uint32_t dstLeaf,
-                                          double residualDemand) {
-        EpsWecmpDecision decision{enableEpsWecmp, srcLeaf, dstLeaf, residualDemand, 0, {}};
-        if (!enableEpsWecmp || numSpines == 0 || residualDemand <= 0)
-        {
-            return decision;
-        }
-
-        EpsWecmpPairState& pairState = getOrCreateEpsWecmpPairState(srcLeaf, dstLeaf);
-        const double baseResidualDemand = residualDemand;
-        const double initialProbability = 1.0 / static_cast<double>(numSpines);
-        std::vector<double> currentProbabilities = pairState.probabilities;
-        decision.linkStates.reserve(numSpines);
-        for (uint32_t spineIndex = 0; spineIndex < numSpines; ++spineIndex)
-        {
-            decision.linkStates.push_back({spineIndex,
-                                           0.0,
-                                           0.0,
-                                           pairState.smoothedUtilizations[spineIndex],
-                                           0.0,
-                                           initialProbability,
-                                           currentProbabilities[spineIndex],
-                                           currentProbabilities[spineIndex]});
-        }
-
-        for (uint32_t epsEpoch = 0; epsEpoch < epsWecmpEpochs; ++epsEpoch)
-        {
-            double sumAttractiveness = 0.0;
-            for (auto& state : decision.linkStates)
-            {
-                double deterministicBias = 0.0;
-                if (state.spineIndex == 0)
-                {
-                    deterministicBias = 0.30 * baseResidualDemand;
-                }
-                else if (state.spineIndex >= 2)
-                {
-                    deterministicBias =
-                        0.10 * baseResidualDemand / static_cast<double>(state.spineIndex + 1);
-                }
-
-                state.observedTraffic =
-                    baseResidualDemand / static_cast<double>(numSpines) + deterministicBias;
-                state.utilization = state.observedTraffic / epsWecmpCapacity;
-                state.smoothedUtilization =
-                    epsWecmpRho * state.smoothedUtilization +
-                    (1.0 - epsWecmpRho) * state.utilization;
-                state.attractiveness =
-                    1.0 /
-                    (std::pow(state.smoothedUtilization, epsWecmpGamma) + epsWecmpEpsilon);
-                sumAttractiveness += state.attractiveness;
-            }
-
-            double probabilitySum = 0.0;
-            for (auto& state : decision.linkStates)
-            {
-                const double previousProbability = currentProbabilities[state.spineIndex];
-                state.targetProbability =
-                    sumAttractiveness > 0 ? state.attractiveness / sumAttractiveness
-                                          : initialProbability;
-                const double rawUpdated =
-                    (1.0 - epsWecmpKappa) * previousProbability +
-                    epsWecmpKappa * state.targetProbability;
-                const double lower = previousProbability - epsWecmpMaxDelta;
-                const double upper = previousProbability + epsWecmpMaxDelta;
-                state.updatedProbability = std::max(0.0, std::min(rawUpdated, upper));
-                state.updatedProbability = std::max(state.updatedProbability, lower);
-                probabilitySum += state.updatedProbability;
-            }
-
-            if (probabilitySum > 0)
-            {
-                for (auto& state : decision.linkStates)
-                {
-                    state.updatedProbability /= probabilitySum;
-                }
-            }
-            else
-            {
-                for (auto& state : decision.linkStates)
-                {
-                    state.updatedProbability = initialProbability;
-                }
-            }
-
-            for (auto& state : decision.linkStates)
-            {
-                currentProbabilities[state.spineIndex] = state.updatedProbability;
-            }
-        }
-
-        for (const auto& state : decision.linkStates)
-        {
-            pairState.probabilities[state.spineIndex] = state.updatedProbability;
-            pairState.smoothedUtilizations[state.spineIndex] = state.smoothedUtilization;
-        }
-
-        for (const auto& state : decision.linkStates)
-        {
-            const auto& selectedState = decision.linkStates[decision.selectedSpine];
-            if (state.updatedProbability > selectedState.updatedProbability ||
-                (state.updatedProbability == selectedState.updatedProbability &&
-                 state.spineIndex < selectedState.spineIndex))
-            {
-                decision.selectedSpine = state.spineIndex;
-            }
-        }
-
-        return decision;
-    };
-
     matrixFlowWecmpDecisionIndex.assign(matrixFlowSpecs.size(), -1);
     if (enableEpsWecmp && enableMatrixFlows)
     {
@@ -3282,9 +3373,10 @@ main(int argc, char* argv[])
             }
 
             EpsWecmpDecision decision =
-                runEpsWecmpForResidualPair(spec.srcLeaf,
-                                           spec.dstLeaf,
-                                           spec.wecmpResidualDemand);
+                runEpsWecmpUpdateForPair(spec.srcLeaf,
+                                         spec.dstLeaf,
+                                         spec.wecmpResidualDemand,
+                                         true);
             matrixFlowWecmpDecisionIndex[flowIndex] =
                 static_cast<int32_t>(epsWecmpDecisions.size());
             epsWecmpDecisions.push_back(decision);
@@ -4016,6 +4108,26 @@ main(int argc, char* argv[])
                       << "] previousConfigAgeAfter = "
                       << summary.previousConfigAgeAfter << std::endl;
         }
+    }
+
+    std::cout << "[HYBRID-DCN][MULTI-WECMP] enabled = "
+              << (multiPeriodWecmpStateEnabled ? "true" : "false") << std::endl;
+    std::cout << "[HYBRID-DCN][MULTI-WECMP] epochSummaries = "
+              << epsWecmpEpochSummaries.size() << std::endl;
+    for (const auto& summary : epsWecmpEpochSummaries)
+    {
+        std::cout << "[HYBRID-DCN][MULTI-WECMP] epoch[" << summary.epoch
+                  << "] trafficMatrixMode = " << summary.trafficMatrixMode << std::endl;
+        std::cout << "[HYBRID-DCN][MULTI-WECMP] epoch[" << summary.epoch
+                  << "] residualPairs = " << summary.residualPairs << std::endl;
+        std::cout << "[HYBRID-DCN][MULTI-WECMP] epoch[" << summary.epoch
+                  << "] updatedPairs = " << summary.updatedPairs << std::endl;
+        std::cout << "[HYBRID-DCN][MULTI-WECMP] epoch[" << summary.epoch
+                  << "] totalPlannedResidualDemand = "
+                  << summary.totalPlannedResidualDemand << std::endl;
+        std::cout << "[HYBRID-DCN][MULTI-WECMP] epoch[" << summary.epoch
+                  << "] totalRealResidualDemand = "
+                  << summary.totalRealResidualDemand << std::endl;
     }
 
     std::cout << "[HYBRID-DCN][PAPER] paperStage = stage-26-experiment-group-summary"
