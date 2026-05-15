@@ -267,6 +267,9 @@ main(int argc, char* argv[])
     uint32_t previousOcsLeafB = 1;
     bool enableConfigUpdateGate = false;
     double configUpdateThreshold = 0.0;
+    bool enableHoldTimeGate = false;
+    uint32_t minHoldCycles = 1;
+    uint32_t previousConfigAge = 1;
     uint32_t ocsPortK = 1;
     uint32_t maxSelectedOcsLinks = 1;
     bool enableMatrixFlows = true;
@@ -330,6 +333,9 @@ main(int argc, char* argv[])
     cmd.AddValue("previousOcsLeafB", "Second Leaf/ToR index for custom previous OCS state.", previousOcsLeafB);
     cmd.AddValue("enableConfigUpdateGate", "Enable single-cycle OCS configuration update threshold gating.", enableConfigUpdateGate);
     cmd.AddValue("configUpdateThreshold", "Configuration update threshold for candidate-vs-previous OCS selection.", configUpdateThreshold);
+    cmd.AddValue("enableHoldTimeGate", "Enable minimum OCS configuration hold-time gating.", enableHoldTimeGate);
+    cmd.AddValue("minHoldCycles", "Minimum OCS configuration hold cycles.", minHoldCycles);
+    cmd.AddValue("previousConfigAge", "Number of cycles that the previous OCS configuration has been held.", previousConfigAge);
     cmd.AddValue("ocsPortK", "Per-Leaf OCS port budget for greedy candidate selection.", ocsPortK);
     cmd.AddValue("maxSelectedOcsLinks", "Maximum number of OCS candidate links selected by the controller.", maxSelectedOcsLinks);
     cmd.AddValue("enableMatrixFlows", "Enable Stage-12 matrix-driven multi-pair BulkSend flows.", enableMatrixFlows);
@@ -480,6 +486,14 @@ main(int argc, char* argv[])
     {
         std::cerr
             << "[HYBRID-DCN][ERROR] configUpdateThreshold must be greater than or equal to 0."
+            << std::endl;
+        return 1;
+    }
+
+    if (enableHoldTimeGate && minHoldCycles == 0)
+    {
+        std::cerr
+            << "[HYBRID-DCN][ERROR] minHoldCycles must be greater than 0 when enableHoldTimeGate is true."
             << std::endl;
         return 1;
     }
@@ -962,9 +976,17 @@ main(int argc, char* argv[])
     const double candidateConfigScore = configScore(candidateOcsEdges);
     const double previousConfigScore = configScore(previousOcsEdges);
     const double configScoreImprovement = candidateConfigScore - previousConfigScore;
+    const bool previousConfigAvailable = !previousOcsEdges.empty();
+    const bool holdTimeActive =
+        enableHoldTimeGate && previousConfigAvailable && previousConfigAge < minHoldCycles;
     std::string configGateDecision = "disabled";
     std::vector<OcsCandidateEdge> selectedOcsEdges;
-    if (!enableConfigUpdateGate)
+    if (holdTimeActive)
+    {
+        selectedOcsEdges = previousOcsEdges;
+        configGateDecision = "hold-previous";
+    }
+    else if (!enableConfigUpdateGate)
     {
         selectedOcsEdges = candidateOcsEdges;
     }
@@ -2021,6 +2043,11 @@ main(int argc, char* argv[])
         std::cout << "[HYBRID-DCN][CONFIG] note = keeping previous OCS configuration because improvement does not exceed threshold"
                   << std::endl;
     }
+    if (configGateDecision == "hold-previous")
+    {
+        std::cout << "[HYBRID-DCN][CONFIG] note = keeping previous OCS configuration because minHoldCycles is not satisfied"
+                  << std::endl;
+    }
     if (enableConfigUpdateGate && previousOcsEdges.empty())
     {
         std::cout << "[HYBRID-DCN][CONFIG] note = previous OCS configuration is empty"
@@ -2089,6 +2116,21 @@ main(int argc, char* argv[])
         const auto& edge = previousOcsEdges[edgeIndex];
         std::cout << "[HYBRID-DCN][STATE] previousEdge[" << edgeIndex
                   << "] = " << edge.leafA << "-" << edge.leafB << std::endl;
+    }
+
+    std::cout << "[HYBRID-DCN][HOLD] enableHoldTimeGate = "
+              << (enableHoldTimeGate ? "true" : "false") << std::endl;
+    std::cout << "[HYBRID-DCN][HOLD] minHoldCycles = " << minHoldCycles << std::endl;
+    std::cout << "[HYBRID-DCN][HOLD] previousConfigAge = " << previousConfigAge
+              << std::endl;
+    std::cout << "[HYBRID-DCN][HOLD] previousConfigAvailable = "
+              << (previousConfigAvailable ? "true" : "false") << std::endl;
+    std::cout << "[HYBRID-DCN][HOLD] holdTimeActive = "
+              << (holdTimeActive ? "true" : "false") << std::endl;
+    if (holdTimeActive)
+    {
+        std::cout << "[HYBRID-DCN][HOLD] note = keeping previous OCS configuration because minHoldCycles is not satisfied"
+                  << std::endl;
     }
 
     std::cout << "[HYBRID-DCN][COMMUNITY] previewEnabled = true" << std::endl;
