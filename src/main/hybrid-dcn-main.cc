@@ -157,6 +157,27 @@ struct OcsControllerDecision
     ControlEpochSummary summary;
 };
 
+struct EpsWecmpLinkState
+{
+    uint32_t spineIndex;
+    double observedTraffic;
+    double utilization;
+    double smoothedUtilization;
+    double attractiveness;
+    double targetProbability;
+    double previousProbability;
+    double updatedProbability;
+};
+
+struct EpsWecmpDecision
+{
+    bool enabled;
+    uint32_t srcLeaf;
+    uint32_t dstLeaf;
+    uint32_t selectedSpine;
+    std::vector<EpsWecmpLinkState> linkStates;
+};
+
 uint64_t g_bulkRxBytes = 0;
 bool g_bulkSeenFirstRx = false;
 double g_bulkFirstRxTime = 0.0;
@@ -358,6 +379,14 @@ main(int argc, char* argv[])
     uint64_t matrixFlowMaxBytes = 524288;
     double matrixFlowStart = 0.35;
     uint16_t matrixFlowPortBase = 11000;
+    bool enableEpsWecmp = false;
+    double epsWecmpRho = 0.7;
+    double epsWecmpGamma = 2.0;
+    double epsWecmpEpsilon = 1e-6;
+    double epsWecmpKappa = 0.5;
+    double epsWecmpMaxDelta = 0.25;
+    uint32_t epsWecmpEpochs = 3;
+    double epsWecmpCapacity = 100.0;
     bool enableResultValidation = true;
     std::string validationMode = "warn";
 
@@ -547,6 +576,22 @@ main(int argc, char* argv[])
     cmd.AddValue("matrixFlowMaxBytes", "MaxBytes for each matrix-generated BulkSend flow.", matrixFlowMaxBytes);
     cmd.AddValue("matrixFlowStart", "Start time for matrix-generated BulkSend flows in seconds.", matrixFlowStart);
     cmd.AddValue("matrixFlowPortBase", "Base TCP port for matrix-generated PacketSink applications.", matrixFlowPortBase);
+    cmd.AddValue("enableEpsWecmp",
+                 "Enable EPS residual-flow WECMP control-plane next-hop selection.",
+                 enableEpsWecmp);
+    cmd.AddValue("epsWecmpRho", "EPS-WECMP utilization smoothing coefficient.", epsWecmpRho);
+    cmd.AddValue("epsWecmpGamma", "EPS-WECMP load sensitivity exponent.", epsWecmpGamma);
+    cmd.AddValue("epsWecmpEpsilon", "EPS-WECMP attractiveness stability term.", epsWecmpEpsilon);
+    cmd.AddValue("epsWecmpKappa", "EPS-WECMP probability update step.", epsWecmpKappa);
+    cmd.AddValue("epsWecmpMaxDelta",
+                 "EPS-WECMP maximum per-cycle probability change.",
+                 epsWecmpMaxDelta);
+    cmd.AddValue("epsWecmpEpochs",
+                 "Number of EPS-WECMP control-plane update epochs.",
+                 epsWecmpEpochs);
+    cmd.AddValue("epsWecmpCapacity",
+                 "EPS-WECMP abstract link capacity in traffic-matrix units.",
+                 epsWecmpCapacity);
     cmd.AddValue("enableResultValidation",
                  "Enable Stage-24 result consistency validation logs.",
                  enableResultValidation);
@@ -936,6 +981,55 @@ main(int argc, char* argv[])
         std::cerr
             << "[HYBRID-DCN][ERROR] controlEpochs must be greater than 0 when enableMultiPeriodControl is true."
             << std::endl;
+        return 1;
+    }
+
+    if (epsWecmpRho <= 0 || epsWecmpRho >= 1)
+    {
+        std::cerr << "[HYBRID-DCN][ERROR] epsWecmpRho must be in (0, 1)." << std::endl;
+        return 1;
+    }
+
+    if (epsWecmpGamma <= 1)
+    {
+        std::cerr << "[HYBRID-DCN][ERROR] epsWecmpGamma must be greater than 1."
+                  << std::endl;
+        return 1;
+    }
+
+    if (epsWecmpEpsilon <= 0)
+    {
+        std::cerr << "[HYBRID-DCN][ERROR] epsWecmpEpsilon must be greater than 0."
+                  << std::endl;
+        return 1;
+    }
+
+    if (epsWecmpKappa <= 0 || epsWecmpKappa > 1)
+    {
+        std::cerr << "[HYBRID-DCN][ERROR] epsWecmpKappa must be in (0, 1]."
+                  << std::endl;
+        return 1;
+    }
+
+    if (epsWecmpMaxDelta <= 0 || epsWecmpMaxDelta > 1)
+    {
+        std::cerr << "[HYBRID-DCN][ERROR] epsWecmpMaxDelta must be in (0, 1]."
+                  << std::endl;
+        return 1;
+    }
+
+    if (enableEpsWecmp && epsWecmpEpochs == 0)
+    {
+        std::cerr
+            << "[HYBRID-DCN][ERROR] epsWecmpEpochs must be greater than 0 when enableEpsWecmp is true."
+            << std::endl;
+        return 1;
+    }
+
+    if (epsWecmpCapacity <= 0)
+    {
+        std::cerr << "[HYBRID-DCN][ERROR] epsWecmpCapacity must be greater than 0."
+                  << std::endl;
         return 1;
     }
 
@@ -2683,6 +2777,8 @@ main(int argc, char* argv[])
     std::vector<MatrixBulkFlowSpec> matrixFlowSpecs;
     std::vector<MatrixBulkFlowStats> matrixFlowStats;
     std::vector<Ptr<PacketSink>> matrixFlowSinks;
+    std::vector<EpsWecmpDecision> epsWecmpDecisions;
+    std::vector<int32_t> matrixFlowWecmpDecisionIndex;
     if (enableMatrixFlows)
     {
         std::vector<std::vector<bool>> matrixFlowPairUsed(numLeaves,
@@ -2746,6 +2842,138 @@ main(int argc, char* argv[])
         }
 
         matrixFlowStats.resize(matrixFlowSpecs.size(), {0, false, 0.0, 0.0});
+    }
+
+    auto isSelectedOcsPair = [&selectedOcsEdges](uint32_t leafA, uint32_t leafB) {
+        for (const auto& edge : selectedOcsEdges)
+        {
+            if ((edge.leafA == leafA && edge.leafB == leafB) ||
+                (edge.leafA == leafB && edge.leafB == leafA))
+            {
+                return true;
+            }
+        }
+        return false;
+    };
+
+    auto runEpsWecmpForResidualPair = [&](uint32_t srcLeaf, uint32_t dstLeaf) {
+        EpsWecmpDecision decision{enableEpsWecmp, srcLeaf, dstLeaf, 0, {}};
+        if (!enableEpsWecmp || numSpines == 0 || isSelectedOcsPair(srcLeaf, dstLeaf))
+        {
+            return decision;
+        }
+
+        const double baseResidualDemand = torTrafficMatrix[srcLeaf][dstLeaf];
+        const double initialProbability = 1.0 / static_cast<double>(numSpines);
+        decision.linkStates.reserve(numSpines);
+        for (uint32_t spineIndex = 0; spineIndex < numSpines; ++spineIndex)
+        {
+            decision.linkStates.push_back({spineIndex,
+                                           0.0,
+                                           0.0,
+                                           0.0,
+                                           0.0,
+                                           initialProbability,
+                                           initialProbability,
+                                           initialProbability});
+        }
+
+        for (uint32_t epsEpoch = 0; epsEpoch < epsWecmpEpochs; ++epsEpoch)
+        {
+            double sumAttractiveness = 0.0;
+            for (auto& state : decision.linkStates)
+            {
+                double deterministicBias = 0.0;
+                if (state.spineIndex == 0)
+                {
+                    deterministicBias = 0.30 * baseResidualDemand;
+                }
+                else if (state.spineIndex >= 2)
+                {
+                    deterministicBias =
+                        0.10 * baseResidualDemand / static_cast<double>(state.spineIndex + 1);
+                }
+
+                state.observedTraffic =
+                    baseResidualDemand / static_cast<double>(numSpines) + deterministicBias;
+                state.utilization = state.observedTraffic / epsWecmpCapacity;
+                state.smoothedUtilization =
+                    epsWecmpRho * state.smoothedUtilization +
+                    (1.0 - epsWecmpRho) * state.utilization;
+                state.attractiveness =
+                    1.0 /
+                    (std::pow(state.smoothedUtilization, epsWecmpGamma) + epsWecmpEpsilon);
+                sumAttractiveness += state.attractiveness;
+            }
+
+            double probabilitySum = 0.0;
+            for (auto& state : decision.linkStates)
+            {
+                state.targetProbability =
+                    sumAttractiveness > 0 ? state.attractiveness / sumAttractiveness
+                                          : initialProbability;
+                const double rawUpdated =
+                    (1.0 - epsWecmpKappa) * state.previousProbability +
+                    epsWecmpKappa * state.targetProbability;
+                const double lower = state.previousProbability - epsWecmpMaxDelta;
+                const double upper = state.previousProbability + epsWecmpMaxDelta;
+                state.updatedProbability = std::max(0.0, std::min(rawUpdated, upper));
+                state.updatedProbability = std::max(state.updatedProbability, lower);
+                probabilitySum += state.updatedProbability;
+            }
+
+            if (probabilitySum > 0)
+            {
+                for (auto& state : decision.linkStates)
+                {
+                    state.updatedProbability /= probabilitySum;
+                }
+            }
+            else
+            {
+                for (auto& state : decision.linkStates)
+                {
+                    state.updatedProbability = initialProbability;
+                }
+            }
+
+            for (auto& state : decision.linkStates)
+            {
+                state.previousProbability = state.updatedProbability;
+            }
+        }
+
+        for (const auto& state : decision.linkStates)
+        {
+            const auto& selectedState = decision.linkStates[decision.selectedSpine];
+            if (state.updatedProbability > selectedState.updatedProbability ||
+                (state.updatedProbability == selectedState.updatedProbability &&
+                 state.spineIndex < selectedState.spineIndex))
+            {
+                decision.selectedSpine = state.spineIndex;
+            }
+        }
+
+        return decision;
+    };
+
+    matrixFlowWecmpDecisionIndex.assign(matrixFlowSpecs.size(), -1);
+    if (enableEpsWecmp && enableMatrixFlows)
+    {
+        for (uint32_t flowIndex = 0; flowIndex < matrixFlowSpecs.size(); ++flowIndex)
+        {
+            const auto& spec = matrixFlowSpecs[flowIndex];
+            if (spec.ocsCovered || isSelectedOcsPair(spec.srcLeaf, spec.dstLeaf))
+            {
+                continue;
+            }
+
+            EpsWecmpDecision decision =
+                runEpsWecmpForResidualPair(spec.srcLeaf, spec.dstLeaf);
+            matrixFlowWecmpDecisionIndex[flowIndex] =
+                static_cast<int32_t>(epsWecmpDecisions.size());
+            epsWecmpDecisions.push_back(decision);
+        }
     }
 
     if (enableEcho)
@@ -3022,6 +3250,68 @@ main(int argc, char* argv[])
               << (enableMatrixFlows ? matrixFlowStart : 0.0) << " s" << std::endl;
     std::cout << "[HYBRID-DCN] matrixFlowPortBase     = "
               << (enableMatrixFlows ? matrixFlowPortBase : 0) << std::endl;
+
+    std::cout << "[HYBRID-DCN][WECMP] enabled = "
+              << (enableEpsWecmp ? "true" : "false") << std::endl;
+    std::cout << "[HYBRID-DCN][WECMP] source = residual-demand-estimate" << std::endl;
+    std::cout << "[HYBRID-DCN][WECMP] rho = " << epsWecmpRho << std::endl;
+    std::cout << "[HYBRID-DCN][WECMP] gamma = " << epsWecmpGamma << std::endl;
+    std::cout << "[HYBRID-DCN][WECMP] epsilon = " << epsWecmpEpsilon << std::endl;
+    std::cout << "[HYBRID-DCN][WECMP] kappa = " << epsWecmpKappa << std::endl;
+    std::cout << "[HYBRID-DCN][WECMP] maxDelta = " << epsWecmpMaxDelta << std::endl;
+    std::cout << "[HYBRID-DCN][WECMP] epochs = " << epsWecmpEpochs << std::endl;
+    std::cout << "[HYBRID-DCN][WECMP] capacity = " << epsWecmpCapacity << std::endl;
+    std::cout << "[HYBRID-DCN][WECMP] residualDecisions = "
+              << epsWecmpDecisions.size() << std::endl;
+    if (enableEpsWecmp)
+    {
+        for (uint32_t flowIndex = 0; flowIndex < matrixFlowSpecs.size(); ++flowIndex)
+        {
+            const auto& spec = matrixFlowSpecs[flowIndex];
+            if (spec.ocsCovered || isSelectedOcsPair(spec.srcLeaf, spec.dstLeaf))
+            {
+                std::cout << "[HYBRID-DCN][WECMP] matrixFlow[" << flowIndex
+                          << "] skipped = ocs-covered" << std::endl;
+                continue;
+            }
+
+            const int32_t decisionIndex = matrixFlowWecmpDecisionIndex[flowIndex];
+            if (decisionIndex < 0)
+            {
+                continue;
+            }
+
+            const auto& decision =
+                epsWecmpDecisions[static_cast<std::size_t>(decisionIndex)];
+            std::cout << "[HYBRID-DCN][WECMP] decision[" << decisionIndex
+                      << "] pair = " << decision.srcLeaf << "-" << decision.dstLeaf
+                      << std::endl;
+            std::cout << "[HYBRID-DCN][WECMP] decision[" << decisionIndex
+                      << "] selectedSpine = " << decision.selectedSpine << std::endl;
+            std::cout << "[HYBRID-DCN][WECMP] decision[" << decisionIndex
+                      << "] candidateSpines = " << decision.linkStates.size() << std::endl;
+            for (const auto& state : decision.linkStates)
+            {
+                std::cout << "[HYBRID-DCN][WECMP] decision[" << decisionIndex
+                          << "] spine[" << state.spineIndex
+                          << "] observedTraffic = " << state.observedTraffic << std::endl;
+                std::cout << "[HYBRID-DCN][WECMP] decision[" << decisionIndex
+                          << "] spine[" << state.spineIndex
+                          << "] utilization = " << state.utilization << std::endl;
+                std::cout << "[HYBRID-DCN][WECMP] decision[" << decisionIndex
+                          << "] spine[" << state.spineIndex
+                          << "] smoothedUtilization = " << state.smoothedUtilization
+                          << std::endl;
+                std::cout << "[HYBRID-DCN][WECMP] decision[" << decisionIndex
+                          << "] spine[" << state.spineIndex
+                          << "] targetProbability = " << state.targetProbability << std::endl;
+                std::cout << "[HYBRID-DCN][WECMP] decision[" << decisionIndex
+                          << "] spine[" << state.spineIndex
+                          << "] updatedProbability = " << state.updatedProbability
+                          << std::endl;
+            }
+        }
+    }
 
     std::cout << "[HYBRID-DCN][MATRIX] enableMatrixSelect = "
               << (enableMatrixSelect ? "true" : "false") << std::endl;
