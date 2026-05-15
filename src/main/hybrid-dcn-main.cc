@@ -14,7 +14,6 @@
 #include <iostream>
 #include <sstream>
 #include <string>
-#include <tuple>
 #include <vector>
 
 using namespace ns3;
@@ -137,6 +136,25 @@ struct ControlEpochSummary
     std::string decision;
     uint32_t previousConfigAgeBefore;
     uint32_t previousConfigAgeAfter;
+};
+
+struct OcsControllerDecision
+{
+    std::vector<OcsCandidateEdge> candidateEdges;
+    std::vector<OcsCandidateEdge> candidateOcsEdges;
+    std::vector<OcsCandidateEdge> previousOcsEdges;
+    std::vector<OcsCandidateEdge> selectedOcsEdges;
+    LouvainResult louvain;
+    CommunityPreview communityPreview;
+    std::vector<uint32_t> communityLabels;
+    uint32_t communityCount;
+    double candidateConfigScore;
+    double previousConfigScore;
+    double configScoreImprovement;
+    bool holdTimeActive;
+    std::string decision;
+    uint32_t selectedConfigAge;
+    ControlEpochSummary summary;
 };
 
 uint64_t g_bulkRxBytes = 0;
@@ -1883,6 +1901,12 @@ main(int argc, char* argv[])
                 return edge;
             };
 
+            std::vector<OcsCandidateEdge> epochPreviousOcsEdges;
+            for (const auto& edge : epochPreviousEdges)
+            {
+                epochPreviousOcsEdges.push_back(makeEpochCandidateEdge(edge.leafA, edge.leafB));
+            }
+
             std::vector<OcsCandidateEdge> epochCandidateEdges;
             for (uint32_t leafA = 0; leafA < numLeaves; ++leafA)
             {
@@ -1927,10 +1951,10 @@ main(int argc, char* argv[])
             }
 
             const double epochCandidateConfigScore = configScore(epochCandidateOcsEdges);
-            const double epochPreviousConfigScore = configScore(epochPreviousEdges);
+            const double epochPreviousConfigScore = configScore(epochPreviousOcsEdges);
             const double epochConfigScoreImprovement =
                 epochCandidateConfigScore - epochPreviousConfigScore;
-            const bool epochPreviousConfigAvailable = !epochPreviousEdges.empty();
+            const bool epochPreviousConfigAvailable = !epochPreviousOcsEdges.empty();
             const bool epochHoldTimeActive = enableHoldTimeGate &&
                                              epochPreviousConfigAvailable &&
                                              epochPreviousAge < minHoldCycles;
@@ -1938,7 +1962,7 @@ main(int argc, char* argv[])
             std::vector<OcsCandidateEdge> epochSelectedEdges;
             if (epochHoldTimeActive)
             {
-                epochSelectedEdges = epochPreviousEdges;
+                epochSelectedEdges = epochPreviousOcsEdges;
                 epochDecision = "hold-previous";
             }
             else if (!enableConfigUpdateGate)
@@ -1952,19 +1976,20 @@ main(int argc, char* argv[])
             }
             else
             {
-                epochSelectedEdges = epochPreviousEdges;
+                epochSelectedEdges = epochPreviousOcsEdges;
                 epochDecision = "keep-previous";
             }
 
             const uint32_t epochAgeAfter =
-                areEdgeSetsEqual(epochSelectedEdges, epochPreviousEdges) ? epochPreviousAge + 1 : 1;
+                areEdgeSetsEqual(epochSelectedEdges, epochPreviousOcsEdges) ? epochPreviousAge + 1
+                                                                            : 1;
 
             ControlEpochSummary summary{epoch,
                                         matrixModeName,
                                         epochCommunityCount,
                                         static_cast<uint32_t>(epochCandidateEdges.size()),
                                         static_cast<uint32_t>(epochCandidateOcsEdges.size()),
-                                        static_cast<uint32_t>(epochPreviousEdges.size()),
+                                        static_cast<uint32_t>(epochPreviousOcsEdges.size()),
                                         static_cast<uint32_t>(epochSelectedEdges.size()),
                                         epochCandidateConfigScore,
                                         epochPreviousConfigScore,
@@ -1974,21 +1999,21 @@ main(int argc, char* argv[])
                                         epochPreviousAge,
                                         epochAgeAfter};
 
-            return std::make_tuple(epochCandidateEdges,
-                                   epochCandidateOcsEdges,
-                                   epochPreviousEdges,
-                                   epochSelectedEdges,
-                                   epochLouvain,
-                                   epochPreview,
-                                   epochLabels,
-                                   epochCommunityCount,
-                                   epochCandidateConfigScore,
-                                   epochPreviousConfigScore,
-                                   epochConfigScoreImprovement,
-                                   epochHoldTimeActive,
-                                   epochDecision,
-                                   epochAgeAfter,
-                                   summary);
+            return OcsControllerDecision{epochCandidateEdges,
+                                         epochCandidateOcsEdges,
+                                         epochPreviousOcsEdges,
+                                         epochSelectedEdges,
+                                         epochLouvain,
+                                         epochPreview,
+                                         epochLabels,
+                                         epochCommunityCount,
+                                         epochCandidateConfigScore,
+                                         epochPreviousConfigScore,
+                                         epochConfigScoreImprovement,
+                                         epochHoldTimeActive,
+                                         epochDecision,
+                                         epochAgeAfter,
+                                         summary};
         };
 
     if (enableMultiPeriodControl)
@@ -1999,26 +2024,27 @@ main(int argc, char* argv[])
         {
             const std::string epochMatrixMode = getEpochMatrixMode(epoch);
             const WeightedMatrix epochMatrix = buildTrafficMatrix(epochMatrixMode, numLeaves);
-            auto epochResult = runControlDecisionForMatrix(epochMatrix,
-                                                           epochMatrixMode,
-                                                           epochPreviousEdges,
-                                                           epochPreviousAge,
-                                                           epoch);
+            OcsControllerDecision epochDecision =
+                runControlDecisionForMatrix(epochMatrix,
+                                            epochMatrixMode,
+                                            epochPreviousEdges,
+                                            epochPreviousAge,
+                                            epoch);
 
-            candidateEdges = std::get<0>(epochResult);
-            candidateOcsEdges = std::get<1>(epochResult);
-            previousOcsEdges = std::get<2>(epochResult);
-            selectedOcsEdges = std::get<3>(epochResult);
-            louvainResult = std::get<4>(epochResult);
-            activeCommunityLabels = std::get<6>(epochResult);
-            activeCommunityCount = std::get<7>(epochResult);
-            candidateConfigScore = std::get<8>(epochResult);
-            previousConfigScore = std::get<9>(epochResult);
-            configScoreImprovement = std::get<10>(epochResult);
-            holdTimeActive = std::get<11>(epochResult);
-            configGateDecision = std::get<12>(epochResult);
-            epochPreviousAge = std::get<13>(epochResult);
-            controlEpochSummaries.push_back(std::get<14>(epochResult));
+            candidateEdges = epochDecision.candidateEdges;
+            candidateOcsEdges = epochDecision.candidateOcsEdges;
+            previousOcsEdges = epochDecision.previousOcsEdges;
+            selectedOcsEdges = epochDecision.selectedOcsEdges;
+            louvainResult = epochDecision.louvain;
+            activeCommunityLabels = epochDecision.communityLabels;
+            activeCommunityCount = epochDecision.communityCount;
+            candidateConfigScore = epochDecision.candidateConfigScore;
+            previousConfigScore = epochDecision.previousConfigScore;
+            configScoreImprovement = epochDecision.configScoreImprovement;
+            holdTimeActive = epochDecision.holdTimeActive;
+            configGateDecision = epochDecision.decision;
+            epochPreviousAge = epochDecision.selectedConfigAge;
+            controlEpochSummaries.push_back(epochDecision.summary);
 
             epochPreviousEdges = selectedOcsEdges;
             finalEpochMatrixMode = epochMatrixMode;
@@ -2028,9 +2054,9 @@ main(int argc, char* argv[])
         trafficMatrixMode = finalEpochMatrixMode;
         previousConfigAge =
             controlEpochSummaries.empty() ? previousConfigAge
-                                          : controlEpochSummaries.back().previousConfigAgeBefore;
+                                          : controlEpochSummaries.back().previousConfigAgeAfter;
         recomputeTrafficMetrics(torTrafficMatrix);
-        previousConfigAvailable = !previousOcsEdges.empty();
+        previousConfigAvailable = !selectedOcsEdges.empty();
 
         intraCandidateEdges = 0;
         interCandidateEdges = 0;
