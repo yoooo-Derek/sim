@@ -215,6 +215,15 @@ struct EpsWecmpPairState
     bool initialized;
 };
 
+struct EpsPhysicalLinkState
+{
+    uint32_t leafIndex;
+    uint32_t spineIndex;
+    double observedTraffic;
+    double utilization;
+    double smoothedUtilization;
+};
+
 struct EpsWecmpEpochSummary
 {
     uint32_t epoch;
@@ -448,6 +457,7 @@ main(int argc, char* argv[])
     double epsWecmpMaxDelta = 0.25;
     uint32_t epsWecmpEpochs = 3;
     double epsWecmpCapacity = 100.0;
+    std::string epsWecmpPathMetric = "max";
     bool enableEpsWecmpRouting = false;
     bool enableMultiPeriodWecmpState = true;
     bool enableResultValidation = true;
@@ -510,6 +520,7 @@ main(int argc, char* argv[])
             "matrixFlowStart",
             "matrixFlowPortBase",
             "enableMultiPeriodWecmpState",
+            "epsWecmpPathMetric",
             "numLeaves",
             "serversPerLeaf",
             "numSpines",
@@ -665,6 +676,9 @@ main(int argc, char* argv[])
     cmd.AddValue("epsWecmpCapacity",
                  "EPS-WECMP abstract link capacity in traffic-matrix units.",
                  epsWecmpCapacity);
+    cmd.AddValue("epsWecmpPathMetric",
+                 "EPS-WECMP path metric over leaf-spine links: max or average.",
+                 epsWecmpPathMetric);
     cmd.AddValue("enableEpsWecmpRouting",
                  "Bind residual matrix-flow EPS paths to EPS-WECMP selected spines using static routes.",
                  enableEpsWecmpRouting);
@@ -1122,6 +1136,13 @@ main(int argc, char* argv[])
     if (epsWecmpCapacity <= 0)
     {
         std::cerr << "[HYBRID-DCN][ERROR] epsWecmpCapacity must be greater than 0."
+                  << std::endl;
+        return 1;
+    }
+
+    if (epsWecmpPathMetric != "max" && epsWecmpPathMetric != "average")
+    {
+        std::cerr << "[HYBRID-DCN][ERROR] epsWecmpPathMetric must be max or average."
                   << std::endl;
         return 1;
     }
@@ -1949,7 +1970,19 @@ main(int argc, char* argv[])
     std::vector<ControlEpochSummary> controlEpochSummaries;
     std::vector<EpsWecmpEpochSummary> epsWecmpEpochSummaries;
     std::vector<EpsWecmpPairState> epsWecmpPairStates;
+    std::vector<std::vector<EpsPhysicalLinkState>> epsPhysicalLinkStates(
+        numLeaves,
+        std::vector<EpsPhysicalLinkState>(numSpines));
     std::string finalEpochMatrixMode = trafficMatrixMode;
+
+    for (uint32_t leafIndex = 0; leafIndex < numLeaves; ++leafIndex)
+    {
+        for (uint32_t spineIndex = 0; spineIndex < numSpines; ++spineIndex)
+        {
+            epsPhysicalLinkStates[leafIndex][spineIndex] =
+                EpsPhysicalLinkState{leafIndex, spineIndex, 0.0, 0.0, 0.0};
+        }
+    }
 
     auto getOrCreateEpsWecmpPairState = [&](uint32_t srcLeaf,
                                             uint32_t dstLeaf) -> EpsWecmpPairState& {
@@ -1981,6 +2014,46 @@ main(int argc, char* argv[])
         return epsWecmpPairStates.back();
     };
 
+    auto resetEpsPhysicalObservedTraffic = [&]() {
+        for (auto& leafStates : epsPhysicalLinkStates)
+        {
+            for (auto& linkState : leafStates)
+            {
+                linkState.observedTraffic = 0.0;
+            }
+        }
+    };
+
+    auto accumulateEpsResidualTraffic = [&](uint32_t srcLeaf,
+                                            uint32_t dstLeaf,
+                                            double residualDemand) {
+        if (residualDemand <= 0 || numSpines == 0)
+        {
+            return;
+        }
+
+        EpsWecmpPairState& pairState = getOrCreateEpsWecmpPairState(srcLeaf, dstLeaf);
+        for (uint32_t spineIndex = 0; spineIndex < numSpines; ++spineIndex)
+        {
+            const double allocation = residualDemand * pairState.probabilities[spineIndex];
+            epsPhysicalLinkStates[srcLeaf][spineIndex].observedTraffic += allocation;
+            epsPhysicalLinkStates[dstLeaf][spineIndex].observedTraffic += allocation;
+        }
+    };
+
+    auto updateEpsPhysicalSmoothedUtilization = [&]() {
+        for (auto& leafStates : epsPhysicalLinkStates)
+        {
+            for (auto& linkState : leafStates)
+            {
+                linkState.utilization = linkState.observedTraffic / epsWecmpCapacity;
+                linkState.smoothedUtilization =
+                    epsWecmpRho * linkState.smoothedUtilization +
+                    (1.0 - epsWecmpRho) * linkState.utilization;
+            }
+        }
+    };
+
     auto runEpsWecmpUpdateForPair = [&](uint32_t srcLeaf,
                                         uint32_t dstLeaf,
                                         double residualDemand,
@@ -1997,7 +2070,6 @@ main(int argc, char* argv[])
         }
 
         EpsWecmpPairState& pairState = getOrCreateEpsWecmpPairState(srcLeaf, dstLeaf);
-        const double baseResidualDemand = residualDemand;
         const double initialProbability = 1.0 / static_cast<double>(numSpines);
         std::vector<double> currentProbabilities = pairState.probabilities;
         decision.linkStates.reserve(numSpines);
@@ -2018,23 +2090,24 @@ main(int argc, char* argv[])
             double sumAttractiveness = 0.0;
             for (auto& state : decision.linkStates)
             {
-                double deterministicBias = 0.0;
-                if (state.spineIndex == 0)
+                const auto& srcLinkState = epsPhysicalLinkStates[srcLeaf][state.spineIndex];
+                const auto& dstLinkState = epsPhysicalLinkStates[dstLeaf][state.spineIndex];
+                if (epsWecmpPathMetric == "max")
                 {
-                    deterministicBias = 0.30 * baseResidualDemand;
+                    state.observedTraffic =
+                        std::max(srcLinkState.observedTraffic, dstLinkState.observedTraffic);
+                    state.smoothedUtilization = std::max(srcLinkState.smoothedUtilization,
+                                                         dstLinkState.smoothedUtilization);
                 }
-                else if (state.spineIndex >= 2)
+                else
                 {
-                    deterministicBias =
-                        0.10 * baseResidualDemand / static_cast<double>(state.spineIndex + 1);
+                    state.observedTraffic =
+                        0.5 * (srcLinkState.observedTraffic + dstLinkState.observedTraffic);
+                    state.smoothedUtilization =
+                        0.5 * (srcLinkState.smoothedUtilization +
+                               dstLinkState.smoothedUtilization);
                 }
-
-                state.observedTraffic =
-                    baseResidualDemand / static_cast<double>(numSpines) + deterministicBias;
-                state.utilization = state.observedTraffic / epsWecmpCapacity;
-                state.smoothedUtilization =
-                    epsWecmpRho * state.smoothedUtilization +
-                    (1.0 - epsWecmpRho) * state.utilization;
+                state.utilization = state.smoothedUtilization;
                 state.attractiveness =
                     1.0 /
                     (std::pow(state.smoothedUtilization, epsWecmpGamma) + epsWecmpEpsilon);
@@ -2506,6 +2579,14 @@ main(int argc, char* argv[])
             if (multiPeriodWecmpStateEnabled)
             {
                 EpsWecmpEpochSummary wecmpSummary{epoch, epochMatrixMode, 0, 0, 0.0, 0.0};
+                struct EpochResidualPair
+                {
+                    uint32_t leafA;
+                    uint32_t leafB;
+                    double residualDemand;
+                };
+                std::vector<EpochResidualPair> epochResidualPairs;
+                resetEpsPhysicalObservedTraffic();
                 for (uint32_t leafA = 0; leafA < numLeaves; ++leafA)
                 {
                     for (uint32_t leafB = leafA + 1; leafB < numLeaves; ++leafB)
@@ -2535,17 +2616,19 @@ main(int argc, char* argv[])
                         wecmpSummary.residualPairs++;
                         wecmpSummary.totalPlannedResidualDemand += plannedResidualDemand;
                         wecmpSummary.totalRealResidualDemand += realResidualDemand;
-
-                        const EpsWecmpDecision wecmpDecision =
-                            runEpsWecmpUpdateForPair(leafA,
-                                                     leafB,
-                                                     plannedResidualDemand,
-                                                     false);
-                        if (!wecmpDecision.linkStates.empty() || numSpines > 0)
-                        {
-                            wecmpSummary.updatedPairs++;
-                        }
+                        epochResidualPairs.push_back({leafA, leafB, plannedResidualDemand});
+                        accumulateEpsResidualTraffic(leafA, leafB, plannedResidualDemand);
                     }
+                }
+
+                updateEpsPhysicalSmoothedUtilization();
+                for (const auto& residualPair : epochResidualPairs)
+                {
+                    runEpsWecmpUpdateForPair(residualPair.leafA,
+                                             residualPair.leafB,
+                                             residualPair.residualDemand,
+                                             false);
+                    wecmpSummary.updatedPairs++;
                 }
                 epsWecmpEpochSummaries.push_back(wecmpSummary);
             }
@@ -3360,6 +3443,18 @@ main(int argc, char* argv[])
     matrixFlowWecmpDecisionIndex.assign(matrixFlowSpecs.size(), -1);
     if (enableEpsWecmp && enableMatrixFlows)
     {
+        resetEpsPhysicalObservedTraffic();
+        for (const auto& spec : matrixFlowSpecs)
+        {
+            if (!spec.ocsCovered && spec.wecmpResidualDemand > 0)
+            {
+                accumulateEpsResidualTraffic(spec.srcLeaf,
+                                             spec.dstLeaf,
+                                             spec.wecmpResidualDemand);
+            }
+        }
+        updateEpsPhysicalSmoothedUtilization();
+
         for (uint32_t flowIndex = 0; flowIndex < matrixFlowSpecs.size(); ++flowIndex)
         {
             const auto& spec = matrixFlowSpecs[flowIndex];
@@ -3783,7 +3878,8 @@ main(int argc, char* argv[])
 
     std::cout << "[HYBRID-DCN][WECMP] enabled = "
               << (enableEpsWecmp ? "true" : "false") << std::endl;
-    std::cout << "[HYBRID-DCN][WECMP] source = residual-demand-estimate" << std::endl;
+    std::cout << "[HYBRID-DCN][WECMP] source = shared-eps-physical-link-telemetry"
+              << std::endl;
     std::cout << "[HYBRID-DCN][WECMP] rho = " << epsWecmpRho << std::endl;
     std::cout << "[HYBRID-DCN][WECMP] gamma = " << epsWecmpGamma << std::endl;
     std::cout << "[HYBRID-DCN][WECMP] epsilon = " << epsWecmpEpsilon << std::endl;
@@ -3791,10 +3887,44 @@ main(int argc, char* argv[])
     std::cout << "[HYBRID-DCN][WECMP] maxDelta = " << epsWecmpMaxDelta << std::endl;
     std::cout << "[HYBRID-DCN][WECMP] epochs = " << epsWecmpEpochs << std::endl;
     std::cout << "[HYBRID-DCN][WECMP] capacity = " << epsWecmpCapacity << std::endl;
+    std::cout << "[HYBRID-DCN][WECMP] pathMetric = " << epsWecmpPathMetric << std::endl;
     std::cout << "[HYBRID-DCN][WECMP] residualDecisions = "
               << epsWecmpDecisions.size() << std::endl;
     std::cout << "[HYBRID-DCN][WECMP] pairStates = " << epsWecmpPairStates.size()
               << std::endl;
+    const uint32_t physicalLinkStateCount = numLeaves * numSpines;
+    std::cout << "[HYBRID-DCN][WECMP] physicalLinkStates = "
+              << physicalLinkStateCount << std::endl;
+    const uint32_t physicalLinkLogLimit = 8;
+    if (physicalLinkStateCount > physicalLinkLogLimit)
+    {
+        std::cout << "[HYBRID-DCN][WECMP] physicalLinkLogLimit = "
+                  << physicalLinkLogLimit << std::endl;
+    }
+    uint32_t physicalLinkLogIndex = 0;
+    for (uint32_t leafIndex = 0; leafIndex < numLeaves &&
+                                      physicalLinkLogIndex < physicalLinkLogLimit;
+         ++leafIndex)
+    {
+        for (uint32_t spineIndex = 0; spineIndex < numSpines &&
+                                          physicalLinkLogIndex < physicalLinkLogLimit;
+             ++spineIndex)
+        {
+            const auto& linkState = epsPhysicalLinkStates[leafIndex][spineIndex];
+            std::cout << "[HYBRID-DCN][WECMP] physicalLink[" << physicalLinkLogIndex
+                      << "] leaf = " << linkState.leafIndex << std::endl;
+            std::cout << "[HYBRID-DCN][WECMP] physicalLink[" << physicalLinkLogIndex
+                      << "] spine = " << linkState.spineIndex << std::endl;
+            std::cout << "[HYBRID-DCN][WECMP] physicalLink[" << physicalLinkLogIndex
+                      << "] observedTraffic = " << linkState.observedTraffic << std::endl;
+            std::cout << "[HYBRID-DCN][WECMP] physicalLink[" << physicalLinkLogIndex
+                      << "] utilization = " << linkState.utilization << std::endl;
+            std::cout << "[HYBRID-DCN][WECMP] physicalLink[" << physicalLinkLogIndex
+                      << "] smoothedUtilization = " << linkState.smoothedUtilization
+                      << std::endl;
+            physicalLinkLogIndex++;
+        }
+    }
     if (enableEpsWecmp)
     {
         for (uint32_t flowIndex = 0; flowIndex < matrixFlowSpecs.size(); ++flowIndex)
