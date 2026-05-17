@@ -463,6 +463,8 @@ main(int argc, char* argv[])
     std::string epsWecmpPathMetric = "max";
     bool enableEpsWecmpRouting = false;
     bool enableMultiPeriodWecmpState = true;
+    bool enableAlgorithmInvariantCheck = true;
+    bool strictAlgorithmInvariantCheck = false;
     bool enableResultValidation = true;
     std::string validationMode = "warn";
 
@@ -688,6 +690,12 @@ main(int argc, char* argv[])
     cmd.AddValue("enableMultiPeriodWecmpState",
                  "Update EPS-WECMP pair state after each multi-period OCS control epoch.",
                  enableMultiPeriodWecmpState);
+    cmd.AddValue("enableAlgorithmInvariantCheck",
+                 "Enable Stage-40 core algorithm invariant checks.",
+                 enableAlgorithmInvariantCheck);
+    cmd.AddValue("strictAlgorithmInvariantCheck",
+                 "Return non-zero when a Stage-40 invariant check fails.",
+                 strictAlgorithmInvariantCheck);
     cmd.AddValue("enableResultValidation",
                  "Enable Stage-24 result consistency validation logs.",
                  enableResultValidation);
@@ -5380,6 +5388,234 @@ main(int argc, char* argv[])
                   << baselineConsistency << std::endl;
         std::cout << "[HYBRID-DCN][VALIDATION] overallResultConsistency = "
                   << passFail(overallResultConsistency) << std::endl;
+    }
+
+    std::cout << "[HYBRID-DCN][INVARIANT] enabled = "
+              << (enableAlgorithmInvariantCheck ? "true" : "false") << std::endl;
+    if (enableAlgorithmInvariantCheck)
+    {
+        auto invariantStatus = [](bool passed) {
+            return passed ? "pass" : "fail";
+        };
+        auto updateOverallInvariant = [](bool& overall, bool passed) {
+            overall = overall && passed;
+        };
+
+        bool overallAlgorithmInvariant = true;
+
+        std::cout << "[HYBRID-DCN][INVARIANT] strict = "
+                  << (strictAlgorithmInvariantCheck ? "true" : "false") << std::endl;
+        std::cout << "[HYBRID-DCN][INVARIANT] stage = stage-40-core-algorithm-invariants"
+                  << std::endl;
+
+        std::vector<uint32_t> invariantOcsDegree(numLeaves, 0);
+        bool ocsPortConstraintCheck = true;
+        for (const auto& edge : selectedOcsEdges)
+        {
+            if (edge.leafA >= numLeaves || edge.leafB >= numLeaves)
+            {
+                ocsPortConstraintCheck = false;
+                continue;
+            }
+            invariantOcsDegree[edge.leafA]++;
+            invariantOcsDegree[edge.leafB]++;
+        }
+        for (const auto degree : invariantOcsDegree)
+        {
+            if (degree > ocsPortK)
+            {
+                ocsPortConstraintCheck = false;
+                break;
+            }
+        }
+        updateOverallInvariant(overallAlgorithmInvariant, ocsPortConstraintCheck);
+        std::cout << "[HYBRID-DCN][INVARIANT] ocsPortConstraintCheck = "
+                  << invariantStatus(ocsPortConstraintCheck) << std::endl;
+
+        const bool maxSelectedOcsLinksCheck =
+            selectedOcsEdges.size() <= maxSelectedOcsLinks;
+        updateOverallInvariant(overallAlgorithmInvariant, maxSelectedOcsLinksCheck);
+        std::cout << "[HYBRID-DCN][INVARIANT] maxSelectedOcsLinksCheck = "
+                  << invariantStatus(maxSelectedOcsLinksCheck) << std::endl;
+
+        bool hardHoldPreservedInCandidateCheck = true;
+        if (holdTimeActive || !holdOcsEdges.empty())
+        {
+            for (const auto& edge : holdOcsEdges)
+            {
+                if (!isEdgeInSet(candidateOcsEdges, edge.leafA, edge.leafB))
+                {
+                    hardHoldPreservedInCandidateCheck = false;
+                    break;
+                }
+            }
+        }
+        updateOverallInvariant(overallAlgorithmInvariant, hardHoldPreservedInCandidateCheck);
+        std::cout << "[HYBRID-DCN][INVARIANT] hardHoldPreservedInCandidateCheck = "
+                  << invariantStatus(hardHoldPreservedInCandidateCheck) << std::endl;
+
+        if (enableOcsAdmissionControl)
+        {
+            bool ocsAdmissionThresholdCheck = true;
+            for (const auto& spec : matrixFlowSpecs)
+            {
+                if (spec.ocsAdmitted &&
+                    spec.ocsLoadAfter > ocsAdmissionThreshold + 1e-9)
+                {
+                    ocsAdmissionThresholdCheck = false;
+                    break;
+                }
+            }
+            updateOverallInvariant(overallAlgorithmInvariant, ocsAdmissionThresholdCheck);
+            std::cout << "[HYBRID-DCN][INVARIANT] ocsAdmissionThresholdCheck = "
+                      << invariantStatus(ocsAdmissionThresholdCheck) << std::endl;
+        }
+        else
+        {
+            std::cout << "[HYBRID-DCN][INVARIANT] ocsAdmissionThresholdCheck = skipped"
+                      << std::endl;
+        }
+
+        bool residualDemandNonNegativeCheck = true;
+        for (const auto& spec : matrixFlowSpecs)
+        {
+            if (spec.plannedResidualDemand < -1e-9 ||
+                spec.realResidualDemand < -1e-9 ||
+                spec.wecmpResidualDemand < -1e-9)
+            {
+                residualDemandNonNegativeCheck = false;
+                break;
+            }
+        }
+        updateOverallInvariant(overallAlgorithmInvariant, residualDemandNonNegativeCheck);
+        std::cout << "[HYBRID-DCN][INVARIANT] residualDemandNonNegativeCheck = "
+                  << invariantStatus(residualDemandNonNegativeCheck) << std::endl;
+
+        if (enableEpsWecmp)
+        {
+            bool wecmpProbabilitySumCheck = true;
+            bool wecmpProbabilityRangeCheck = true;
+            for (const auto& state : epsWecmpPairStates)
+            {
+                double probabilitySum = 0.0;
+                for (const auto probability : state.probabilities)
+                {
+                    probabilitySum += probability;
+                    if (probability < -1e-9 || probability > 1.0 + 1e-9)
+                    {
+                        wecmpProbabilityRangeCheck = false;
+                    }
+                }
+                if (!state.probabilities.empty() &&
+                    std::abs(probabilitySum - 1.0) > 1e-6)
+                {
+                    wecmpProbabilitySumCheck = false;
+                }
+            }
+            updateOverallInvariant(overallAlgorithmInvariant, wecmpProbabilitySumCheck);
+            updateOverallInvariant(overallAlgorithmInvariant, wecmpProbabilityRangeCheck);
+            std::cout << "[HYBRID-DCN][INVARIANT] wecmpProbabilitySumCheck = "
+                      << invariantStatus(wecmpProbabilitySumCheck) << std::endl;
+            std::cout << "[HYBRID-DCN][INVARIANT] wecmpProbabilityRangeCheck = "
+                      << invariantStatus(wecmpProbabilityRangeCheck) << std::endl;
+
+            bool epsPhysicalLinkNonNegativeCheck = true;
+            for (const auto& leafStates : epsPhysicalLinkStates)
+            {
+                for (const auto& linkState : leafStates)
+                {
+                    if (linkState.observedTraffic < -1e-9 ||
+                        linkState.utilization < -1e-9 ||
+                        linkState.smoothedUtilization < -1e-9)
+                    {
+                        epsPhysicalLinkNonNegativeCheck = false;
+                        break;
+                    }
+                }
+                if (!epsPhysicalLinkNonNegativeCheck)
+                {
+                    break;
+                }
+            }
+            updateOverallInvariant(overallAlgorithmInvariant,
+                                   epsPhysicalLinkNonNegativeCheck);
+            std::cout << "[HYBRID-DCN][INVARIANT] epsPhysicalLinkNonNegativeCheck = "
+                      << invariantStatus(epsPhysicalLinkNonNegativeCheck) << std::endl;
+        }
+        else
+        {
+            std::cout << "[HYBRID-DCN][INVARIANT] wecmpProbabilitySumCheck = skipped"
+                      << std::endl;
+            std::cout << "[HYBRID-DCN][INVARIANT] wecmpProbabilityRangeCheck = skipped"
+                      << std::endl;
+            std::cout << "[HYBRID-DCN][INVARIANT] epsPhysicalLinkNonNegativeCheck = skipped"
+                      << std::endl;
+        }
+
+        if (enableEpsWecmpRouting)
+        {
+            bool routeBindingFreezeCheck = true;
+            for (const auto& binding : epsWecmpRouteBindings)
+            {
+                if (binding.flowIndex >= matrixFlowSpecs.size())
+                {
+                    routeBindingFreezeCheck = false;
+                    break;
+                }
+
+                const auto& spec = matrixFlowSpecs[binding.flowIndex];
+                if ((binding.installed && !binding.pathFrozen) ||
+                    (binding.pathFrozen && !spec.epsPathFrozen) ||
+                    (binding.pathFrozen &&
+                     spec.frozenSpine != static_cast<int32_t>(binding.selectedSpine)) ||
+                    spec.ocsCovered)
+                {
+                    routeBindingFreezeCheck = false;
+                    break;
+                }
+            }
+            updateOverallInvariant(overallAlgorithmInvariant, routeBindingFreezeCheck);
+            std::cout << "[HYBRID-DCN][INVARIANT] routeBindingFreezeCheck = "
+                      << invariantStatus(routeBindingFreezeCheck) << std::endl;
+        }
+        else
+        {
+            std::cout << "[HYBRID-DCN][INVARIANT] routeBindingFreezeCheck = skipped"
+                      << std::endl;
+        }
+
+        bool ocsAdmittedNotEpsFrozenCheck = true;
+        for (const auto& spec : matrixFlowSpecs)
+        {
+            if (spec.ocsCovered && (spec.epsPathFrozen || spec.frozenSpine != -1))
+            {
+                ocsAdmittedNotEpsFrozenCheck = false;
+                break;
+            }
+        }
+        updateOverallInvariant(overallAlgorithmInvariant, ocsAdmittedNotEpsFrozenCheck);
+        std::cout << "[HYBRID-DCN][INVARIANT] ocsAdmittedNotEpsFrozenCheck = "
+                  << invariantStatus(ocsAdmittedNotEpsFrozenCheck) << std::endl;
+
+        bool matrixFlowCompletionCountCheck = true;
+        if (enableMatrixFlows && !matrixFlowSpecs.empty())
+        {
+            matrixFlowCompletionCountCheck =
+                resultCompletedFlows <= matrixFlowSpecs.size();
+        }
+        updateOverallInvariant(overallAlgorithmInvariant, matrixFlowCompletionCountCheck);
+        std::cout << "[HYBRID-DCN][INVARIANT] matrixFlowCompletionCountCheck = "
+                  << invariantStatus(matrixFlowCompletionCountCheck) << std::endl;
+
+        std::cout << "[HYBRID-DCN][INVARIANT] overallAlgorithmInvariant = "
+                  << invariantStatus(overallAlgorithmInvariant) << std::endl;
+
+        if (strictAlgorithmInvariantCheck && !overallAlgorithmInvariant)
+        {
+            std::cerr << "[HYBRID-DCN][ERROR] algorithm invariant check failed."
+                      << std::endl;
+            return 1;
+        }
     }
 
     std::cout << "[OK] Hybrid Core DCN topology build completed." << std::endl;
