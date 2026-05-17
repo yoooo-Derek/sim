@@ -65,6 +65,8 @@ struct MatrixBulkFlowSpec
     double plannedResidualDemand;
     double realResidualDemand;
     double wecmpResidualDemand;
+    bool epsPathFrozen;
+    int32_t frozenSpine;
     std::string name;
 };
 
@@ -243,6 +245,7 @@ struct EpsWecmpRouteBinding
     Ipv4Address srcServerAddress;
     Ipv4Address dstServerAddress;
     bool installed;
+    bool pathFrozen;
 };
 
 uint64_t g_bulkRxBytes = 0;
@@ -3380,6 +3383,8 @@ main(int argc, char* argv[])
                                        admission.plannedResidualDemand,
                                        admission.realResidualDemand,
                                        admission.wecmpResidualDemand,
+                                       false,
+                                       -1,
                                        flowName.str()});
         }
 
@@ -3419,6 +3424,8 @@ main(int argc, char* argv[])
                                            admission.plannedResidualDemand,
                                            admission.realResidualDemand,
                                            admission.wecmpResidualDemand,
+                                           false,
+                                           -1,
                                            flowName.str()});
                 matrixFlowPairUsed[srcLeaf][dstLeaf] = true;
                 matrixFlowPairUsed[dstLeaf][srcLeaf] = true;
@@ -3483,7 +3490,7 @@ main(int argc, char* argv[])
         Ipv4StaticRoutingHelper staticRoutingHelper;
         for (uint32_t flowIndex = 0; flowIndex < matrixFlowSpecs.size(); ++flowIndex)
         {
-            const auto& spec = matrixFlowSpecs[flowIndex];
+            auto& spec = matrixFlowSpecs[flowIndex];
             if (spec.ocsCovered || spec.wecmpResidualDemand <= 0)
             {
                 continue;
@@ -3527,13 +3534,21 @@ main(int argc, char* argv[])
                 installed = true;
             }
 
+            const bool pathFrozen = installed;
+            if (pathFrozen)
+            {
+                spec.epsPathFrozen = true;
+                spec.frozenSpine = static_cast<int32_t>(selectedSpine);
+            }
+
             epsWecmpRouteBindings.push_back({flowIndex,
                                              spec.srcLeaf,
                                              spec.dstLeaf,
                                              selectedSpine,
                                              srcServerAddress,
                                              dstServerAddress,
-                                             installed});
+                                             installed,
+                                             pathFrozen});
         }
     }
 
@@ -4026,7 +4041,45 @@ main(int argc, char* argv[])
         std::cout << "[HYBRID-DCN][WECMP-ROUTE] binding[" << bindingIndex
                   << "] installed = " << (binding.installed ? "true" : "false")
                   << std::endl;
+        std::cout << "[HYBRID-DCN][WECMP-ROUTE] binding[" << bindingIndex
+                  << "] pathFrozen = " << (binding.pathFrozen ? "true" : "false")
+                  << std::endl;
     }
+
+    uint32_t epsFrozenFlows = 0;
+    uint32_t epsUnfrozenResidualFlows = 0;
+    for (uint32_t flowIndex = 0; flowIndex < matrixFlowSpecs.size(); ++flowIndex)
+    {
+        const auto& spec = matrixFlowSpecs[flowIndex];
+        if (!spec.ocsCovered)
+        {
+            if (spec.epsPathFrozen)
+            {
+                epsFrozenFlows++;
+            }
+            else
+            {
+                epsUnfrozenResidualFlows++;
+            }
+        }
+
+        std::cout << "[HYBRID-DCN][FLOW-PATH] matrixFlow[" << flowIndex
+                  << "] name = " << spec.name << std::endl;
+        std::cout << "[HYBRID-DCN][FLOW-PATH] matrixFlow[" << flowIndex
+                  << "] pair = " << spec.srcLeaf << "-" << spec.dstLeaf << std::endl;
+        std::cout << "[HYBRID-DCN][FLOW-PATH] matrixFlow[" << flowIndex
+                  << "] ocsCovered = " << (spec.ocsCovered ? "true" : "false")
+                  << std::endl;
+        std::cout << "[HYBRID-DCN][FLOW-PATH] matrixFlow[" << flowIndex
+                  << "] epsPathFrozen = "
+                  << (spec.epsPathFrozen ? "true" : "false") << std::endl;
+        std::cout << "[HYBRID-DCN][FLOW-PATH] matrixFlow[" << flowIndex
+                  << "] frozenSpine = " << spec.frozenSpine << std::endl;
+    }
+    std::cout << "[HYBRID-DCN][FLOW-PATH] epsFrozenFlows = " << epsFrozenFlows
+              << std::endl;
+    std::cout << "[HYBRID-DCN][FLOW-PATH] epsUnfrozenResidualFlows = "
+              << epsUnfrozenResidualFlows << std::endl;
 
     std::cout << "[HYBRID-DCN][MATRIX] enableMatrixSelect = "
               << (enableMatrixSelect ? "true" : "false") << std::endl;
