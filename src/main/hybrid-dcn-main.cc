@@ -12,11 +12,49 @@
 #include <algorithm>
 #include <cmath>
 #include <iostream>
+#include <limits>
 #include <sstream>
 #include <string>
 #include <vector>
 
 using namespace ns3;
+
+using OcsEdgeAgeMatrix = std::vector<std::vector<uint32_t>>;
+
+std::pair<uint32_t, uint32_t>
+NormalizeEdgePair(uint32_t leafA, uint32_t leafB)
+{
+    return {std::min(leafA, leafB), std::max(leafA, leafB)};
+}
+
+OcsEdgeAgeMatrix
+MakeZeroOcsEdgeAgeMatrix(uint32_t numLeaves)
+{
+    return OcsEdgeAgeMatrix(numLeaves, std::vector<uint32_t>(numLeaves, 0));
+}
+
+uint32_t
+GetOcsEdgeAge(const OcsEdgeAgeMatrix& ageMatrix, uint32_t leafA, uint32_t leafB)
+{
+    if (ageMatrix.empty() || leafA >= ageMatrix.size() || leafB >= ageMatrix.size())
+    {
+        return 0;
+    }
+    const auto pair = NormalizeEdgePair(leafA, leafB);
+    return ageMatrix[pair.first][pair.second];
+}
+
+void
+SetOcsEdgeAge(OcsEdgeAgeMatrix& ageMatrix, uint32_t leafA, uint32_t leafB, uint32_t age)
+{
+    if (ageMatrix.empty() || leafA >= ageMatrix.size() || leafB >= ageMatrix.size())
+    {
+        return;
+    }
+    const auto pair = NormalizeEdgePair(leafA, leafB);
+    ageMatrix[pair.first][pair.second] = age;
+    ageMatrix[pair.second][pair.first] = age;
+}
 
 struct OcsCandidateEdge
 {
@@ -34,6 +72,60 @@ struct OcsCandidateEdge
     double stateHoldingGain;
     double selectionScore;
 };
+
+bool
+IsOcsEdgeInSet(const std::vector<OcsCandidateEdge>& edges, uint32_t leafA, uint32_t leafB)
+{
+    for (const auto& edge : edges)
+    {
+        if ((edge.leafA == leafA && edge.leafB == leafB) ||
+            (edge.leafA == leafB && edge.leafB == leafA))
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+OcsEdgeAgeMatrix
+UpdateOcsEdgeAges(const OcsEdgeAgeMatrix& previousAgeMatrix,
+                  const std::vector<OcsCandidateEdge>& previousEdges,
+                  const std::vector<OcsCandidateEdge>& selectedEdges)
+{
+    OcsEdgeAgeMatrix nextAgeMatrix = MakeZeroOcsEdgeAgeMatrix(previousAgeMatrix.size());
+    for (const auto& edge : selectedEdges)
+    {
+        const bool wasSelectedPreviously =
+            IsOcsEdgeInSet(previousEdges, edge.leafA, edge.leafB);
+        const uint32_t previousAge =
+            wasSelectedPreviously ? GetOcsEdgeAge(previousAgeMatrix, edge.leafA, edge.leafB) : 0;
+        SetOcsEdgeAge(nextAgeMatrix,
+                      edge.leafA,
+                      edge.leafB,
+                      wasSelectedPreviously ? previousAge + 1 : 1);
+    }
+    return nextAgeMatrix;
+}
+
+std::pair<uint32_t, uint32_t>
+GetOcsEdgeAgeRange(const OcsEdgeAgeMatrix& ageMatrix,
+                   const std::vector<OcsCandidateEdge>& edges)
+{
+    if (edges.empty())
+    {
+        return {0, 0};
+    }
+
+    uint32_t minAge = std::numeric_limits<uint32_t>::max();
+    uint32_t maxAge = 0;
+    for (const auto& edge : edges)
+    {
+        const uint32_t age = GetOcsEdgeAge(ageMatrix, edge.leafA, edge.leafB);
+        minAge = std::min(minAge, age);
+        maxAge = std::max(maxAge, age);
+    }
+    return {minAge, maxAge};
+}
 
 struct OcsInstalledLink
 {
@@ -163,6 +255,10 @@ struct ControlEpochSummary
     std::string decision;
     uint32_t previousConfigAgeBefore;
     uint32_t previousConfigAgeAfter;
+    uint32_t minSelectedEdgeAge;
+    uint32_t maxSelectedEdgeAge;
+    uint32_t minHoldEdgeAge;
+    uint32_t maxHoldEdgeAge;
 };
 
 struct OcsControllerDecision
@@ -172,6 +268,8 @@ struct OcsControllerDecision
     std::vector<OcsCandidateEdge> previousOcsEdges;
     std::vector<OcsCandidateEdge> selectedOcsEdges;
     std::vector<OcsCandidateEdge> holdOcsEdges;
+    OcsEdgeAgeMatrix previousOcsEdgeAges;
+    OcsEdgeAgeMatrix selectedOcsEdgeAges;
     LouvainResult louvain;
     CommunityPreview communityPreview;
     std::vector<uint32_t> communityLabels;
@@ -1849,6 +1947,12 @@ main(int argc, char* argv[])
         }
     }
 
+    OcsEdgeAgeMatrix previousOcsEdgeAges = MakeZeroOcsEdgeAgeMatrix(numLeaves);
+    for (const auto& edge : previousOcsEdges)
+    {
+        SetOcsEdgeAge(previousOcsEdgeAges, edge.leafA, edge.leafB, previousConfigAge);
+    }
+
     std::vector<OcsCandidateEdge> candidateEdges;
     for (uint32_t i = 0; i < numLeaves; ++i)
     {
@@ -1882,9 +1986,15 @@ main(int argc, char* argv[])
     std::vector<OcsCandidateEdge> candidateOcsEdges;
     std::vector<OcsCandidateEdge> holdOcsEdges;
     bool previousConfigAvailable = !previousOcsEdges.empty();
-    if (enableHoldTimeGate && previousConfigAvailable && previousConfigAge < minHoldCycles)
+    if (enableHoldTimeGate && previousConfigAvailable)
     {
-        holdOcsEdges = previousOcsEdges;
+        for (const auto& edge : previousOcsEdges)
+        {
+            if (GetOcsEdgeAge(previousOcsEdgeAges, edge.leafA, edge.leafB) < minHoldCycles)
+            {
+                holdOcsEdges.push_back(edge);
+            }
+        }
     }
 
     auto isHeldEdge = [&holdOcsEdges](uint32_t leafA, uint32_t leafB) {
@@ -1955,6 +2065,8 @@ main(int argc, char* argv[])
         selectedOcsEdges = previousOcsEdges;
         configGateDecision = "keep-previous";
     }
+    OcsEdgeAgeMatrix selectedOcsEdgeAges =
+        UpdateOcsEdgeAges(previousOcsEdgeAges, previousOcsEdges, selectedOcsEdges);
 
     uint32_t intraCandidateEdges = 0;
     uint32_t interCandidateEdges = 0;
@@ -2202,30 +2314,6 @@ main(int argc, char* argv[])
         return false;
     };
 
-    auto areEdgeSetsEqual = [](const std::vector<OcsCandidateEdge>& lhs,
-                               const std::vector<OcsCandidateEdge>& rhs) {
-        if (lhs.size() != rhs.size())
-        {
-            return false;
-        }
-
-        std::vector<std::pair<uint32_t, uint32_t>> lhsPairs;
-        std::vector<std::pair<uint32_t, uint32_t>> rhsPairs;
-        for (const auto& edge : lhs)
-        {
-            lhsPairs.push_back({std::min(edge.leafA, edge.leafB),
-                                std::max(edge.leafA, edge.leafB)});
-        }
-        for (const auto& edge : rhs)
-        {
-            rhsPairs.push_back({std::min(edge.leafA, edge.leafB),
-                                std::max(edge.leafA, edge.leafB)});
-        }
-        std::sort(lhsPairs.begin(), lhsPairs.end());
-        std::sort(rhsPairs.begin(), rhsPairs.end());
-        return lhsPairs == rhsPairs;
-    };
-
     auto getEpochMatrixMode = [&](uint32_t epoch) {
         if (trafficMatrixSequence == "static")
         {
@@ -2292,6 +2380,7 @@ main(int argc, char* argv[])
         [&](const WeightedMatrix& matrix,
             const std::string& matrixModeName,
             const std::vector<OcsCandidateEdge>& epochPreviousEdges,
+            const OcsEdgeAgeMatrix& epochPreviousAgeMatrix,
             uint32_t epochPreviousAge,
             uint32_t epoch) {
             std::vector<double> epochDegree = computeNodeDegree(matrix);
@@ -2409,10 +2498,16 @@ main(int argc, char* argv[])
             std::vector<OcsCandidateEdge> epochCandidateOcsEdges;
             std::vector<OcsCandidateEdge> epochHoldOcsEdges;
             const bool epochPreviousConfigAvailable = !epochPreviousOcsEdges.empty();
-            if (enableHoldTimeGate && epochPreviousConfigAvailable &&
-                epochPreviousAge < minHoldCycles)
+            if (enableHoldTimeGate && epochPreviousConfigAvailable)
             {
-                epochHoldOcsEdges = epochPreviousOcsEdges;
+                for (const auto& edge : epochPreviousOcsEdges)
+                {
+                    if (GetOcsEdgeAge(epochPreviousAgeMatrix, edge.leafA, edge.leafB) <
+                        minHoldCycles)
+                    {
+                        epochHoldOcsEdges.push_back(edge);
+                    }
+                }
             }
 
             auto isEpochHeldEdge = [&epochHoldOcsEdges](uint32_t leafA, uint32_t leafB) {
@@ -2448,12 +2543,18 @@ main(int argc, char* argv[])
                                                 !epochHoldOcsEdges.empty(),
                                                 "error",
                                                 epochPreviousAge,
-                                                epochPreviousAge};
+                                                epochPreviousAge,
+                                                0,
+                                                0,
+                                                0,
+                                                0};
                     return OcsControllerDecision{epochCandidateEdges,
                                                  {},
                                                  epochPreviousOcsEdges,
                                                  {},
                                                  epochHoldOcsEdges,
+                                                 epochPreviousAgeMatrix,
+                                                 MakeZeroOcsEdgeAgeMatrix(numLeaves),
                                                  epochLouvain,
                                                  epochPreview,
                                                  epochLabels,
@@ -2510,9 +2611,15 @@ main(int argc, char* argv[])
                 epochDecision = "keep-previous";
             }
 
-            const uint32_t epochAgeAfter =
-                areEdgeSetsEqual(epochSelectedEdges, epochPreviousOcsEdges) ? epochPreviousAge + 1
-                                                                            : 1;
+            OcsEdgeAgeMatrix epochSelectedAgeMatrix =
+                UpdateOcsEdgeAges(epochPreviousAgeMatrix,
+                                  epochPreviousOcsEdges,
+                                  epochSelectedEdges);
+            const auto selectedAgeRange =
+                GetOcsEdgeAgeRange(epochSelectedAgeMatrix, epochSelectedEdges);
+            const auto holdAgeRange =
+                GetOcsEdgeAgeRange(epochPreviousAgeMatrix, epochHoldOcsEdges);
+            const uint32_t epochAgeAfter = selectedAgeRange.second;
 
             ControlEpochSummary summary{epoch,
                                         matrixModeName,
@@ -2528,13 +2635,19 @@ main(int argc, char* argv[])
                                         epochHoldTimeActive,
                                         epochDecision,
                                         epochPreviousAge,
-                                        epochAgeAfter};
+                                        epochAgeAfter,
+                                        selectedAgeRange.first,
+                                        selectedAgeRange.second,
+                                        holdAgeRange.first,
+                                        holdAgeRange.second};
 
             return OcsControllerDecision{epochCandidateEdges,
                                          epochCandidateOcsEdges,
                                          epochPreviousOcsEdges,
                                          epochSelectedEdges,
                                          epochHoldOcsEdges,
+                                         epochPreviousAgeMatrix,
+                                         epochSelectedAgeMatrix,
                                          epochLouvain,
                                          epochPreview,
                                          epochLabels,
@@ -2555,6 +2668,7 @@ main(int argc, char* argv[])
     if (enableMultiPeriodControl)
     {
         std::vector<OcsCandidateEdge> epochPreviousEdges = previousOcsEdges;
+        OcsEdgeAgeMatrix epochPreviousAgeMatrix = previousOcsEdgeAges;
         uint32_t epochPreviousAge = previousConfigAge;
         for (uint32_t epoch = 0; epoch < controlEpochs; ++epoch)
         {
@@ -2564,6 +2678,7 @@ main(int argc, char* argv[])
                 runControlDecisionForMatrix(epochMatrix,
                                             epochMatrixMode,
                                             epochPreviousEdges,
+                                            epochPreviousAgeMatrix,
                                             epochPreviousAge,
                                             epoch);
             if (!epochDecision.success)
@@ -2576,6 +2691,8 @@ main(int argc, char* argv[])
             previousOcsEdges = epochDecision.previousOcsEdges;
             selectedOcsEdges = epochDecision.selectedOcsEdges;
             holdOcsEdges = epochDecision.holdOcsEdges;
+            previousOcsEdgeAges = epochDecision.previousOcsEdgeAges;
+            selectedOcsEdgeAges = epochDecision.selectedOcsEdgeAges;
             louvainResult = epochDecision.louvain;
             activeCommunityLabels = epochDecision.communityLabels;
             activeCommunityCount = epochDecision.communityCount;
@@ -2645,6 +2762,7 @@ main(int argc, char* argv[])
             }
 
             epochPreviousEdges = selectedOcsEdges;
+            epochPreviousAgeMatrix = selectedOcsEdgeAges;
             finalEpochMatrixMode = epochMatrixMode;
             torTrafficMatrix = epochMatrix;
         }
@@ -4298,6 +4416,16 @@ main(int argc, char* argv[])
             std::cout << "[HYBRID-DCN][MULTI] epoch[" << summary.epoch
                       << "] previousConfigAgeAfter = "
                       << summary.previousConfigAgeAfter << std::endl;
+            std::cout << "[HYBRID-DCN][MULTI] epoch[" << summary.epoch
+                      << "] minSelectedEdgeAge = "
+                      << summary.minSelectedEdgeAge << std::endl;
+            std::cout << "[HYBRID-DCN][MULTI] epoch[" << summary.epoch
+                      << "] maxSelectedEdgeAge = "
+                      << summary.maxSelectedEdgeAge << std::endl;
+            std::cout << "[HYBRID-DCN][MULTI] epoch[" << summary.epoch
+                      << "] minHoldEdgeAge = " << summary.minHoldEdgeAge << std::endl;
+            std::cout << "[HYBRID-DCN][MULTI] epoch[" << summary.epoch
+                      << "] maxHoldEdgeAge = " << summary.maxHoldEdgeAge << std::endl;
         }
     }
 
@@ -4551,6 +4679,29 @@ main(int argc, char* argv[])
     if (holdTimeActive)
     {
         std::cout << "[HYBRID-DCN][HOLD] note = hard-hold edges occupy OCS ports before greedy candidate selection"
+                  << std::endl;
+    }
+
+    std::cout << "[HYBRID-DCN][HOLD-AGE] edgeAgeMode = per-edge" << std::endl;
+    std::cout << "[HYBRID-DCN][HOLD-AGE] previousConfigAgeCompatibility = "
+              << previousConfigAge << std::endl;
+    std::cout << "[HYBRID-DCN][HOLD-AGE] selectedEdgeAges = "
+              << selectedOcsEdges.size() << std::endl;
+    for (uint32_t edgeIndex = 0; edgeIndex < selectedOcsEdges.size(); ++edgeIndex)
+    {
+        const auto& edge = selectedOcsEdges[edgeIndex];
+        std::cout << "[HYBRID-DCN][HOLD-AGE] selectedEdge[" << edgeIndex
+                  << "] = " << edge.leafA << "-" << edge.leafB
+                  << " age="
+                  << GetOcsEdgeAge(selectedOcsEdgeAges, edge.leafA, edge.leafB)
+                  << std::endl;
+    }
+    for (uint32_t edgeIndex = 0; edgeIndex < holdOcsEdges.size(); ++edgeIndex)
+    {
+        const auto& edge = holdOcsEdges[edgeIndex];
+        std::cout << "[HYBRID-DCN][HOLD-AGE] holdEdge[" << edgeIndex
+                  << "] = " << edge.leafA << "-" << edge.leafB
+                  << " age=" << GetOcsEdgeAge(previousOcsEdgeAges, edge.leafA, edge.leafB)
                   << std::endl;
     }
 
@@ -5453,6 +5604,45 @@ main(int argc, char* argv[])
         updateOverallInvariant(overallAlgorithmInvariant, hardHoldPreservedInCandidateCheck);
         std::cout << "[HYBRID-DCN][INVARIANT] hardHoldPreservedInCandidateCheck = "
                   << invariantStatus(hardHoldPreservedInCandidateCheck) << std::endl;
+
+        if (enableHoldTimeGate)
+        {
+            bool hardHoldAgeCheck = true;
+            for (const auto& edge : holdOcsEdges)
+            {
+                const uint32_t edgeAge =
+                    GetOcsEdgeAge(previousOcsEdgeAges, edge.leafA, edge.leafB);
+                if (edgeAge >= minHoldCycles)
+                {
+                    hardHoldAgeCheck = false;
+                    break;
+                }
+            }
+            if (hardHoldAgeCheck)
+            {
+                for (const auto& edge : previousOcsEdges)
+                {
+                    const uint32_t edgeAge =
+                        GetOcsEdgeAge(previousOcsEdgeAges, edge.leafA, edge.leafB);
+                    const bool hardHeld =
+                        isEdgeInSet(holdOcsEdges, edge.leafA, edge.leafB);
+                    if ((edgeAge < minHoldCycles && !hardHeld) ||
+                        (edgeAge >= minHoldCycles && hardHeld))
+                    {
+                        hardHoldAgeCheck = false;
+                        break;
+                    }
+                }
+            }
+            updateOverallInvariant(overallAlgorithmInvariant, hardHoldAgeCheck);
+            std::cout << "[HYBRID-DCN][INVARIANT] hardHoldAgeCheck = "
+                      << invariantStatus(hardHoldAgeCheck) << std::endl;
+        }
+        else
+        {
+            std::cout << "[HYBRID-DCN][INVARIANT] hardHoldAgeCheck = skipped"
+                      << std::endl;
+        }
 
         if (enableOcsAdmissionControl)
         {
