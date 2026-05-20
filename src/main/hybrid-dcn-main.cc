@@ -379,6 +379,7 @@ struct EpsWecmpRouteBinding
     Ipv4Address dstServerAddress;
     bool installed;
     bool pathFrozen;
+    double residualDemand;
 };
 
 uint64_t g_bulkRxBytes = 0;
@@ -608,6 +609,8 @@ main(int argc, char* argv[])
     bool strictAlgorithmInvariantCheck = false;
     bool enableDetailedAlgorithmTrace = false;
     uint32_t detailedCandidateLogLimit = 20;
+    bool enableDetailedFlowTrace = false;
+    uint32_t detailedFlowLogLimit = 50;
     bool enableResultValidation = true;
     std::string validationMode = "warn";
 
@@ -693,6 +696,8 @@ main(int argc, char* argv[])
             "strictAlgorithmInvariantCheck",
             "enableDetailedAlgorithmTrace",
             "detailedCandidateLogLimit",
+            "enableDetailedFlowTrace",
+            "detailedFlowLogLimit",
             "numLeaves",
             "serversPerLeaf",
             "numSpines",
@@ -891,6 +896,12 @@ main(int argc, char* argv[])
     cmd.AddValue("detailedCandidateLogLimit",
                  "Maximum number of detailed candidate diagnostics to print.",
                  detailedCandidateLogLimit);
+    cmd.AddValue("enableDetailedFlowTrace",
+                 "Enable detailed matrix-flow, admission, and path diagnostics.",
+                 enableDetailedFlowTrace);
+    cmd.AddValue("detailedFlowLogLimit",
+                 "Maximum number of detailed flow diagnostics to print.",
+                 detailedFlowLogLimit);
     cmd.AddValue("enableResultValidation",
                  "Enable Stage-24 result consistency validation logs.",
                  enableResultValidation);
@@ -4160,7 +4171,8 @@ main(int argc, char* argv[])
                                              srcServerAddress,
                                              dstServerAddress,
                                              installed,
-                                             pathFrozen});
+                                             pathFrozen,
+                                             spec.wecmpResidualDemand});
         }
     }
 
@@ -4563,6 +4575,9 @@ main(int argc, char* argv[])
               << std::endl;
     std::cout << "[HYBRID-DCN][WECMP] diagnosticLoadPurpose = synthetic-diagnostics-only"
               << std::endl;
+    std::cout << "[HYBRID-DCN][WECMP] diagnosticLoadApplicationSemantics = "
+                 "applied-before-each-wecmp-telemetry-update"
+              << std::endl;
     std::cout << "[HYBRID-DCN][WECMP] residualDecisions = "
               << epsWecmpDecisions.size() << std::endl;
     std::cout << "[HYBRID-DCN][WECMP] pairStates = " << epsWecmpPairStates.size()
@@ -4734,6 +4749,8 @@ main(int argc, char* argv[])
         std::cout << "[HYBRID-DCN][WECMP-ROUTE] binding[" << bindingIndex
                   << "] pathFrozen = " << (binding.pathFrozen ? "true" : "false")
                   << std::endl;
+        std::cout << "[HYBRID-DCN][WECMP-ROUTE] binding[" << bindingIndex
+                  << "] residualDemand = " << binding.residualDemand << std::endl;
     }
 
     uint32_t epsFrozenFlows = 0;
@@ -5207,6 +5224,10 @@ main(int argc, char* argv[])
               << (enableDetailedAlgorithmTrace ? "true" : "false") << std::endl;
     std::cout << "[HYBRID-DCN][CONTROL] detailedCandidateLogLimit = "
               << detailedCandidateLogLimit << std::endl;
+    std::cout << "[HYBRID-DCN][CONTROL] enableDetailedFlowTrace = "
+              << (enableDetailedFlowTrace ? "true" : "false") << std::endl;
+    std::cout << "[HYBRID-DCN][CONTROL] detailedFlowLogLimit = "
+              << detailedFlowLogLimit << std::endl;
     std::cout << "[HYBRID-DCN][CONTROL] presetApplicationOrder = after-command-line-parse"
               << std::endl;
     std::cout << "[HYBRID-DCN][CONTROL] explicitArgCount = " << explicitArgNames.size()
@@ -5582,6 +5603,16 @@ main(int argc, char* argv[])
                   << louvainResult.modularityQ << std::endl;
         std::cout << "[HYBRID-DCN][TRACE] communityLabelVector = "
                   << formatCommunityLabelVector(activeCommunityLabels) << std::endl;
+        std::cout << "[HYBRID-DCN][TRACE] candidateSortRule = "
+                     "descending-selectionScore-ascending-leafA-ascending-leafB"
+                  << std::endl;
+        std::cout << "[HYBRID-DCN][TRACE] traceScope = final-control-state"
+                  << std::endl;
+        if (enableMultiPeriodControl)
+        {
+            std::cout << "[HYBRID-DCN][TRACE] multiPeriodDetailedTrace = final-epoch-only"
+                      << std::endl;
+        }
         for (uint32_t leafIndex = 0; leafIndex < numLeaves; ++leafIndex)
         {
             std::cout << "[HYBRID-DCN][TRACE] nodeDegree[" << leafIndex
@@ -5616,18 +5647,60 @@ main(int argc, char* argv[])
             }
         }
 
-        std::vector<uint32_t> selectedTraceDegree(numLeaves, 0);
-        for (const auto& selectedEdge : selectedOcsEdges)
+        std::vector<uint32_t> replayOcsDegree(numLeaves, 0);
+        std::vector<OcsCandidateEdge> replaySelectedEdges;
+        std::vector<std::string> replayRejectReasons(candidateEdges.size(),
+                                                     "not-selected-greedy-order");
+        for (const auto& holdEdge : holdOcsEdges)
         {
-            if (selectedEdge.leafA < numLeaves)
+            replaySelectedEdges.push_back(holdEdge);
+            if (holdEdge.leafA < numLeaves)
             {
-                selectedTraceDegree[selectedEdge.leafA]++;
+                replayOcsDegree[holdEdge.leafA]++;
             }
-            if (selectedEdge.leafB < numLeaves)
+            if (holdEdge.leafB < numLeaves)
             {
-                selectedTraceDegree[selectedEdge.leafB]++;
+                replayOcsDegree[holdEdge.leafB]++;
             }
         }
+        for (uint32_t candidateIndex = 0; candidateIndex < candidateEdges.size();
+             ++candidateIndex)
+        {
+            const auto& edge = candidateEdges[candidateIndex];
+            if (isEdgeInSet(holdOcsEdges, edge.leafA, edge.leafB))
+            {
+                replayRejectReasons[candidateIndex] = "hard-hold-preserved";
+                continue;
+            }
+            if (edge.selectionScore <= 0)
+            {
+                replayRejectReasons[candidateIndex] = "non-positive-score";
+                continue;
+            }
+            if (replaySelectedEdges.size() >= maxSelectedOcsLinks)
+            {
+                replayRejectReasons[candidateIndex] = "max-selected-links";
+                continue;
+            }
+            if (replayOcsDegree[edge.leafA] >= ocsPortK ||
+                replayOcsDegree[edge.leafB] >= ocsPortK)
+            {
+                replayRejectReasons[candidateIndex] = "ocs-port-budget";
+                continue;
+            }
+
+            replaySelectedEdges.push_back(edge);
+            replayOcsDegree[edge.leafA]++;
+            replayOcsDegree[edge.leafB]++;
+            replayRejectReasons[candidateIndex] = "selected";
+        }
+
+        const bool greedyReplayMatchesSelected =
+            makeEdgeSet(replaySelectedEdges) == makeEdgeSet(selectedOcsEdges);
+        std::cout << "[HYBRID-DCN][TRACE] greedyReplayMatchesSelected = "
+                  << (greedyReplayMatchesSelected ? "true" : "false") << std::endl;
+        std::cout << "[HYBRID-DCN][TRACE] replaySelectedEdgeSet = "
+                  << formatEdgeSet(replaySelectedEdges) << std::endl;
 
         const uint32_t sortedCandidateLogCount =
             static_cast<uint32_t>(std::min<std::size_t>(candidateEdges.size(),
@@ -5636,25 +5709,8 @@ main(int argc, char* argv[])
              ++candidateIndex)
         {
             const auto& edge = candidateEdges[candidateIndex];
-            const bool selected = isEdgeInSet(selectedOcsEdges, edge.leafA, edge.leafB);
-            std::string rejectReason = "not-selected-greedy-order";
-            if (selected)
-            {
-                rejectReason = "selected";
-            }
-            else if (edge.selectionScore <= 0)
-            {
-                rejectReason = "non-positive-score";
-            }
-            else if (selectedOcsEdges.size() >= maxSelectedOcsLinks)
-            {
-                rejectReason = "max-selected-links";
-            }
-            else if (selectedTraceDegree[edge.leafA] >= ocsPortK ||
-                     selectedTraceDegree[edge.leafB] >= ocsPortK)
-            {
-                rejectReason = "ocs-port-budget";
-            }
+            const bool selected = isEdgeInSet(replaySelectedEdges, edge.leafA, edge.leafB);
+            const std::string rejectReason = replayRejectReasons[candidateIndex];
 
             std::cout << "[HYBRID-DCN][TRACE] sortedCandidate[" << candidateIndex
                       << "] pair = " << edge.leafA << "-" << edge.leafB << std::endl;
@@ -6067,6 +6123,87 @@ main(int argc, char* argv[])
         std::cout << "[HYBRID-DCN][MATRIX-FLOW] avgGoodputMbps   = 0 Mbps" << std::endl;
     }
 
+    std::cout << "[HYBRID-DCN][FLOW-TRACE] enabled = "
+              << (enableDetailedFlowTrace ? "true" : "false") << std::endl;
+    std::cout << "[HYBRID-DCN][FLOW-TRACE] detailedFlowLogLimit = "
+              << detailedFlowLogLimit << std::endl;
+    if (enableDetailedFlowTrace && enableMatrixFlows)
+    {
+        const uint32_t flowTraceCount =
+            static_cast<uint32_t>(std::min<std::size_t>(matrixFlowSpecs.size(),
+                                                        detailedFlowLogLimit));
+        for (uint32_t flowIndex = 0; flowIndex < flowTraceCount; ++flowIndex)
+        {
+            const auto& spec = matrixFlowSpecs[flowIndex];
+            const auto& stats = matrixFlowStats[flowIndex];
+            const bool completed = stats.rxBytes >= matrixFlowMaxBytes;
+            const double firstRx = stats.seenFirstRx ? stats.firstRxTime : 0.0;
+            const double lastRx = stats.seenFirstRx ? stats.lastRxTime : 0.0;
+            const double duration = lastRx > firstRx ? (lastRx - firstRx) : 0.0;
+            const double goodputMbps =
+                duration > 0 ? static_cast<double>(stats.rxBytes) * 8.0 / duration / 1e6 : 0.0;
+            const double flowStart = matrixFlowStart + (0.02 * static_cast<double>(flowIndex));
+
+            std::cout << "[HYBRID-DCN][FLOW-TRACE] flow[" << flowIndex
+                      << "] name = " << spec.name << std::endl;
+            std::cout << "[HYBRID-DCN][FLOW-TRACE] flow[" << flowIndex
+                      << "] srcLeaf = " << spec.srcLeaf << std::endl;
+            std::cout << "[HYBRID-DCN][FLOW-TRACE] flow[" << flowIndex
+                      << "] dstLeaf = " << spec.dstLeaf << std::endl;
+            std::cout << "[HYBRID-DCN][FLOW-TRACE] flow[" << flowIndex
+                      << "] rawDemand = " << rawTrafficMatrix[spec.srcLeaf][spec.dstLeaf]
+                      << std::endl;
+            std::cout << "[HYBRID-DCN][FLOW-TRACE] flow[" << flowIndex
+                      << "] controlDemand = "
+                      << controlTrafficMatrix[spec.srcLeaf][spec.dstLeaf] << std::endl;
+            std::cout << "[HYBRID-DCN][FLOW-TRACE] flow[" << flowIndex
+                      << "] ocsPairInstalled = "
+                      << (isOcsPairInstalled(spec.srcLeaf, spec.dstLeaf) ? "true" : "false")
+                      << std::endl;
+            std::cout << "[HYBRID-DCN][FLOW-TRACE] flow[" << flowIndex
+                      << "] admissionMode = "
+                      << (enableOcsAdmissionControl ? "controlled" : "disabled-direct-ocs")
+                      << std::endl;
+            std::cout << "[HYBRID-DCN][FLOW-TRACE] flow[" << flowIndex
+                      << "] ocsAdmitted = " << (spec.ocsAdmitted ? "true" : "false")
+                      << std::endl;
+            std::cout << "[HYBRID-DCN][FLOW-TRACE] flow[" << flowIndex
+                      << "] ocsCovered = " << (spec.ocsCovered ? "true" : "false")
+                      << std::endl;
+            std::cout << "[HYBRID-DCN][FLOW-TRACE] flow[" << flowIndex
+                      << "] fallbackToEps = " << (spec.epsFallback ? "true" : "false")
+                      << std::endl;
+            std::cout << "[HYBRID-DCN][FLOW-TRACE] flow[" << flowIndex
+                      << "] plannedResidualDemand = " << spec.plannedResidualDemand
+                      << std::endl;
+            std::cout << "[HYBRID-DCN][FLOW-TRACE] flow[" << flowIndex
+                      << "] realResidualDemand = " << spec.realResidualDemand << std::endl;
+            std::cout << "[HYBRID-DCN][FLOW-TRACE] flow[" << flowIndex
+                      << "] wecmpResidualDemand = " << spec.wecmpResidualDemand << std::endl;
+            std::cout << "[HYBRID-DCN][FLOW-TRACE] flow[" << flowIndex
+                      << "] epsPathFrozen = " << (spec.epsPathFrozen ? "true" : "false")
+                      << std::endl;
+            std::cout << "[HYBRID-DCN][FLOW-TRACE] flow[" << flowIndex
+                      << "] frozenSpine = " << spec.frozenSpine << std::endl;
+            std::cout << "[HYBRID-DCN][FLOW-TRACE] flow[" << flowIndex
+                      << "] packetSinkPort = " << spec.port << std::endl;
+            std::cout << "[HYBRID-DCN][FLOW-TRACE] flow[" << flowIndex
+                      << "] bulkStart = " << flowStart << std::endl;
+            std::cout << "[HYBRID-DCN][FLOW-TRACE] flow[" << flowIndex
+                      << "] maxBytes = " << matrixFlowMaxBytes << std::endl;
+            std::cout << "[HYBRID-DCN][FLOW-TRACE] flow[" << flowIndex
+                      << "] rxBytes = " << stats.rxBytes << std::endl;
+            std::cout << "[HYBRID-DCN][FLOW-TRACE] flow[" << flowIndex
+                      << "] completed = " << (completed ? "true" : "false") << std::endl;
+            std::cout << "[HYBRID-DCN][FLOW-TRACE] flow[" << flowIndex
+                      << "] firstRx = " << firstRx << std::endl;
+            std::cout << "[HYBRID-DCN][FLOW-TRACE] flow[" << flowIndex
+                      << "] lastRx = " << lastRx << std::endl;
+            std::cout << "[HYBRID-DCN][FLOW-TRACE] flow[" << flowIndex
+                      << "] goodputMbps = " << goodputMbps << std::endl;
+        }
+    }
+
     std::cout << "[HYBRID-DCN][OCS] enabled     = " << (enableStaticOcs ? "true" : "false")
               << std::endl;
     std::cout << "[HYBRID-DCN][OCS] txPackets   = " << g_ocsTxPackets << std::endl;
@@ -6150,6 +6287,33 @@ main(int argc, char* argv[])
         ocsAndEpsBothObserved || (admissionFallbackOnlyDataPlane && resultEpsObservedUse);
     const bool dataPlaneValidationPass =
         allMatrixFlowsCompleted && dataPlanePathObservationPass;
+    uint32_t resultWecmpFrozenFlows = 0;
+    for (const auto& spec : matrixFlowSpecs)
+    {
+        if (spec.epsPathFrozen)
+        {
+            resultWecmpFrozenFlows++;
+        }
+    }
+
+    std::cout << "[HYBRID-DCN][PATH] ocsCoveredFlowCount = "
+              << resultCoveredFlows << std::endl;
+    std::cout << "[HYBRID-DCN][PATH] epsResidualFlowCount = "
+              << resultResidualFlows << std::endl;
+    std::cout << "[HYBRID-DCN][PATH] fallbackFlowCount = "
+              << admissionFallbackFlows << std::endl;
+    std::cout << "[HYBRID-DCN][PATH] wecmpFrozenFlowCount = "
+              << resultWecmpFrozenFlows << std::endl;
+    std::cout << "[HYBRID-DCN][PATH] ocsTxBytes = " << g_ocsTxBytes << std::endl;
+    std::cout << "[HYBRID-DCN][PATH] epsTxBytes = " << g_epsTxBytes << std::endl;
+    std::cout << "[HYBRID-DCN][PATH] ocsObservedUse = "
+              << (resultOcsObservedUse ? "true" : "false") << std::endl;
+    std::cout << "[HYBRID-DCN][PATH] epsObservedUse = "
+              << (resultEpsObservedUse ? "true" : "false") << std::endl;
+    std::cout << "[HYBRID-DCN][PATH] hasCoveredAndResidualFlows = "
+              << (hasCoveredAndResidualFlows ? "true" : "false") << std::endl;
+    std::cout << "[HYBRID-DCN][PATH] ocsToEpsByteRatio = "
+              << ocsToEpsByteRatio << std::endl;
 
     std::cout << "[HYBRID-DCN][RESULT] resultStage = stage-23-result-summary"
               << std::endl;
@@ -6923,6 +7087,108 @@ main(int argc, char* argv[])
         updateOverallInvariant(overallAlgorithmInvariant, matrixFlowCompletionCountCheck);
         std::cout << "[HYBRID-DCN][INVARIANT] matrixFlowCompletionCountCheck = "
                   << invariantStatus(matrixFlowCompletionCountCheck) << std::endl;
+
+        bool matrixFlowPortUniquenessCheck = true;
+        bool matrixFlowStartBeforeStopCheck = true;
+        bool matrixFlowRxBytesBoundCheck = true;
+        bool ocsCoveredFlowsHaveInstalledPairCheck = true;
+        bool fallbackFlowsAreResidualCheck = true;
+        bool wecmpFrozenFlowsAreResidualCheck = true;
+        bool resultGoodputFiniteCheck = std::isfinite(resultMatrixAggregateGoodputMbps);
+        std::set<uint16_t> matrixFlowPorts;
+        if (enableMatrixFlows)
+        {
+            for (uint32_t flowIndex = 0; flowIndex < matrixFlowSpecs.size(); ++flowIndex)
+            {
+                const auto& spec = matrixFlowSpecs[flowIndex];
+                const auto& stats = matrixFlowStats[flowIndex];
+                if (!matrixFlowPorts.insert(spec.port).second)
+                {
+                    matrixFlowPortUniquenessCheck = false;
+                }
+                const double flowStart =
+                    matrixFlowStart + (0.02 * static_cast<double>(flowIndex));
+                if (flowStart >= simTime)
+                {
+                    matrixFlowStartBeforeStopCheck = false;
+                }
+                if (stats.rxBytes > matrixFlowMaxBytes + 65536)
+                {
+                    matrixFlowRxBytesBoundCheck = false;
+                }
+                if (spec.ocsCovered && !isFinalEdgeInstalled(spec.srcLeaf, spec.dstLeaf))
+                {
+                    ocsCoveredFlowsHaveInstalledPairCheck = false;
+                }
+                if (spec.epsFallback &&
+                    (spec.ocsCovered || spec.wecmpResidualDemand <= 0 ||
+                     spec.realResidualDemand <= 0))
+                {
+                    fallbackFlowsAreResidualCheck = false;
+                }
+                if (spec.epsPathFrozen && (spec.ocsCovered || spec.wecmpResidualDemand <= 0))
+                {
+                    wecmpFrozenFlowsAreResidualCheck = false;
+                }
+
+                const double firstRx = stats.seenFirstRx ? stats.firstRxTime : 0.0;
+                const double lastRx = stats.seenFirstRx ? stats.lastRxTime : 0.0;
+                const double duration = lastRx > firstRx ? (lastRx - firstRx) : 0.0;
+                const double goodputMbps =
+                    duration > 0
+                        ? static_cast<double>(stats.rxBytes) * 8.0 / duration / 1e6
+                        : 0.0;
+                if (!std::isfinite(goodputMbps))
+                {
+                    resultGoodputFiniteCheck = false;
+                }
+            }
+        }
+        for (const auto& event : ocsAdmissionEvents)
+        {
+            if (event.epsFallback &&
+                (event.ocsAdmitted || event.realResidualDemand <= 0 ||
+                 event.wecmpResidualDemand <= 0))
+            {
+                fallbackFlowsAreResidualCheck = false;
+            }
+        }
+
+        bool routeBindingFlowIndexCheck = true;
+        for (const auto& binding : epsWecmpRouteBindings)
+        {
+            if (binding.flowIndex >= matrixFlowSpecs.size())
+            {
+                routeBindingFlowIndexCheck = false;
+                break;
+            }
+        }
+
+        updateOverallInvariant(overallAlgorithmInvariant, matrixFlowPortUniquenessCheck);
+        updateOverallInvariant(overallAlgorithmInvariant, matrixFlowStartBeforeStopCheck);
+        updateOverallInvariant(overallAlgorithmInvariant, matrixFlowRxBytesBoundCheck);
+        updateOverallInvariant(overallAlgorithmInvariant,
+                               ocsCoveredFlowsHaveInstalledPairCheck);
+        updateOverallInvariant(overallAlgorithmInvariant, fallbackFlowsAreResidualCheck);
+        updateOverallInvariant(overallAlgorithmInvariant, wecmpFrozenFlowsAreResidualCheck);
+        updateOverallInvariant(overallAlgorithmInvariant, routeBindingFlowIndexCheck);
+        updateOverallInvariant(overallAlgorithmInvariant, resultGoodputFiniteCheck);
+        std::cout << "[HYBRID-DCN][INVARIANT] matrixFlowPortUniquenessCheck = "
+                  << invariantStatus(matrixFlowPortUniquenessCheck) << std::endl;
+        std::cout << "[HYBRID-DCN][INVARIANT] matrixFlowStartBeforeStopCheck = "
+                  << invariantStatus(matrixFlowStartBeforeStopCheck) << std::endl;
+        std::cout << "[HYBRID-DCN][INVARIANT] matrixFlowRxBytesBoundCheck = "
+                  << invariantStatus(matrixFlowRxBytesBoundCheck) << std::endl;
+        std::cout << "[HYBRID-DCN][INVARIANT] ocsCoveredFlowsHaveInstalledPairCheck = "
+                  << invariantStatus(ocsCoveredFlowsHaveInstalledPairCheck) << std::endl;
+        std::cout << "[HYBRID-DCN][INVARIANT] fallbackFlowsAreResidualCheck = "
+                  << invariantStatus(fallbackFlowsAreResidualCheck) << std::endl;
+        std::cout << "[HYBRID-DCN][INVARIANT] wecmpFrozenFlowsAreResidualCheck = "
+                  << invariantStatus(wecmpFrozenFlowsAreResidualCheck) << std::endl;
+        std::cout << "[HYBRID-DCN][INVARIANT] routeBindingFlowIndexCheck = "
+                  << invariantStatus(routeBindingFlowIndexCheck) << std::endl;
+        std::cout << "[HYBRID-DCN][INVARIANT] resultGoodputFiniteCheck = "
+                  << invariantStatus(resultGoodputFiniteCheck) << std::endl;
 
         std::cout << "[HYBRID-DCN][INVARIANT] overallAlgorithmInvariant = "
                   << invariantStatus(overallAlgorithmInvariant) << std::endl;
