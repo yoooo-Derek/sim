@@ -12,7 +12,9 @@
 #include <algorithm>
 #include <cmath>
 #include <iostream>
+#include <iterator>
 #include <limits>
+#include <set>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -304,9 +306,14 @@ struct EpsWecmpLinkState
     double utilization;
     double smoothedUtilization;
     double attractiveness;
+    double normalizedAttractiveness;
     double targetProbability;
     double previousProbability;
     double updatedProbability;
+    double probabilityDelta;
+    double boundedProbabilityDelta;
+    double pathLoadMetric;
+    double candidatePathLoad;
 };
 
 struct EpsWecmpDecision
@@ -592,6 +599,9 @@ main(int argc, char* argv[])
     uint32_t epsWecmpEpochs = 3;
     double epsWecmpCapacity = 100.0;
     std::string epsWecmpPathMetric = "max";
+    std::string epsWecmpDiagnosticLoadMode = "none";
+    double epsWecmpDiagnosticLoad = 0.0;
+    uint32_t epsWecmpDiagnosticHotSpine = 0;
     bool enableEpsWecmpRouting = false;
     bool enableMultiPeriodWecmpState = true;
     bool enableAlgorithmInvariantCheck = true;
@@ -671,6 +681,9 @@ main(int argc, char* argv[])
             "epsWecmpMaxDelta",
             "epsWecmpEpochs",
             "epsWecmpCapacity",
+            "epsWecmpDiagnosticLoadMode",
+            "epsWecmpDiagnosticLoad",
+            "epsWecmpDiagnosticHotSpine",
             "enableMultiPeriodWecmpState",
             "epsWecmpPathMetric",
             "enableEpsWecmpRouting",
@@ -847,6 +860,15 @@ main(int argc, char* argv[])
     cmd.AddValue("epsWecmpPathMetric",
                  "EPS-WECMP path metric over leaf-spine links: max or average.",
                  epsWecmpPathMetric);
+    cmd.AddValue("epsWecmpDiagnosticLoadMode",
+                 "EPS-WECMP diagnostic synthetic load mode: none or hot-spine.",
+                 epsWecmpDiagnosticLoadMode);
+    cmd.AddValue("epsWecmpDiagnosticLoad",
+                 "Synthetic background load added to diagnostic EPS physical links.",
+                 epsWecmpDiagnosticLoad);
+    cmd.AddValue("epsWecmpDiagnosticHotSpine",
+                 "Spine index receiving diagnostic synthetic background load.",
+                 epsWecmpDiagnosticHotSpine);
     cmd.AddValue("enableEpsWecmpRouting",
                  "Bind residual matrix-flow EPS paths to EPS-WECMP selected spines using static routes.",
                  enableEpsWecmpRouting);
@@ -1423,6 +1445,31 @@ main(int argc, char* argv[])
     {
         std::cerr << "[HYBRID-DCN][ERROR] epsWecmpPathMetric must be max or average."
                   << std::endl;
+        return 1;
+    }
+
+    if (epsWecmpDiagnosticLoadMode != "none" &&
+        epsWecmpDiagnosticLoadMode != "hot-spine")
+    {
+        std::cerr
+            << "[HYBRID-DCN][ERROR] epsWecmpDiagnosticLoadMode must be none or hot-spine."
+            << std::endl;
+        return 1;
+    }
+
+    if (epsWecmpDiagnosticLoad < 0)
+    {
+        std::cerr
+            << "[HYBRID-DCN][ERROR] epsWecmpDiagnosticLoad must be greater than or equal to 0."
+            << std::endl;
+        return 1;
+    }
+
+    if (epsWecmpDiagnosticHotSpine >= numSpines)
+    {
+        std::cerr
+            << "[HYBRID-DCN][ERROR] epsWecmpDiagnosticHotSpine must be less than numSpines."
+            << std::endl;
         return 1;
     }
 
@@ -2268,39 +2315,60 @@ main(int argc, char* argv[])
         uint32_t changedEdgeCount;
     };
 
-    auto countChangedEdges = [](const std::vector<OcsCandidateEdge>& edges,
-                                const std::vector<OcsCandidateEdge>& previousEdges) {
-        std::vector<std::pair<uint32_t, uint32_t>> currentPairs;
-        std::vector<std::pair<uint32_t, uint32_t>> previousPairs;
+    auto makeEdgeSet = [](const std::vector<OcsCandidateEdge>& edges) {
+        std::set<std::pair<uint32_t, uint32_t>> edgeSet;
         for (const auto& edge : edges)
         {
-            currentPairs.push_back(NormalizeEdgePair(edge.leafA, edge.leafB));
+            edgeSet.insert(NormalizeEdgePair(edge.leafA, edge.leafB));
         }
-        for (const auto& edge : previousEdges)
-        {
-            previousPairs.push_back(NormalizeEdgePair(edge.leafA, edge.leafB));
-        }
-        auto containsPair = [](const std::vector<std::pair<uint32_t, uint32_t>>& pairs,
-                               const std::pair<uint32_t, uint32_t>& target) {
-            return std::find(pairs.begin(), pairs.end(), target) != pairs.end();
-        };
+        return edgeSet;
+    };
 
-        uint32_t changedEdges = 0;
-        for (const auto& pair : currentPairs)
+    auto formatEdgePairSet = [](const std::set<std::pair<uint32_t, uint32_t>>& edgeSet) {
+        if (edgeSet.empty())
         {
-            if (!containsPair(previousPairs, pair))
-            {
-                changedEdges++;
-            }
+            return std::string("none");
         }
-        for (const auto& pair : previousPairs)
+
+        std::ostringstream stream;
+        bool first = true;
+        for (const auto& pair : edgeSet)
         {
-            if (!containsPair(currentPairs, pair))
+            if (!first)
             {
-                changedEdges++;
+                stream << ",";
             }
+            stream << pair.first << "-" << pair.second;
+            first = false;
         }
-        return changedEdges;
+        return stream.str();
+    };
+
+    auto computeChangedEdgeSet = [&](const std::vector<OcsCandidateEdge>& edges,
+                                     const std::vector<OcsCandidateEdge>& previousEdges) {
+        const auto currentSet = makeEdgeSet(edges);
+        const auto previousSet = makeEdgeSet(previousEdges);
+        std::set<std::pair<uint32_t, uint32_t>> changedSet;
+        std::set_symmetric_difference(currentSet.begin(),
+                                      currentSet.end(),
+                                      previousSet.begin(),
+                                      previousSet.end(),
+                                      std::inserter(changedSet, changedSet.begin()));
+        return changedSet;
+    };
+
+    auto countChangedEdges = [&](const std::vector<OcsCandidateEdge>& edges,
+                                 const std::vector<OcsCandidateEdge>& previousEdges) {
+        return static_cast<uint32_t>(computeChangedEdgeSet(edges, previousEdges).size());
+    };
+
+    auto formatEdgeSet = [&](const std::vector<OcsCandidateEdge>& edges) {
+        return formatEdgePairSet(makeEdgeSet(edges));
+    };
+
+    auto formatChangedEdgeSet = [&](const std::vector<OcsCandidateEdge>& edges,
+                                    const std::vector<OcsCandidateEdge>& previousEdges) {
+        return formatEdgePairSet(computeChangedEdgeSet(edges, previousEdges));
     };
 
     auto computeConfigScore =
@@ -2470,6 +2538,24 @@ main(int argc, char* argv[])
         }
     };
 
+    bool epsWecmpDiagnosticLoadApplied = false;
+    auto applyEpsWecmpDiagnosticLoad = [&]() {
+        if (epsWecmpDiagnosticLoadMode != "hot-spine" ||
+            epsWecmpDiagnosticLoad <= 0 ||
+            epsWecmpDiagnosticHotSpine >= numSpines)
+        {
+            return false;
+        }
+
+        for (uint32_t leafIndex = 0; leafIndex < numLeaves; ++leafIndex)
+        {
+            epsPhysicalLinkStates[leafIndex][epsWecmpDiagnosticHotSpine].observedTraffic +=
+                epsWecmpDiagnosticLoad;
+        }
+        epsWecmpDiagnosticLoadApplied = true;
+        return true;
+    };
+
     auto runEpsWecmpUpdateForPair = [&](uint32_t srcLeaf,
                                         uint32_t dstLeaf,
                                         double residualDemand,
@@ -2488,6 +2574,8 @@ main(int argc, char* argv[])
         EpsWecmpPairState& pairState = getOrCreateEpsWecmpPairState(srcLeaf, dstLeaf);
         const double initialProbability = 1.0 / static_cast<double>(numSpines);
         std::vector<double> currentProbabilities = pairState.probabilities;
+        const std::vector<double> decisionStartProbabilities = pairState.probabilities;
+        std::vector<double> boundedProbabilityDeltas(numSpines, 0.0);
         decision.linkStates.reserve(numSpines);
         for (uint32_t spineIndex = 0; spineIndex < numSpines; ++spineIndex)
         {
@@ -2496,9 +2584,14 @@ main(int argc, char* argv[])
                                            0.0,
                                            pairState.smoothedUtilizations[spineIndex],
                                            0.0,
+                                           0.0,
                                            initialProbability,
                                            currentProbabilities[spineIndex],
-                                           currentProbabilities[spineIndex]});
+                                           currentProbabilities[spineIndex],
+                                           0.0,
+                                           0.0,
+                                           pairState.smoothedUtilizations[spineIndex],
+                                           0.0});
         }
 
         for (uint32_t epsEpoch = 0; epsEpoch < epsWecmpEpochs; ++epsEpoch)
@@ -2524,6 +2617,8 @@ main(int argc, char* argv[])
                                dstLinkState.smoothedUtilization);
                 }
                 state.utilization = state.smoothedUtilization;
+                state.pathLoadMetric = state.smoothedUtilization;
+                state.candidatePathLoad = state.observedTraffic;
                 state.attractiveness =
                     1.0 /
                     (std::pow(state.smoothedUtilization, epsWecmpGamma) + epsWecmpEpsilon);
@@ -2534,9 +2629,11 @@ main(int argc, char* argv[])
             for (auto& state : decision.linkStates)
             {
                 const double previousProbability = currentProbabilities[state.spineIndex];
+                state.previousProbability = previousProbability;
                 state.targetProbability =
                     sumAttractiveness > 0 ? state.attractiveness / sumAttractiveness
                                           : initialProbability;
+                state.normalizedAttractiveness = state.targetProbability;
                 const double rawUpdated =
                     (1.0 - epsWecmpKappa) * previousProbability +
                     epsWecmpKappa * state.targetProbability;
@@ -2565,7 +2662,16 @@ main(int argc, char* argv[])
             for (auto& state : decision.linkStates)
             {
                 currentProbabilities[state.spineIndex] = state.updatedProbability;
+                boundedProbabilityDeltas[state.spineIndex] =
+                    state.updatedProbability - state.previousProbability;
             }
+        }
+
+        for (auto& state : decision.linkStates)
+        {
+            state.previousProbability = decisionStartProbabilities[state.spineIndex];
+            state.probabilityDelta = state.updatedProbability - state.previousProbability;
+            state.boundedProbabilityDelta = boundedProbabilityDeltas[state.spineIndex];
         }
 
         for (const auto& state : decision.linkStates)
@@ -3109,6 +3215,7 @@ main(int argc, char* argv[])
                     }
                 }
 
+                applyEpsWecmpDiagnosticLoad();
                 updateEpsPhysicalSmoothedUtilization();
                 for (const auto& residualPair : epochResidualPairs)
                 {
@@ -3949,6 +4056,7 @@ main(int argc, char* argv[])
                                              spec.wecmpResidualDemand);
             }
         }
+        applyEpsWecmpDiagnosticLoad();
         updateEpsPhysicalSmoothedUtilization();
 
         for (uint32_t flowIndex = 0; flowIndex < matrixFlowSpecs.size(); ++flowIndex)
@@ -4353,6 +4461,8 @@ main(int argc, char* argv[])
     }
     admissionAdmittedFlows =
         enableOcsAdmissionControl ? admissionControlledAdmittedFlows : 0;
+    const uint32_t ocsPairAvailableFlows =
+        admissionControlledAdmittedFlows + directOcsFlows + admissionFallbackFlows;
 
     std::cout << "[HYBRID-DCN][ADMISSION] enabled = "
               << (enableOcsAdmissionControl ? "true" : "false") << std::endl;
@@ -4365,6 +4475,8 @@ main(int argc, char* argv[])
               << std::endl;
     std::cout << "[HYBRID-DCN][ADMISSION] ocsCoveredFlows = " << ocsCoveredFlows
               << std::endl;
+    std::cout << "[HYBRID-DCN][ADMISSION] ocsPairAvailableFlows = "
+              << ocsPairAvailableFlows << std::endl;
     std::cout << "[HYBRID-DCN][ADMISSION] admissionControlledAdmittedFlows = "
               << admissionControlledAdmittedFlows << std::endl;
     std::cout << "[HYBRID-DCN][ADMISSION] directOcsFlows = " << directOcsFlows
@@ -4420,6 +4532,14 @@ main(int argc, char* argv[])
     std::cout << "[HYBRID-DCN][WECMP] epochs = " << epsWecmpEpochs << std::endl;
     std::cout << "[HYBRID-DCN][WECMP] capacity = " << epsWecmpCapacity << std::endl;
     std::cout << "[HYBRID-DCN][WECMP] pathMetric = " << epsWecmpPathMetric << std::endl;
+    std::cout << "[HYBRID-DCN][WECMP] diagnosticLoadMode = "
+              << epsWecmpDiagnosticLoadMode << std::endl;
+    std::cout << "[HYBRID-DCN][WECMP] diagnosticLoad = "
+              << epsWecmpDiagnosticLoad << std::endl;
+    std::cout << "[HYBRID-DCN][WECMP] diagnosticHotSpine = "
+              << epsWecmpDiagnosticHotSpine << std::endl;
+    std::cout << "[HYBRID-DCN][WECMP] diagnosticLoadApplied = "
+              << (epsWecmpDiagnosticLoadApplied ? "true" : "false") << std::endl;
     std::cout << "[HYBRID-DCN][WECMP] residualDecisions = "
               << epsWecmpDecisions.size() << std::endl;
     std::cout << "[HYBRID-DCN][WECMP] pairStates = " << epsWecmpPairStates.size()
@@ -4506,6 +4626,20 @@ main(int argc, char* argv[])
                           << std::endl;
                 std::cout << "[HYBRID-DCN][WECMP] decision[" << decisionIndex
                           << "] spine[" << state.spineIndex
+                          << "] pathLoadMetric = " << state.pathLoadMetric << std::endl;
+                std::cout << "[HYBRID-DCN][WECMP] decision[" << decisionIndex
+                          << "] spine[" << state.spineIndex
+                          << "] candidatePathLoad = " << state.candidatePathLoad
+                          << std::endl;
+                std::cout << "[HYBRID-DCN][WECMP] decision[" << decisionIndex
+                          << "] spine[" << state.spineIndex
+                          << "] attractiveness = " << state.attractiveness << std::endl;
+                std::cout << "[HYBRID-DCN][WECMP] decision[" << decisionIndex
+                          << "] spine[" << state.spineIndex
+                          << "] normalizedAttractiveness = "
+                          << state.normalizedAttractiveness << std::endl;
+                std::cout << "[HYBRID-DCN][WECMP] decision[" << decisionIndex
+                          << "] spine[" << state.spineIndex
                           << "] targetProbability = " << state.targetProbability << std::endl;
                 std::cout << "[HYBRID-DCN][WECMP] decision[" << decisionIndex
                           << "] spine[" << state.spineIndex
@@ -4514,6 +4648,10 @@ main(int argc, char* argv[])
                 std::cout << "[HYBRID-DCN][WECMP] decision[" << decisionIndex
                           << "] spine[" << state.spineIndex
                           << "] updatedProbability = " << state.updatedProbability
+                          << std::endl;
+                std::cout << "[HYBRID-DCN][WECMP] decision[" << decisionIndex
+                          << "] spine[" << state.spineIndex
+                          << "] probabilityDelta = " << state.probabilityDelta
                           << std::endl;
             }
         }
@@ -4709,6 +4847,12 @@ main(int argc, char* argv[])
               << candidateChangedEdges << std::endl;
     std::cout << "[HYBRID-DCN][CONFIG] previousChangedEdges = "
               << previousChangedEdges << std::endl;
+    std::cout << "[HYBRID-DCN][CONFIG] candidateEdgeSet = "
+              << formatEdgeSet(candidateOcsEdges) << std::endl;
+    std::cout << "[HYBRID-DCN][CONFIG] previousEdgeSet = "
+              << formatEdgeSet(previousOcsEdges) << std::endl;
+    std::cout << "[HYBRID-DCN][CONFIG] changedEdgeSet = "
+              << formatChangedEdgeSet(candidateOcsEdges, previousOcsEdges) << std::endl;
     std::cout << "[HYBRID-DCN][CONFIG] decision = " << configGateDecision << std::endl;
     std::cout << "[HYBRID-DCN][CONFIG] candidateEdges = "
               << candidateOcsEdges.size() << std::endl;
@@ -5044,11 +5188,16 @@ main(int argc, char* argv[])
         std::cout << "[HYBRID-DCN][CONTROL] explicitControlArg[" << argIndex
                   << "] = " << explicitControlArgNames[argIndex] << std::endl;
     }
-    if (presetScenario != "manual" && presetOverrideMode == "preset-wins" &&
-        !explicitControlArgNames.empty())
+    const bool presetIgnoresExplicitControlArgs =
+        presetScenario != "manual" && presetOverrideMode == "preset-wins";
+    const uint32_t presetIgnoredExplicitControlArgCount =
+        presetIgnoresExplicitControlArgs
+            ? static_cast<uint32_t>(explicitControlArgNames.size())
+            : 0;
+    std::cout << "[HYBRID-DCN][CONTROL] presetIgnoredExplicitControlArgCount = "
+              << presetIgnoredExplicitControlArgCount << std::endl;
+    if (presetIgnoredExplicitControlArgCount > 0)
     {
-        std::cout << "[HYBRID-DCN][CONTROL] presetIgnoredExplicitControlArgCount = "
-                  << explicitControlArgNames.size() << std::endl;
         const uint32_t ignoredExplicitControlArgLogCount =
             static_cast<uint32_t>(std::min<size_t>(explicitControlArgNames.size(), 20));
         for (uint32_t argIndex = 0; argIndex < ignoredExplicitControlArgLogCount; ++argIndex)
@@ -5121,6 +5270,12 @@ main(int argc, char* argv[])
               << candidateChangedEdges << std::endl;
     std::cout << "[HYBRID-DCN][CONTROL] previousChangedEdges = "
               << previousChangedEdges << std::endl;
+    std::cout << "[HYBRID-DCN][CONTROL] candidateEdgeSet = "
+              << formatEdgeSet(candidateOcsEdges) << std::endl;
+    std::cout << "[HYBRID-DCN][CONTROL] previousEdgeSet = "
+              << formatEdgeSet(previousOcsEdges) << std::endl;
+    std::cout << "[HYBRID-DCN][CONTROL] changedEdgeSet = "
+              << formatChangedEdgeSet(candidateOcsEdges, previousOcsEdges) << std::endl;
     std::cout << "[HYBRID-DCN][CONTROL] hasTrafficMatrix = true" << std::endl;
     std::cout << "[HYBRID-DCN][CONTROL] hasCommunityLabels = true" << std::endl;
     std::cout << "[HYBRID-DCN][CONTROL] hasCommunityUtility = "
@@ -6388,6 +6543,7 @@ main(int argc, char* argv[])
         {
             bool wecmpProbabilitySumCheck = true;
             bool wecmpProbabilityRangeCheck = true;
+            bool wecmpProbabilityDeltaBoundCheck = true;
             for (const auto& state : epsWecmpPairStates)
             {
                 double probabilitySum = 0.0;
@@ -6405,12 +6561,31 @@ main(int argc, char* argv[])
                     wecmpProbabilitySumCheck = false;
                 }
             }
+            for (const auto& decision : epsWecmpDecisions)
+            {
+                for (const auto& linkState : decision.linkStates)
+                {
+                    if (std::abs(linkState.boundedProbabilityDelta) >
+                        epsWecmpMaxDelta + 1e-6)
+                    {
+                        wecmpProbabilityDeltaBoundCheck = false;
+                        break;
+                    }
+                }
+                if (!wecmpProbabilityDeltaBoundCheck)
+                {
+                    break;
+                }
+            }
             updateOverallInvariant(overallAlgorithmInvariant, wecmpProbabilitySumCheck);
             updateOverallInvariant(overallAlgorithmInvariant, wecmpProbabilityRangeCheck);
+            updateOverallInvariant(overallAlgorithmInvariant, wecmpProbabilityDeltaBoundCheck);
             std::cout << "[HYBRID-DCN][INVARIANT] wecmpProbabilitySumCheck = "
                       << invariantStatus(wecmpProbabilitySumCheck) << std::endl;
             std::cout << "[HYBRID-DCN][INVARIANT] wecmpProbabilityRangeCheck = "
                       << invariantStatus(wecmpProbabilityRangeCheck) << std::endl;
+            std::cout << "[HYBRID-DCN][INVARIANT] wecmpProbabilityDeltaBoundCheck = "
+                      << invariantStatus(wecmpProbabilityDeltaBoundCheck) << std::endl;
 
             bool epsPhysicalLinkNonNegativeCheck = true;
             for (const auto& leafStates : epsPhysicalLinkStates)
@@ -6440,6 +6615,8 @@ main(int argc, char* argv[])
             std::cout << "[HYBRID-DCN][INVARIANT] wecmpProbabilitySumCheck = skipped"
                       << std::endl;
             std::cout << "[HYBRID-DCN][INVARIANT] wecmpProbabilityRangeCheck = skipped"
+                      << std::endl;
+            std::cout << "[HYBRID-DCN][INVARIANT] wecmpProbabilityDeltaBoundCheck = skipped"
                       << std::endl;
             std::cout << "[HYBRID-DCN][INVARIANT] epsPhysicalLinkNonNegativeCheck = skipped"
                       << std::endl;
