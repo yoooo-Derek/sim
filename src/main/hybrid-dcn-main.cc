@@ -251,6 +251,13 @@ struct ControlEpochSummary
     double candidateConfigScore;
     double previousConfigScore;
     double configScoreImprovement;
+    double candidateRawUtilitySum;
+    double previousRawUtilitySum;
+    double candidateSelectionScoreSum;
+    double previousSelectionScoreSum;
+    uint32_t candidateChangedEdges;
+    uint32_t previousChangedEdges;
+    std::string configScoreMode;
     bool holdTimeActive;
     std::string decision;
     uint32_t previousConfigAgeBefore;
@@ -277,6 +284,12 @@ struct OcsControllerDecision
     double candidateConfigScore;
     double previousConfigScore;
     double configScoreImprovement;
+    double candidateRawUtilitySum;
+    double previousRawUtilitySum;
+    double candidateSelectionScoreSum;
+    double previousSelectionScoreSum;
+    uint32_t candidateChangedEdges;
+    uint32_t previousChangedEdges;
     bool holdTimeActive;
     std::string decision;
     uint32_t selectedConfigAge;
@@ -556,6 +569,8 @@ main(int argc, char* argv[])
     uint32_t previousOcsLeafB = 1;
     bool enableConfigUpdateGate = false;
     double configUpdateThreshold = 0.0;
+    std::string configScoreMode = "selection-score-sum";
+    double reconfigurationPenalty = 5.0;
     bool enableHoldTimeGate = false;
     uint32_t minHoldCycles = 1;
     uint32_t previousConfigAge = 1;
@@ -628,6 +643,8 @@ main(int argc, char* argv[])
             "previousOcsLeafB",
             "enableConfigUpdateGate",
             "configUpdateThreshold",
+            "configScoreMode",
+            "reconfigurationPenalty",
             "enableHoldTimeGate",
             "minHoldCycles",
             "previousConfigAge",
@@ -787,6 +804,12 @@ main(int argc, char* argv[])
     cmd.AddValue("previousOcsLeafB", "Second Leaf/ToR index for custom previous OCS state.", previousOcsLeafB);
     cmd.AddValue("enableConfigUpdateGate", "Enable single-cycle OCS configuration update threshold gating.", enableConfigUpdateGate);
     cmd.AddValue("configUpdateThreshold", "Configuration update threshold for candidate-vs-previous OCS selection.", configUpdateThreshold);
+    cmd.AddValue("configScoreMode",
+                 "Configuration update objective: selection-score-sum or paper-objective.",
+                 configScoreMode);
+    cmd.AddValue("reconfigurationPenalty",
+                 "Per changed OCS edge penalty used by configScoreMode=paper-objective.",
+                 reconfigurationPenalty);
     cmd.AddValue("enableHoldTimeGate", "Enable minimum OCS configuration hold-time gating.", enableHoldTimeGate);
     cmd.AddValue("minHoldCycles", "Minimum OCS configuration hold cycles.", minHoldCycles);
     cmd.AddValue("previousConfigAge", "Number of cycles that the previous OCS configuration has been held.", previousConfigAge);
@@ -1194,6 +1217,14 @@ main(int argc, char* argv[])
         {
             configUpdateThreshold = 0.0;
         }
+        if (shouldApplyPresetValue("configScoreMode"))
+        {
+            configScoreMode = "paper-objective";
+        }
+        if (shouldApplyPresetValue("reconfigurationPenalty"))
+        {
+            reconfigurationPenalty = 5.0;
+        }
         if (shouldApplyPresetValue("enableHoldTimeGate"))
         {
             enableHoldTimeGate = true;
@@ -1508,6 +1539,22 @@ main(int argc, char* argv[])
     {
         std::cerr
             << "[HYBRID-DCN][ERROR] configUpdateThreshold must be greater than or equal to 0."
+            << std::endl;
+        return 1;
+    }
+
+    if (configScoreMode != "selection-score-sum" && configScoreMode != "paper-objective")
+    {
+        std::cerr
+            << "[HYBRID-DCN][ERROR] configScoreMode must be selection-score-sum or paper-objective."
+            << std::endl;
+        return 1;
+    }
+
+    if (reconfigurationPenalty < 0)
+    {
+        std::cerr
+            << "[HYBRID-DCN][ERROR] reconfigurationPenalty must be greater than or equal to 0."
             << std::endl;
         return 1;
     }
@@ -2213,18 +2260,86 @@ main(int argc, char* argv[])
         }
     }
 
-    auto configScore = [](const std::vector<OcsCandidateEdge>& edges) {
-        double score = 0.0;
-        for (const auto& edge : edges)
-        {
-            score += edge.selectionScore;
-        }
-        return score;
+    struct ConfigScoreBreakdown
+    {
+        double score;
+        double rawUtilitySum;
+        double selectionScoreSum;
+        uint32_t changedEdgeCount;
     };
 
-    double candidateConfigScore = configScore(candidateOcsEdges);
-    double previousConfigScore = configScore(previousOcsEdges);
+    auto countChangedEdges = [](const std::vector<OcsCandidateEdge>& edges,
+                                const std::vector<OcsCandidateEdge>& previousEdges) {
+        std::vector<std::pair<uint32_t, uint32_t>> currentPairs;
+        std::vector<std::pair<uint32_t, uint32_t>> previousPairs;
+        for (const auto& edge : edges)
+        {
+            currentPairs.push_back(NormalizeEdgePair(edge.leafA, edge.leafB));
+        }
+        for (const auto& edge : previousEdges)
+        {
+            previousPairs.push_back(NormalizeEdgePair(edge.leafA, edge.leafB));
+        }
+        auto containsPair = [](const std::vector<std::pair<uint32_t, uint32_t>>& pairs,
+                               const std::pair<uint32_t, uint32_t>& target) {
+            return std::find(pairs.begin(), pairs.end(), target) != pairs.end();
+        };
+
+        uint32_t changedEdges = 0;
+        for (const auto& pair : currentPairs)
+        {
+            if (!containsPair(previousPairs, pair))
+            {
+                changedEdges++;
+            }
+        }
+        for (const auto& pair : previousPairs)
+        {
+            if (!containsPair(currentPairs, pair))
+            {
+                changedEdges++;
+            }
+        }
+        return changedEdges;
+    };
+
+    auto computeConfigScore =
+        [&](const std::vector<OcsCandidateEdge>& edges,
+            const std::vector<OcsCandidateEdge>& previousEdges,
+            const std::string& mode) {
+            ConfigScoreBreakdown breakdown{0.0, 0.0, 0.0, 0};
+            for (const auto& edge : edges)
+            {
+                breakdown.rawUtilitySum += edge.utility;
+                breakdown.selectionScoreSum += edge.selectionScore;
+            }
+            breakdown.changedEdgeCount = countChangedEdges(edges, previousEdges);
+            if (mode == "paper-objective")
+            {
+                breakdown.score =
+                    breakdown.rawUtilitySum -
+                    reconfigurationPenalty * static_cast<double>(breakdown.changedEdgeCount);
+            }
+            else
+            {
+                breakdown.score = breakdown.selectionScoreSum;
+            }
+            return breakdown;
+    };
+
+    ConfigScoreBreakdown candidateConfigBreakdown =
+        computeConfigScore(candidateOcsEdges, previousOcsEdges, configScoreMode);
+    ConfigScoreBreakdown previousConfigBreakdown =
+        computeConfigScore(previousOcsEdges, previousOcsEdges, configScoreMode);
+    double candidateConfigScore = candidateConfigBreakdown.score;
+    double previousConfigScore = previousConfigBreakdown.score;
     double configScoreImprovement = candidateConfigScore - previousConfigScore;
+    double candidateRawUtilitySum = candidateConfigBreakdown.rawUtilitySum;
+    double previousRawUtilitySum = previousConfigBreakdown.rawUtilitySum;
+    double candidateSelectionScoreSum = candidateConfigBreakdown.selectionScoreSum;
+    double previousSelectionScoreSum = previousConfigBreakdown.selectionScoreSum;
+    uint32_t candidateChangedEdges = candidateConfigBreakdown.changedEdgeCount;
+    uint32_t previousChangedEdges = previousConfigBreakdown.changedEdgeCount;
     bool holdTimeActive = !holdOcsEdges.empty();
     std::string configGateDecision = "disabled";
     std::vector<OcsCandidateEdge> selectedOcsEdges;
@@ -2707,6 +2822,10 @@ main(int argc, char* argv[])
                 {
                     std::cerr << "[HYBRID-DCN][ERROR] hold OCS edge exceeds ocsPortK."
                               << std::endl;
+                    const ConfigScoreBreakdown epochPreviousBreakdown =
+                        computeConfigScore(epochPreviousOcsEdges,
+                                           epochPreviousOcsEdges,
+                                           configScoreMode);
                     ControlEpochSummary summary{epoch,
                                                 matrixModeName,
                                                 epochCommunityCount,
@@ -2716,8 +2835,15 @@ main(int argc, char* argv[])
                                                 0,
                                                 static_cast<uint32_t>(epochHoldOcsEdges.size()),
                                                 0.0,
-                                                configScore(epochPreviousOcsEdges),
+                                                epochPreviousBreakdown.score,
                                                 0.0,
+                                                0.0,
+                                                epochPreviousBreakdown.rawUtilitySum,
+                                                0.0,
+                                                epochPreviousBreakdown.selectionScoreSum,
+                                                0,
+                                                epochPreviousBreakdown.changedEdgeCount,
+                                                configScoreMode,
                                                 !epochHoldOcsEdges.empty(),
                                                 "error",
                                                 epochPreviousAge,
@@ -2738,8 +2864,14 @@ main(int argc, char* argv[])
                                                  epochLabels,
                                                  epochCommunityCount,
                                                  0.0,
-                                                 configScore(epochPreviousOcsEdges),
+                                                 epochPreviousBreakdown.score,
                                                  0.0,
+                                                 0.0,
+                                                 epochPreviousBreakdown.rawUtilitySum,
+                                                 0.0,
+                                                 epochPreviousBreakdown.selectionScoreSum,
+                                                 0,
+                                                 epochPreviousBreakdown.changedEdgeCount,
                                                  !epochHoldOcsEdges.empty(),
                                                  "error",
                                                  epochPreviousAge,
@@ -2767,8 +2899,16 @@ main(int argc, char* argv[])
                 }
             }
 
-            const double epochCandidateConfigScore = configScore(epochCandidateOcsEdges);
-            const double epochPreviousConfigScore = configScore(epochPreviousOcsEdges);
+            const ConfigScoreBreakdown epochCandidateBreakdown =
+                computeConfigScore(epochCandidateOcsEdges,
+                                   epochPreviousOcsEdges,
+                                   configScoreMode);
+            const ConfigScoreBreakdown epochPreviousBreakdown =
+                computeConfigScore(epochPreviousOcsEdges,
+                                   epochPreviousOcsEdges,
+                                   configScoreMode);
+            const double epochCandidateConfigScore = epochCandidateBreakdown.score;
+            const double epochPreviousConfigScore = epochPreviousBreakdown.score;
             const double epochConfigScoreImprovement =
                 epochCandidateConfigScore - epochPreviousConfigScore;
             const bool epochHoldTimeActive = !epochHoldOcsEdges.empty();
@@ -2810,6 +2950,13 @@ main(int argc, char* argv[])
                                         epochCandidateConfigScore,
                                         epochPreviousConfigScore,
                                         epochConfigScoreImprovement,
+                                        epochCandidateBreakdown.rawUtilitySum,
+                                        epochPreviousBreakdown.rawUtilitySum,
+                                        epochCandidateBreakdown.selectionScoreSum,
+                                        epochPreviousBreakdown.selectionScoreSum,
+                                        epochCandidateBreakdown.changedEdgeCount,
+                                        epochPreviousBreakdown.changedEdgeCount,
+                                        configScoreMode,
                                         epochHoldTimeActive,
                                         epochDecision,
                                         epochPreviousAge,
@@ -2833,6 +2980,12 @@ main(int argc, char* argv[])
                                          epochCandidateConfigScore,
                                          epochPreviousConfigScore,
                                          epochConfigScoreImprovement,
+                                         epochCandidateBreakdown.rawUtilitySum,
+                                         epochPreviousBreakdown.rawUtilitySum,
+                                         epochCandidateBreakdown.selectionScoreSum,
+                                         epochPreviousBreakdown.selectionScoreSum,
+                                         epochCandidateBreakdown.changedEdgeCount,
+                                         epochPreviousBreakdown.changedEdgeCount,
                                          epochHoldTimeActive,
                                          epochDecision,
                                          epochAgeAfter,
@@ -2889,6 +3042,12 @@ main(int argc, char* argv[])
             candidateConfigScore = epochDecision.candidateConfigScore;
             previousConfigScore = epochDecision.previousConfigScore;
             configScoreImprovement = epochDecision.configScoreImprovement;
+            candidateRawUtilitySum = epochDecision.candidateRawUtilitySum;
+            previousRawUtilitySum = epochDecision.previousRawUtilitySum;
+            candidateSelectionScoreSum = epochDecision.candidateSelectionScoreSum;
+            previousSelectionScoreSum = epochDecision.previousSelectionScoreSum;
+            candidateChangedEdges = epochDecision.candidateChangedEdges;
+            previousChangedEdges = epochDecision.previousChangedEdges;
             holdTimeActive = epochDecision.holdTimeActive;
             configGateDecision = epochDecision.decision;
             epochPreviousAge = epochDecision.selectedConfigAge;
@@ -4528,12 +4687,28 @@ main(int argc, char* argv[])
               << (enableConfigUpdateGate ? "true" : "false") << std::endl;
     std::cout << "[HYBRID-DCN][CONFIG] configUpdateThreshold = "
               << configUpdateThreshold << std::endl;
+    std::cout << "[HYBRID-DCN][CONFIG] configScoreMode = "
+              << configScoreMode << std::endl;
+    std::cout << "[HYBRID-DCN][CONFIG] reconfigurationPenalty = "
+              << reconfigurationPenalty << std::endl;
     std::cout << "[HYBRID-DCN][CONFIG] candidateConfigScore = "
               << candidateConfigScore << std::endl;
     std::cout << "[HYBRID-DCN][CONFIG] previousConfigScore = "
               << previousConfigScore << std::endl;
     std::cout << "[HYBRID-DCN][CONFIG] configScoreImprovement = "
               << configScoreImprovement << std::endl;
+    std::cout << "[HYBRID-DCN][CONFIG] candidateRawUtilitySum = "
+              << candidateRawUtilitySum << std::endl;
+    std::cout << "[HYBRID-DCN][CONFIG] previousRawUtilitySum = "
+              << previousRawUtilitySum << std::endl;
+    std::cout << "[HYBRID-DCN][CONFIG] candidateSelectionScoreSum = "
+              << candidateSelectionScoreSum << std::endl;
+    std::cout << "[HYBRID-DCN][CONFIG] previousSelectionScoreSum = "
+              << previousSelectionScoreSum << std::endl;
+    std::cout << "[HYBRID-DCN][CONFIG] candidateChangedEdges = "
+              << candidateChangedEdges << std::endl;
+    std::cout << "[HYBRID-DCN][CONFIG] previousChangedEdges = "
+              << previousChangedEdges << std::endl;
     std::cout << "[HYBRID-DCN][CONFIG] decision = " << configGateDecision << std::endl;
     std::cout << "[HYBRID-DCN][CONFIG] candidateEdges = "
               << candidateOcsEdges.size() << std::endl;
@@ -4723,6 +4898,14 @@ main(int argc, char* argv[])
                       << "] configScoreImprovement = " << summary.configScoreImprovement
                       << std::endl;
             std::cout << "[HYBRID-DCN][MULTI] epoch[" << summary.epoch
+                      << "] configScoreMode = " << summary.configScoreMode << std::endl;
+            std::cout << "[HYBRID-DCN][MULTI] epoch[" << summary.epoch
+                      << "] candidateChangedEdges = " << summary.candidateChangedEdges
+                      << std::endl;
+            std::cout << "[HYBRID-DCN][MULTI] epoch[" << summary.epoch
+                      << "] previousChangedEdges = " << summary.previousChangedEdges
+                      << std::endl;
+            std::cout << "[HYBRID-DCN][MULTI] epoch[" << summary.epoch
                       << "] holdTimeActive = "
                       << (summary.holdTimeActive ? "true" : "false") << std::endl;
             std::cout << "[HYBRID-DCN][MULTI] epoch[" << summary.epoch
@@ -4861,6 +5044,20 @@ main(int argc, char* argv[])
         std::cout << "[HYBRID-DCN][CONTROL] explicitControlArg[" << argIndex
                   << "] = " << explicitControlArgNames[argIndex] << std::endl;
     }
+    if (presetScenario != "manual" && presetOverrideMode == "preset-wins" &&
+        !explicitControlArgNames.empty())
+    {
+        std::cout << "[HYBRID-DCN][CONTROL] presetIgnoredExplicitControlArgCount = "
+                  << explicitControlArgNames.size() << std::endl;
+        const uint32_t ignoredExplicitControlArgLogCount =
+            static_cast<uint32_t>(std::min<size_t>(explicitControlArgNames.size(), 20));
+        for (uint32_t argIndex = 0; argIndex < ignoredExplicitControlArgLogCount; ++argIndex)
+        {
+            std::cout << "[HYBRID-DCN][CONTROL] presetIgnoredExplicitControlArg["
+                      << argIndex << "] = " << explicitControlArgNames[argIndex]
+                      << std::endl;
+        }
+    }
     std::cout << "[HYBRID-DCN][CONTROL] trafficMatrixMode = " << trafficMatrixMode
               << std::endl;
     std::cout << "[HYBRID-DCN][CONTROL] communityMode = " << communityMode << std::endl;
@@ -4879,6 +5076,10 @@ main(int argc, char* argv[])
               << (enableConfigUpdateGate ? "true" : "false") << std::endl;
     std::cout << "[HYBRID-DCN][CONTROL] configUpdateThreshold = "
               << configUpdateThreshold << std::endl;
+    std::cout << "[HYBRID-DCN][CONTROL] configScoreMode = "
+              << configScoreMode << std::endl;
+    std::cout << "[HYBRID-DCN][CONTROL] reconfigurationPenalty = "
+              << reconfigurationPenalty << std::endl;
     std::cout << "[HYBRID-DCN][CONTROL] enableHoldTimeGate = "
               << (enableHoldTimeGate ? "true" : "false") << std::endl;
     std::cout << "[HYBRID-DCN][CONTROL] minHoldCycles = " << minHoldCycles
@@ -4908,6 +5109,18 @@ main(int argc, char* argv[])
               << previousConfigScore << std::endl;
     std::cout << "[HYBRID-DCN][CONTROL] configScoreImprovement = "
               << configScoreImprovement << std::endl;
+    std::cout << "[HYBRID-DCN][CONTROL] candidateRawUtilitySum = "
+              << candidateRawUtilitySum << std::endl;
+    std::cout << "[HYBRID-DCN][CONTROL] previousRawUtilitySum = "
+              << previousRawUtilitySum << std::endl;
+    std::cout << "[HYBRID-DCN][CONTROL] candidateSelectionScoreSum = "
+              << candidateSelectionScoreSum << std::endl;
+    std::cout << "[HYBRID-DCN][CONTROL] previousSelectionScoreSum = "
+              << previousSelectionScoreSum << std::endl;
+    std::cout << "[HYBRID-DCN][CONTROL] candidateChangedEdges = "
+              << candidateChangedEdges << std::endl;
+    std::cout << "[HYBRID-DCN][CONTROL] previousChangedEdges = "
+              << previousChangedEdges << std::endl;
     std::cout << "[HYBRID-DCN][CONTROL] hasTrafficMatrix = true" << std::endl;
     std::cout << "[HYBRID-DCN][CONTROL] hasCommunityLabels = true" << std::endl;
     std::cout << "[HYBRID-DCN][CONTROL] hasCommunityUtility = "
@@ -6063,6 +6276,21 @@ main(int argc, char* argv[])
         updateOverallInvariant(overallAlgorithmInvariant, maxSelectedOcsLinksCheck);
         std::cout << "[HYBRID-DCN][INVARIANT] maxSelectedOcsLinksCheck = "
                   << invariantStatus(maxSelectedOcsLinksCheck) << std::endl;
+
+        const bool previousChangedEdgesZeroCheck = previousChangedEdges == 0;
+        const bool changedEdgesNonNegativeCheck =
+            candidateChangedEdges <= candidateOcsEdges.size() + previousOcsEdges.size();
+        const bool configScoreModeCheck =
+            configScoreMode == "selection-score-sum" || configScoreMode == "paper-objective";
+        updateOverallInvariant(overallAlgorithmInvariant, previousChangedEdgesZeroCheck);
+        updateOverallInvariant(overallAlgorithmInvariant, changedEdgesNonNegativeCheck);
+        updateOverallInvariant(overallAlgorithmInvariant, configScoreModeCheck);
+        std::cout << "[HYBRID-DCN][INVARIANT] previousChangedEdgesZeroCheck = "
+                  << invariantStatus(previousChangedEdgesZeroCheck) << std::endl;
+        std::cout << "[HYBRID-DCN][INVARIANT] changedEdgesNonNegativeCheck = "
+                  << invariantStatus(changedEdgesNonNegativeCheck) << std::endl;
+        std::cout << "[HYBRID-DCN][INVARIANT] configScoreModeCheck = "
+                  << invariantStatus(configScoreModeCheck) << std::endl;
 
         bool hardHoldPreservedInCandidateCheck = true;
         if (holdTimeActive || !holdOcsEdges.empty())
