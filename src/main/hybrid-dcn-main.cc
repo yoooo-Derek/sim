@@ -520,6 +520,9 @@ main(int argc, char* argv[])
     std::string routeMode = "global";
     bool enableMatrixSelect = true;
     std::string trafficMatrixMode = "skewed";
+    bool enableEwmaSmoothing = false;
+    double ewmaBeta = 0.7;
+    std::string trafficMatrixSource = "synthetic";
     std::string communityMode = "preview";
     std::string louvainMode = "single-level";
     uint32_t louvainMaxPasses = 10;
@@ -622,6 +625,9 @@ main(int argc, char* argv[])
             "matrixFlowMaxBytes",
             "matrixFlowStart",
             "matrixFlowPortBase",
+            "enableEwmaSmoothing",
+            "ewmaBeta",
+            "trafficMatrixSource",
             "enableOcsAdmissionControl",
             "ocsAdmissionThreshold",
             "matrixFlowDemand",
@@ -737,6 +743,13 @@ main(int argc, char* argv[])
     cmd.AddValue("routeMode", "Routing mode: global or ocs-forced.", routeMode);
     cmd.AddValue("enableMatrixSelect", "Select the static OCS Leaf pair from a built-in ToR traffic matrix.", enableMatrixSelect);
     cmd.AddValue("trafficMatrixMode", "Built-in ToR traffic matrix mode: skewed, clustered, or uniform.", trafficMatrixMode);
+    cmd.AddValue("enableEwmaSmoothing",
+                 "Enable EWMA smoothing from current synthetic traffic matrix A(t) to control matrix A_bar(t).",
+                 enableEwmaSmoothing);
+    cmd.AddValue("ewmaBeta", "EWMA smoothing coefficient beta in [0, 1).", ewmaBeta);
+    cmd.AddValue("trafficMatrixSource",
+                 "Traffic matrix source. Current implementation supports synthetic only.",
+                 trafficMatrixSource);
     cmd.AddValue("communityMode", "Community label source: preview or louvain.", communityMode);
     cmd.AddValue("louvainMode", "Louvain mode: single-level or multi-level.", louvainMode);
     cmd.AddValue("louvainMaxPasses", "Maximum passes per Louvain local-moving level.", louvainMaxPasses);
@@ -1268,6 +1281,19 @@ main(int argc, char* argv[])
         return 1;
     }
 
+    if (trafficMatrixSource != "synthetic")
+    {
+        std::cerr << "[HYBRID-DCN][ERROR] trafficMatrixSource must be synthetic."
+                  << std::endl;
+        return 1;
+    }
+
+    if (ewmaBeta < 0 || ewmaBeta >= 1)
+    {
+        std::cerr << "[HYBRID-DCN][ERROR] ewmaBeta must be in [0, 1)." << std::endl;
+        return 1;
+    }
+
     if (trafficMatrixSequence != "static" && trafficMatrixSequence != "skewed-to-clustered" &&
         trafficMatrixSequence != "clustered-to-skewed" && trafficMatrixSequence != "alternating")
     {
@@ -1498,9 +1524,13 @@ main(int argc, char* argv[])
         }
     }
 
-    auto buildTrafficMatrix = [](const std::string& mode, uint32_t leafCount) {
-        std::vector<std::vector<double>> matrix(leafCount,
-                                                std::vector<double>(leafCount, 0.0));
+    using WeightedMatrix = std::vector<std::vector<double>>;
+
+    // Synthetic source currently emits the undirected ToR-level communication
+    // intensity matrix A(t), not a directed packet/byte matrix W(t).
+    auto buildSyntheticUndirectedTrafficMatrix = [](const std::string& mode,
+                                                    uint32_t leafCount) {
+        WeightedMatrix matrix(leafCount, std::vector<double>(leafCount, 0.0));
 
         if (mode == "skewed")
         {
@@ -1553,8 +1583,41 @@ main(int argc, char* argv[])
         return matrix;
     };
 
+    auto updateEwmaMatrix = [](const WeightedMatrix& previousAbar,
+                               const WeightedMatrix& currentA,
+                               double beta,
+                               bool hasPreviousAbar) {
+        if (!hasPreviousAbar)
+        {
+            return currentA;
+        }
+
+        WeightedMatrix abar(currentA.size(), std::vector<double>(currentA.size(), 0.0));
+        for (uint32_t i = 0; i < currentA.size(); ++i)
+        {
+            for (uint32_t j = i + 1; j < currentA[i].size(); ++j)
+            {
+                double previous = 0.0;
+                if (i < previousAbar.size() && j < previousAbar[i].size())
+                {
+                    previous = previousAbar[i][j];
+                }
+                const double value =
+                    std::max(beta * previous + (1.0 - beta) * currentA[i][j], 0.0);
+                abar[i][j] = value;
+                abar[j][i] = value;
+            }
+        }
+        return abar;
+    };
+
+    const WeightedMatrix initialRawTrafficMatrix =
+        buildSyntheticUndirectedTrafficMatrix(trafficMatrixMode, numLeaves);
     std::vector<std::vector<double>> torTrafficMatrix =
-        buildTrafficMatrix(trafficMatrixMode, numLeaves);
+        enableEwmaSmoothing
+            ? updateEwmaMatrix(WeightedMatrix{}, initialRawTrafficMatrix, ewmaBeta, false)
+            : initialRawTrafficMatrix;
+    std::string matrixUsedForControl = enableEwmaSmoothing ? "ewma" : "raw";
 
     auto buildCommunityPreview = [](const std::string& mode, uint32_t leafCount) {
         CommunityPreview preview;
@@ -1657,8 +1720,6 @@ main(int argc, char* argv[])
             }
         }
     }
-
-    using WeightedMatrix = std::vector<std::vector<double>>;
 
     auto normalizeCommunityLabels = [](std::vector<uint32_t>& labels) {
         std::vector<uint32_t> oldLabels;
@@ -2768,12 +2829,24 @@ main(int argc, char* argv[])
         std::vector<OcsCandidateEdge> epochPreviousEdges = previousOcsEdges;
         OcsEdgeAgeMatrix epochPreviousAgeMatrix = previousOcsEdgeAges;
         uint32_t epochPreviousAge = previousConfigAge;
+        WeightedMatrix previousAbar;
+        bool hasPreviousAbar = false;
         for (uint32_t epoch = 0; epoch < controlEpochs; ++epoch)
         {
             const std::string epochMatrixMode = getEpochMatrixMode(epoch);
-            const WeightedMatrix epochMatrix = buildTrafficMatrix(epochMatrixMode, numLeaves);
+            const WeightedMatrix currentA =
+                buildSyntheticUndirectedTrafficMatrix(epochMatrixMode, numLeaves);
+            const WeightedMatrix epochControlMatrix =
+                enableEwmaSmoothing
+                    ? updateEwmaMatrix(previousAbar, currentA, ewmaBeta, hasPreviousAbar)
+                    : currentA;
+            if (enableEwmaSmoothing)
+            {
+                previousAbar = epochControlMatrix;
+                hasPreviousAbar = true;
+            }
             OcsControllerDecision epochDecision =
-                runControlDecisionForMatrix(epochMatrix,
+                runControlDecisionForMatrix(epochControlMatrix,
                                             epochMatrixMode,
                                             epochPreviousEdges,
                                             epochPreviousAgeMatrix,
@@ -2817,7 +2890,7 @@ main(int argc, char* argv[])
                 {
                     for (uint32_t leafB = leafA + 1; leafB < numLeaves; ++leafB)
                     {
-                        const double demand = epochMatrix[leafA][leafB];
+                        const double demand = epochControlMatrix[leafA][leafB];
                         const bool pairSelected =
                             isEdgeInSet(epochDecision.selectedOcsEdges, leafA, leafB);
                         double plannedResidualDemand = 0.0;
@@ -2862,7 +2935,8 @@ main(int argc, char* argv[])
             epochPreviousEdges = selectedOcsEdges;
             epochPreviousAgeMatrix = selectedOcsEdgeAges;
             finalEpochMatrixMode = epochMatrixMode;
-            torTrafficMatrix = epochMatrix;
+            torTrafficMatrix = epochControlMatrix;
+            matrixUsedForControl = enableEwmaSmoothing ? "ewma" : "raw";
         }
 
         trafficMatrixMode = finalEpochMatrixMode;
@@ -4309,6 +4383,15 @@ main(int argc, char* argv[])
               << (enableMatrixSelect ? "true" : "false") << std::endl;
     std::cout << "[HYBRID-DCN][MATRIX] trafficMatrixMode = " << trafficMatrixMode
               << std::endl;
+    std::cout << "[HYBRID-DCN][MATRIX] trafficMatrixSource = "
+              << trafficMatrixSource << std::endl;
+    std::cout << "[HYBRID-DCN][MATRIX] enableEwmaSmoothing = "
+              << (enableEwmaSmoothing ? "true" : "false") << std::endl;
+    std::cout << "[HYBRID-DCN][MATRIX] ewmaBeta = " << ewmaBeta << std::endl;
+    std::cout << "[HYBRID-DCN][MATRIX] matrixUsedForControl = "
+              << matrixUsedForControl << std::endl;
+    std::cout << "[HYBRID-DCN][MATRIX] matrixSemantic = undirected-synthetic-A"
+              << std::endl;
     std::cout << "[HYBRID-DCN][MATRIX] selectionMetric = " << selectionMetric << std::endl;
     std::cout << "[HYBRID-DCN][MATRIX] eta             = " << eta << std::endl;
     std::cout << "[HYBRID-DCN][MATRIX] totalTraffic    = " << totalTraffic << std::endl;
@@ -4459,10 +4542,17 @@ main(int argc, char* argv[])
     const bool isBaseline =
         presetScenario == "baseline-excess" &&
         !(presetOverrideMode == "explicit-wins" && !explicitControlArgNames.empty());
-    const bool fullStackControlEnabled = presetScenario == "full-stack-control";
+    const bool isFullStackPreset = presetScenario == "full-stack-control";
+    const bool fullStackControlEnabled = enableOcsAdmissionControl &&
+                                         enableEpsWecmp &&
+                                         enableEpsWecmpRouting &&
+                                         enableMultiPeriodControl &&
+                                         enableMultiPeriodWecmpState;
 
     std::ostringstream enabledModuleSummaryStream;
     enabledModuleSummaryStream << "matrix,"
+                               << (enableEwmaSmoothing ? "ewma" : "noEwma")
+                               << ","
                                << (communityMode == "louvain" ? "louvain" : "preview")
                                << ","
                                << (selectionMetric == "community-excess"
@@ -4474,6 +4564,17 @@ main(int argc, char* argv[])
                                << (enableConfigUpdateGate ? "configGate" : "noConfigGate")
                                << ","
                                << (enableHoldTimeGate ? "holdGate" : "noHoldGate")
+                               << ","
+                               << (enableOcsAdmissionControl ? "ocsAdmission"
+                                                             : "noOcsAdmission")
+                               << ","
+                               << (enableEpsWecmp ? "epsWecmp" : "noEpsWecmp")
+                               << ","
+                               << (enableEpsWecmpRouting ? "epsWecmpRouting"
+                                                         : "noEpsWecmpRouting")
+                               << ","
+                               << (enableMultiPeriodControl ? "multiPeriodControl"
+                                                            : "noMultiPeriodControl")
                                << ","
                                << (enableResultValidation ? "resultValidation"
                                                           : "noResultValidation");
@@ -4495,6 +4596,16 @@ main(int argc, char* argv[])
         {
             std::cout << "[HYBRID-DCN][MULTI] epoch[" << summary.epoch
                       << "] trafficMatrixMode = " << summary.trafficMatrixMode << std::endl;
+            std::cout << "[HYBRID-DCN][MULTI] epoch[" << summary.epoch
+                      << "] rawTrafficMatrixMode = " << summary.trafficMatrixMode << std::endl;
+            std::cout << "[HYBRID-DCN][MULTI] epoch[" << summary.epoch
+                      << "] matrixUsedForControl = "
+                      << (enableEwmaSmoothing ? "ewma" : "raw") << std::endl;
+            std::cout << "[HYBRID-DCN][MULTI] epoch[" << summary.epoch
+                      << "] ewmaEnabled = "
+                      << (enableEwmaSmoothing ? "true" : "false") << std::endl;
+            std::cout << "[HYBRID-DCN][MULTI] epoch[" << summary.epoch
+                      << "] ewmaBeta = " << ewmaBeta << std::endl;
             std::cout << "[HYBRID-DCN][MULTI] epoch[" << summary.epoch
                       << "] communityCount = " << summary.communityCount << std::endl;
             std::cout << "[HYBRID-DCN][MULTI] epoch[" << summary.epoch
@@ -4566,6 +4677,8 @@ main(int argc, char* argv[])
               << (isMainMethod ? "true" : "false") << std::endl;
     std::cout << "[HYBRID-DCN][PAPER] isFullStackMethod = "
               << (isFullStackMethod ? "true" : "false") << std::endl;
+    std::cout << "[HYBRID-DCN][PAPER] isFullStackPreset = "
+              << (isFullStackPreset ? "true" : "false") << std::endl;
     std::cout << "[HYBRID-DCN][PAPER] isBaseline = " << (isBaseline ? "true" : "false")
               << std::endl;
     std::cout << "[HYBRID-DCN][PAPER] presetScenario = " << presetScenario
@@ -4576,8 +4689,10 @@ main(int argc, char* argv[])
               << explicitControlArgNames.size() << std::endl;
     std::cout << "[HYBRID-DCN][PAPER] enabledModuleSummary = "
               << enabledModuleSummary << std::endl;
-    std::cout << "[HYBRID-DCN][PAPER] trafficMatrixSource = synthetic" << std::endl;
-    std::cout << "[HYBRID-DCN][PAPER] ewmaEnabled = false" << std::endl;
+    std::cout << "[HYBRID-DCN][PAPER] trafficMatrixSource = "
+              << trafficMatrixSource << std::endl;
+    std::cout << "[HYBRID-DCN][PAPER] ewmaEnabled = "
+              << (enableEwmaSmoothing ? "true" : "false") << std::endl;
     std::cout << "[HYBRID-DCN][PAPER] ocsAdmissionControlEnabled = "
               << (enableOcsAdmissionControl ? "true" : "false") << std::endl;
     std::cout << "[HYBRID-DCN][PAPER] epsWecmpEnabled = "
@@ -4599,6 +4714,8 @@ main(int argc, char* argv[])
               << (isMainMethod ? "true" : "false") << std::endl;
     std::cout << "[HYBRID-DCN][CONTROL] isFullStackMethod = "
               << (isFullStackMethod ? "true" : "false") << std::endl;
+    std::cout << "[HYBRID-DCN][CONTROL] isFullStackPreset = "
+              << (isFullStackPreset ? "true" : "false") << std::endl;
     std::cout << "[HYBRID-DCN][CONTROL] isBaseline = "
               << (isBaseline ? "true" : "false") << std::endl;
     std::cout << "[HYBRID-DCN][CONTROL] enabledModuleSummary = "
@@ -4609,8 +4726,13 @@ main(int argc, char* argv[])
               << std::endl;
     std::cout << "[HYBRID-DCN][CONTROL] presetApplied = "
               << (presetApplied ? "true" : "false") << std::endl;
-    std::cout << "[HYBRID-DCN][CONTROL] trafficMatrixSource = synthetic" << std::endl;
-    std::cout << "[HYBRID-DCN][CONTROL] ewmaEnabled = false" << std::endl;
+    std::cout << "[HYBRID-DCN][CONTROL] trafficMatrixSource = "
+              << trafficMatrixSource << std::endl;
+    std::cout << "[HYBRID-DCN][CONTROL] enableEwmaSmoothing = "
+              << (enableEwmaSmoothing ? "true" : "false") << std::endl;
+    std::cout << "[HYBRID-DCN][CONTROL] ewmaEnabled = "
+              << (enableEwmaSmoothing ? "true" : "false") << std::endl;
+    std::cout << "[HYBRID-DCN][CONTROL] ewmaBeta = " << ewmaBeta << std::endl;
     std::cout << "[HYBRID-DCN][CONTROL] ocsAdmissionControlEnabled = "
               << (enableOcsAdmissionControl ? "true" : "false") << std::endl;
     std::cout << "[HYBRID-DCN][CONTROL] epsWecmpEnabled = "
@@ -5405,12 +5527,19 @@ main(int argc, char* argv[])
               << (isMainMethod ? "true" : "false") << std::endl;
     std::cout << "[HYBRID-DCN][RESULT] isFullStackMethod = "
               << (isFullStackMethod ? "true" : "false") << std::endl;
+    std::cout << "[HYBRID-DCN][RESULT] isFullStackPreset = "
+              << (isFullStackPreset ? "true" : "false") << std::endl;
     std::cout << "[HYBRID-DCN][RESULT] isBaseline = "
               << (isBaseline ? "true" : "false") << std::endl;
     std::cout << "[HYBRID-DCN][RESULT] enabledModuleSummary = "
               << enabledModuleSummary << std::endl;
-    std::cout << "[HYBRID-DCN][RESULT] trafficMatrixSource = synthetic" << std::endl;
-    std::cout << "[HYBRID-DCN][RESULT] ewmaEnabled = false" << std::endl;
+    std::cout << "[HYBRID-DCN][RESULT] trafficMatrixSource = "
+              << trafficMatrixSource << std::endl;
+    std::cout << "[HYBRID-DCN][RESULT] enableEwmaSmoothing = "
+              << (enableEwmaSmoothing ? "true" : "false") << std::endl;
+    std::cout << "[HYBRID-DCN][RESULT] ewmaEnabled = "
+              << (enableEwmaSmoothing ? "true" : "false") << std::endl;
+    std::cout << "[HYBRID-DCN][RESULT] ewmaBeta = " << ewmaBeta << std::endl;
     std::cout << "[HYBRID-DCN][RESULT] ocsAdmissionControlEnabled = "
               << (enableOcsAdmissionControl ? "true" : "false") << std::endl;
     std::cout << "[HYBRID-DCN][RESULT] epsWecmpEnabled = "
@@ -5725,6 +5854,55 @@ main(int argc, char* argv[])
                   << (strictAlgorithmInvariantCheck ? "true" : "false") << std::endl;
         std::cout << "[HYBRID-DCN][INVARIANT] stage = stage-40-core-algorithm-invariants"
                   << std::endl;
+
+        bool trafficMatrixSymmetryCheck = true;
+        bool trafficMatrixDiagonalZeroCheck = true;
+        bool trafficMatrixNonNegativeCheck = true;
+        for (uint32_t i = 0; i < torTrafficMatrix.size(); ++i)
+        {
+            if (i >= torTrafficMatrix[i].size() ||
+                std::abs(torTrafficMatrix[i][i]) > 1e-9)
+            {
+                trafficMatrixDiagonalZeroCheck = false;
+            }
+            for (uint32_t j = 0; j < torTrafficMatrix[i].size(); ++j)
+            {
+                if (torTrafficMatrix[i][j] < -1e-9)
+                {
+                    trafficMatrixNonNegativeCheck = false;
+                }
+                if (j < torTrafficMatrix.size() &&
+                    i < torTrafficMatrix[j].size() &&
+                    std::abs(torTrafficMatrix[i][j] - torTrafficMatrix[j][i]) > 1e-9)
+                {
+                    trafficMatrixSymmetryCheck = false;
+                }
+            }
+        }
+        updateOverallInvariant(overallAlgorithmInvariant, trafficMatrixSymmetryCheck);
+        updateOverallInvariant(overallAlgorithmInvariant, trafficMatrixDiagonalZeroCheck);
+        updateOverallInvariant(overallAlgorithmInvariant, trafficMatrixNonNegativeCheck);
+        std::cout << "[HYBRID-DCN][INVARIANT] trafficMatrixSymmetryCheck = "
+                  << invariantStatus(trafficMatrixSymmetryCheck) << std::endl;
+        std::cout << "[HYBRID-DCN][INVARIANT] trafficMatrixDiagonalZeroCheck = "
+                  << invariantStatus(trafficMatrixDiagonalZeroCheck) << std::endl;
+        std::cout << "[HYBRID-DCN][INVARIANT] trafficMatrixNonNegativeCheck = "
+                  << invariantStatus(trafficMatrixNonNegativeCheck) << std::endl;
+
+        if (enableEwmaSmoothing)
+        {
+            const bool ewmaMatrixCheck = trafficMatrixSymmetryCheck &&
+                                         trafficMatrixDiagonalZeroCheck &&
+                                         trafficMatrixNonNegativeCheck;
+            updateOverallInvariant(overallAlgorithmInvariant, ewmaMatrixCheck);
+            std::cout << "[HYBRID-DCN][INVARIANT] ewmaMatrixCheck = "
+                      << invariantStatus(ewmaMatrixCheck) << std::endl;
+        }
+        else
+        {
+            std::cout << "[HYBRID-DCN][INVARIANT] ewmaMatrixCheck = skipped"
+                      << std::endl;
+        }
 
         std::vector<uint32_t> invariantOcsDegree(numLeaves, 0);
         bool ocsPortConstraintCheck = true;
