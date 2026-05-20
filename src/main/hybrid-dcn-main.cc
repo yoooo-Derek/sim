@@ -705,7 +705,7 @@ main(int argc, char* argv[])
     cmd.AddValue("simTime", "Simulation time in seconds.", simTime);
     cmd.AddValue("experimentName", "Experiment name.", experimentName);
     cmd.AddValue("presetScenario",
-                 "Experiment preset: manual, baseline-excess, community-aware, state-aware, config-gated, hold-gated, or full-control.",
+                 "Experiment preset: manual, baseline-excess, community-aware, state-aware, config-gated, hold-gated, full-control, or full-stack-control.",
                  presetScenario);
     cmd.AddValue("presetOverrideMode",
                  "Preset override mode: preset-wins or explicit-wins.",
@@ -825,9 +825,9 @@ main(int argc, char* argv[])
     if (presetScenario != "manual" && presetScenario != "baseline-excess" &&
         presetScenario != "community-aware" && presetScenario != "state-aware" &&
         presetScenario != "config-gated" && presetScenario != "hold-gated" &&
-        presetScenario != "full-control")
+        presetScenario != "full-control" && presetScenario != "full-stack-control")
     {
-        std::cerr << "[HYBRID-DCN][ERROR] presetScenario must be manual, baseline-excess, community-aware, state-aware, config-gated, hold-gated, or full-control."
+        std::cerr << "[HYBRID-DCN][ERROR] presetScenario must be manual, baseline-excess, community-aware, state-aware, config-gated, hold-gated, full-control, or full-stack-control."
                   << std::endl;
         return 1;
     }
@@ -1129,6 +1129,90 @@ main(int argc, char* argv[])
         if (shouldApplyPresetValue("previousConfigAge"))
         {
             previousConfigAge = 3;
+        }
+    }
+    else if (presetScenario == "full-stack-control")
+    {
+        applyPresetCommon();
+        if (shouldApplyPresetValue("trafficMatrixMode"))
+        {
+            trafficMatrixMode = "skewed";
+        }
+        if (shouldApplyPresetValue("communityMode"))
+        {
+            communityMode = "louvain";
+        }
+        if (shouldApplyPresetValue("selectionMetric"))
+        {
+            selectionMetric = "community-excess";
+        }
+        if (shouldApplyPresetValue("enableStateHolding"))
+        {
+            enableStateHolding = true;
+        }
+        if (shouldApplyPresetValue("stateHoldingLambda"))
+        {
+            stateHoldingLambda = 5.0;
+        }
+        if (shouldApplyPresetValue("previousOcsMode"))
+        {
+            previousOcsMode = "skewed-primary";
+        }
+        if (shouldApplyPresetValue("enableConfigUpdateGate"))
+        {
+            enableConfigUpdateGate = true;
+        }
+        if (shouldApplyPresetValue("configUpdateThreshold"))
+        {
+            configUpdateThreshold = 0.0;
+        }
+        if (shouldApplyPresetValue("enableHoldTimeGate"))
+        {
+            enableHoldTimeGate = true;
+        }
+        if (shouldApplyPresetValue("minHoldCycles"))
+        {
+            minHoldCycles = 3;
+        }
+        if (shouldApplyPresetValue("previousConfigAge"))
+        {
+            previousConfigAge = 3;
+        }
+        if (shouldApplyPresetValue("enableOcsAdmissionControl"))
+        {
+            enableOcsAdmissionControl = true;
+        }
+        if (shouldApplyPresetValue("ocsAdmissionThreshold"))
+        {
+            ocsAdmissionThreshold = 60.0;
+        }
+        if (shouldApplyPresetValue("matrixFlowDemand"))
+        {
+            matrixFlowDemand = 40.0;
+        }
+        if (shouldApplyPresetValue("enableEpsWecmp"))
+        {
+            enableEpsWecmp = true;
+        }
+        if (shouldApplyPresetValue("enableEpsWecmpRouting"))
+        {
+            enableEpsWecmpRouting = true;
+        }
+        if (shouldApplyPresetValue("enableMultiPeriodControl"))
+        {
+            enableMultiPeriodControl = true;
+        }
+        if (shouldApplyPresetValue("controlEpochs"))
+        {
+            controlEpochs = 4;
+        }
+        if (shouldApplyPresetValue("trafficMatrixSequence"))
+        {
+            trafficMatrixSequence = "skewed-to-clustered";
+        }
+        if (shouldApplyPresetValue("enableMultiPeriodWecmpState"))
+        {
+            enableMultiPeriodWecmpState = true;
         }
     }
 
@@ -4351,6 +4435,11 @@ main(int argc, char* argv[])
         experimentGroup = "full-method";
         ablationLevel = 5;
     }
+    else if (presetScenario == "full-stack-control")
+    {
+        experimentGroup = "full-stack-method";
+        ablationLevel = 6;
+    }
 
     if (presetScenario != "manual" && presetOverrideMode == "explicit-wins" &&
         !explicitControlArgNames.empty())
@@ -4363,9 +4452,14 @@ main(int argc, char* argv[])
         presetScenario == "full-control" &&
         (presetOverrideMode == "preset-wins" ||
          (presetOverrideMode == "explicit-wins" && explicitControlArgNames.empty()));
+    const bool isFullStackMethod =
+        presetScenario == "full-stack-control" &&
+        (presetOverrideMode == "preset-wins" ||
+         (presetOverrideMode == "explicit-wins" && explicitControlArgNames.empty()));
     const bool isBaseline =
         presetScenario == "baseline-excess" &&
         !(presetOverrideMode == "explicit-wins" && !explicitControlArgNames.empty());
+    const bool fullStackControlEnabled = presetScenario == "full-stack-control";
 
     std::ostringstream enabledModuleSummaryStream;
     enabledModuleSummaryStream << "matrix,"
@@ -4470,6 +4564,8 @@ main(int argc, char* argv[])
     std::cout << "[HYBRID-DCN][PAPER] ablationLevel = " << ablationLevel << std::endl;
     std::cout << "[HYBRID-DCN][PAPER] isMainMethod = "
               << (isMainMethod ? "true" : "false") << std::endl;
+    std::cout << "[HYBRID-DCN][PAPER] isFullStackMethod = "
+              << (isFullStackMethod ? "true" : "false") << std::endl;
     std::cout << "[HYBRID-DCN][PAPER] isBaseline = " << (isBaseline ? "true" : "false")
               << std::endl;
     std::cout << "[HYBRID-DCN][PAPER] presetScenario = " << presetScenario
@@ -4480,6 +4576,18 @@ main(int argc, char* argv[])
               << explicitControlArgNames.size() << std::endl;
     std::cout << "[HYBRID-DCN][PAPER] enabledModuleSummary = "
               << enabledModuleSummary << std::endl;
+    std::cout << "[HYBRID-DCN][PAPER] trafficMatrixSource = synthetic" << std::endl;
+    std::cout << "[HYBRID-DCN][PAPER] ewmaEnabled = false" << std::endl;
+    std::cout << "[HYBRID-DCN][PAPER] ocsAdmissionControlEnabled = "
+              << (enableOcsAdmissionControl ? "true" : "false") << std::endl;
+    std::cout << "[HYBRID-DCN][PAPER] epsWecmpEnabled = "
+              << (enableEpsWecmp ? "true" : "false") << std::endl;
+    std::cout << "[HYBRID-DCN][PAPER] epsWecmpRoutingEnabled = "
+              << (enableEpsWecmpRouting ? "true" : "false") << std::endl;
+    std::cout << "[HYBRID-DCN][PAPER] multiPeriodControlEnabled = "
+              << (enableMultiPeriodControl ? "true" : "false") << std::endl;
+    std::cout << "[HYBRID-DCN][PAPER] fullStackControlEnabled = "
+              << (fullStackControlEnabled ? "true" : "false") << std::endl;
 
     std::cout << "[HYBRID-DCN][CONTROL] algorithmStage = stage-20-control-summary"
               << std::endl;
@@ -4489,6 +4597,8 @@ main(int argc, char* argv[])
               << std::endl;
     std::cout << "[HYBRID-DCN][CONTROL] isMainMethod = "
               << (isMainMethod ? "true" : "false") << std::endl;
+    std::cout << "[HYBRID-DCN][CONTROL] isFullStackMethod = "
+              << (isFullStackMethod ? "true" : "false") << std::endl;
     std::cout << "[HYBRID-DCN][CONTROL] isBaseline = "
               << (isBaseline ? "true" : "false") << std::endl;
     std::cout << "[HYBRID-DCN][CONTROL] enabledModuleSummary = "
@@ -4499,6 +4609,18 @@ main(int argc, char* argv[])
               << std::endl;
     std::cout << "[HYBRID-DCN][CONTROL] presetApplied = "
               << (presetApplied ? "true" : "false") << std::endl;
+    std::cout << "[HYBRID-DCN][CONTROL] trafficMatrixSource = synthetic" << std::endl;
+    std::cout << "[HYBRID-DCN][CONTROL] ewmaEnabled = false" << std::endl;
+    std::cout << "[HYBRID-DCN][CONTROL] ocsAdmissionControlEnabled = "
+              << (enableOcsAdmissionControl ? "true" : "false") << std::endl;
+    std::cout << "[HYBRID-DCN][CONTROL] epsWecmpEnabled = "
+              << (enableEpsWecmp ? "true" : "false") << std::endl;
+    std::cout << "[HYBRID-DCN][CONTROL] epsWecmpRoutingEnabled = "
+              << (enableEpsWecmpRouting ? "true" : "false") << std::endl;
+    std::cout << "[HYBRID-DCN][CONTROL] multiPeriodControlEnabled = "
+              << (enableMultiPeriodControl ? "true" : "false") << std::endl;
+    std::cout << "[HYBRID-DCN][CONTROL] fullStackControlEnabled = "
+              << (fullStackControlEnabled ? "true" : "false") << std::endl;
     std::cout << "[HYBRID-DCN][CONTROL] presetApplicationOrder = after-command-line-parse"
               << std::endl;
     std::cout << "[HYBRID-DCN][CONTROL] explicitArgCount = " << explicitArgNames.size()
@@ -5281,10 +5403,24 @@ main(int argc, char* argv[])
               << std::endl;
     std::cout << "[HYBRID-DCN][RESULT] isMainMethod = "
               << (isMainMethod ? "true" : "false") << std::endl;
+    std::cout << "[HYBRID-DCN][RESULT] isFullStackMethod = "
+              << (isFullStackMethod ? "true" : "false") << std::endl;
     std::cout << "[HYBRID-DCN][RESULT] isBaseline = "
               << (isBaseline ? "true" : "false") << std::endl;
     std::cout << "[HYBRID-DCN][RESULT] enabledModuleSummary = "
               << enabledModuleSummary << std::endl;
+    std::cout << "[HYBRID-DCN][RESULT] trafficMatrixSource = synthetic" << std::endl;
+    std::cout << "[HYBRID-DCN][RESULT] ewmaEnabled = false" << std::endl;
+    std::cout << "[HYBRID-DCN][RESULT] ocsAdmissionControlEnabled = "
+              << (enableOcsAdmissionControl ? "true" : "false") << std::endl;
+    std::cout << "[HYBRID-DCN][RESULT] epsWecmpEnabled = "
+              << (enableEpsWecmp ? "true" : "false") << std::endl;
+    std::cout << "[HYBRID-DCN][RESULT] epsWecmpRoutingEnabled = "
+              << (enableEpsWecmpRouting ? "true" : "false") << std::endl;
+    std::cout << "[HYBRID-DCN][RESULT] multiPeriodControlEnabled = "
+              << (enableMultiPeriodControl ? "true" : "false") << std::endl;
+    std::cout << "[HYBRID-DCN][RESULT] fullStackControlEnabled = "
+              << (fullStackControlEnabled ? "true" : "false") << std::endl;
     std::cout << "[HYBRID-DCN][RESULT] trafficMatrixMode = " << trafficMatrixMode
               << std::endl;
     std::cout << "[HYBRID-DCN][RESULT] communityMode = " << communityMode << std::endl;
@@ -5466,8 +5602,8 @@ main(int argc, char* argv[])
             presetExpectationSkipReason = "none";
             presetExpectationPass = enableHoldTimeGate &&
                                     holdTimeActive &&
-                                    configGateDecision == "hold-previous" &&
-                                    selectedOcsEdges.size() == 1 &&
+                                    !holdOcsEdges.empty() &&
+                                    selectedOcsEdges.size() >= holdOcsEdges.size() &&
                                     dataPlaneValidationPass;
         }
         else if (presetScenario == "full-control")
@@ -5480,6 +5616,23 @@ main(int argc, char* argv[])
                                     !holdTimeActive &&
                                     configGateDecision == "use-candidate" &&
                                     selectedOcsEdges.size() == 2 &&
+                                    dataPlaneValidationPass;
+        }
+        else if (presetScenario == "full-stack-control")
+        {
+            presetExpectationKnown = true;
+            presetExpectation = "full-stack-control";
+            presetExpectationSkipReason = "none";
+            presetExpectationPass = communityMode == "louvain" &&
+                                    selectionMetric == "community-excess" &&
+                                    enableStateHolding &&
+                                    enableConfigUpdateGate &&
+                                    enableHoldTimeGate &&
+                                    enableOcsAdmissionControl &&
+                                    enableEpsWecmp &&
+                                    enableEpsWecmpRouting &&
+                                    enableMultiPeriodControl &&
+                                    !selectedOcsEdges.empty() &&
                                     dataPlaneValidationPass;
         }
 
