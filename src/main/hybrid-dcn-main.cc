@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <fstream>
 #include <iostream>
 #include <iterator>
 #include <limits>
@@ -162,6 +163,11 @@ struct MatrixBulkFlowSpec
     bool epsPathFrozen;
     int32_t frozenSpine;
     std::string name;
+    std::string fallbackDataPlaneMode = "synthetic-residual-flow-validation";
+    bool fallbackEventMapped = false;
+    std::string fallbackMappingType = "none";
+    double startTime = 0.0;
+    uint64_t expectedBytes = 0;
 };
 
 struct OcsAdmissionEvent
@@ -588,6 +594,7 @@ main(int argc, char* argv[])
     uint64_t matrixFlowMaxBytes = 524288;
     double matrixFlowStart = 0.35;
     uint16_t matrixFlowPortBase = 11000;
+    uint64_t matrixFlowRxBytesTolerance = 65536;
     bool enableOcsAdmissionControl = false;
     double ocsAdmissionThreshold = 100.0;
     double matrixFlowDemand = 40.0;
@@ -611,6 +618,8 @@ main(int argc, char* argv[])
     uint32_t detailedCandidateLogLimit = 20;
     bool enableDetailedFlowTrace = false;
     uint32_t detailedFlowLogLimit = 50;
+    bool enableStructuredResultExport = false;
+    std::string structuredResultDir = "../sim/results/raw";
     bool enableResultValidation = true;
     std::string validationMode = "warn";
 
@@ -672,6 +681,7 @@ main(int argc, char* argv[])
             "matrixFlowMaxBytes",
             "matrixFlowStart",
             "matrixFlowPortBase",
+            "matrixFlowRxBytesTolerance",
             "enableEwmaSmoothing",
             "ewmaBeta",
             "trafficMatrixSource",
@@ -841,6 +851,9 @@ main(int argc, char* argv[])
     cmd.AddValue("matrixFlowMaxBytes", "MaxBytes for each matrix-generated BulkSend flow.", matrixFlowMaxBytes);
     cmd.AddValue("matrixFlowStart", "Start time for matrix-generated BulkSend flows in seconds.", matrixFlowStart);
     cmd.AddValue("matrixFlowPortBase", "Base TCP port for matrix-generated PacketSink applications.", matrixFlowPortBase);
+    cmd.AddValue("matrixFlowRxBytesTolerance",
+                 "Allowed matrix-flow Rx byte overshoot for result invariants.",
+                 matrixFlowRxBytesTolerance);
     cmd.AddValue("enableOcsAdmissionControl",
                  "Enable OCS matrix-flow capacity admission control.",
                  enableOcsAdmissionControl);
@@ -902,6 +915,12 @@ main(int argc, char* argv[])
     cmd.AddValue("detailedFlowLogLimit",
                  "Maximum number of detailed flow diagnostics to print.",
                  detailedFlowLogLimit);
+    cmd.AddValue("enableStructuredResultExport",
+                 "Write structured summary, flow, WECMP, and OCS-candidate CSV outputs.",
+                 enableStructuredResultExport);
+    cmd.AddValue("structuredResultDir",
+                 "Directory for structured result CSV outputs.",
+                 structuredResultDir);
     cmd.AddValue("enableResultValidation",
                  "Enable Stage-24 result consistency validation logs.",
                  enableResultValidation);
@@ -4282,7 +4301,9 @@ main(int argc, char* argv[])
     {
         for (uint32_t flowIndex = 0; flowIndex < matrixFlowSpecs.size(); ++flowIndex)
         {
-            const auto& spec = matrixFlowSpecs[flowIndex];
+            auto& spec = matrixFlowSpecs[flowIndex];
+            spec.startTime = matrixFlowStart + (0.02 * static_cast<double>(flowIndex));
+            spec.expectedBytes = matrixFlowMaxBytes;
             Address sinkAddress(InetSocketAddress(Ipv4Address::GetAny(), spec.port));
             PacketSinkHelper matrixPacketSink("ns3::TcpSocketFactory", sinkAddress);
             ApplicationContainer sinkApps = matrixPacketSink.Install(
@@ -4298,10 +4319,10 @@ main(int argc, char* argv[])
             Address remoteAddress(
                 InetSocketAddress(serverIpv4[spec.dstLeaf][spec.dstServer], spec.port));
             BulkSendHelper matrixBulkSender("ns3::TcpSocketFactory", remoteAddress);
-            matrixBulkSender.SetAttribute("MaxBytes", UintegerValue(matrixFlowMaxBytes));
+            matrixBulkSender.SetAttribute("MaxBytes", UintegerValue(spec.expectedBytes));
             ApplicationContainer bulkApps =
                 matrixBulkSender.Install(servers.Get(serverIndex(spec.srcLeaf, spec.srcServer)));
-            bulkApps.Start(Seconds(matrixFlowStart + (0.02 * static_cast<double>(flowIndex))));
+            bulkApps.Start(Seconds(spec.startTime));
             bulkApps.Stop(Seconds(simTime));
         }
     }
@@ -4450,6 +4471,8 @@ main(int argc, char* argv[])
               << (enableMatrixFlows ? matrixFlowStart : 0.0) << " s" << std::endl;
     std::cout << "[HYBRID-DCN] matrixFlowPortBase     = "
               << (enableMatrixFlows ? matrixFlowPortBase : 0) << std::endl;
+    std::cout << "[HYBRID-DCN] matrixFlowRxBytesTolerance = "
+              << matrixFlowRxBytesTolerance << std::endl;
 
     uint32_t ocsCoveredFlows = 0;
     uint32_t admissionControlledAdmittedFlows = 0;
@@ -4490,6 +4513,42 @@ main(int argc, char* argv[])
         enableOcsAdmissionControl ? admissionControlledAdmittedFlows : 0;
     const uint32_t ocsPairAvailableFlows =
         admissionControlledAdmittedFlows + directOcsFlows + admissionFallbackFlows;
+    const std::string fallbackDataPlaneMode = "synthetic-residual-flow-validation";
+    uint32_t fallbackMatrixFlowCount = 0;
+    for (auto& spec : matrixFlowSpecs)
+    {
+        if (spec.epsFallback ||
+            (admissionFallbackFlows > 0 && !spec.ocsCovered && spec.realResidualDemand > 0))
+        {
+            fallbackMatrixFlowCount++;
+        }
+    }
+    std::string fallbackEventToMatrixFlowMapping = "none";
+    if (admissionFallbackFlows > 0)
+    {
+        fallbackEventToMatrixFlowMapping =
+            fallbackMatrixFlowCount > 0 ? "synthetic-residual" : "none";
+    }
+    for (auto& spec : matrixFlowSpecs)
+    {
+        spec.fallbackDataPlaneMode = fallbackDataPlaneMode;
+        if (spec.epsFallback)
+        {
+            spec.fallbackEventMapped = true;
+            spec.fallbackMappingType = "direct";
+        }
+        else if (fallbackEventToMatrixFlowMapping == "synthetic-residual" &&
+                 !spec.ocsCovered && spec.realResidualDemand > 0)
+        {
+            spec.fallbackEventMapped = true;
+            spec.fallbackMappingType = "synthetic-residual";
+        }
+        else
+        {
+            spec.fallbackEventMapped = false;
+            spec.fallbackMappingType = "none";
+        }
+    }
 
     std::cout << "[HYBRID-DCN][ADMISSION] enabled = "
               << (enableOcsAdmissionControl ? "true" : "false") << std::endl;
@@ -4500,6 +4559,14 @@ main(int argc, char* argv[])
               << std::endl;
     std::cout << "[HYBRID-DCN][ADMISSION] matrixFlowDemand = " << matrixFlowDemand
               << std::endl;
+    std::cout << "[HYBRID-DCN][ADMISSION] fallbackDataPlaneMode = "
+              << fallbackDataPlaneMode << std::endl;
+    std::cout << "[HYBRID-DCN][ADMISSION] fallbackEventCount = "
+              << admissionFallbackFlows << std::endl;
+    std::cout << "[HYBRID-DCN][ADMISSION] fallbackMatrixFlowCount = "
+              << fallbackMatrixFlowCount << std::endl;
+    std::cout << "[HYBRID-DCN][ADMISSION] fallbackEventToMatrixFlowMapping = "
+              << fallbackEventToMatrixFlowMapping << std::endl;
     std::cout << "[HYBRID-DCN][ADMISSION] ocsCoveredFlows = " << ocsCoveredFlows
               << std::endl;
     std::cout << "[HYBRID-DCN][ADMISSION] ocsPairAvailableFlows = "
@@ -5589,6 +5656,56 @@ main(int argc, char* argv[])
         return stream.str();
     };
 
+    std::vector<uint32_t> replayOcsDegree(numLeaves, 0);
+    std::vector<OcsCandidateEdge> replaySelectedEdges;
+    std::vector<std::string> replayRejectReasons(candidateEdges.size(),
+                                                 "not-selected-greedy-order");
+    for (const auto& holdEdge : holdOcsEdges)
+    {
+        replaySelectedEdges.push_back(holdEdge);
+        if (holdEdge.leafA < numLeaves)
+        {
+            replayOcsDegree[holdEdge.leafA]++;
+        }
+        if (holdEdge.leafB < numLeaves)
+        {
+            replayOcsDegree[holdEdge.leafB]++;
+        }
+    }
+    for (uint32_t candidateIndex = 0; candidateIndex < candidateEdges.size();
+         ++candidateIndex)
+    {
+        const auto& edge = candidateEdges[candidateIndex];
+        if (isEdgeInSet(holdOcsEdges, edge.leafA, edge.leafB))
+        {
+            replayRejectReasons[candidateIndex] = "hard-hold-preserved";
+            continue;
+        }
+        if (edge.selectionScore <= 0)
+        {
+            replayRejectReasons[candidateIndex] = "non-positive-score";
+            continue;
+        }
+        if (replaySelectedEdges.size() >= maxSelectedOcsLinks)
+        {
+            replayRejectReasons[candidateIndex] = "max-selected-links";
+            continue;
+        }
+        if (replayOcsDegree[edge.leafA] >= ocsPortK ||
+            replayOcsDegree[edge.leafB] >= ocsPortK)
+        {
+            replayRejectReasons[candidateIndex] = "ocs-port-budget";
+            continue;
+        }
+
+        replaySelectedEdges.push_back(edge);
+        replayOcsDegree[edge.leafA]++;
+        replayOcsDegree[edge.leafB]++;
+        replayRejectReasons[candidateIndex] = "selected";
+    }
+    const bool greedyReplayMatchesSelected =
+        makeEdgeSet(replaySelectedEdges) == makeEdgeSet(selectedOcsEdges);
+
     if (enableDetailedAlgorithmTrace)
     {
         std::cout << "[HYBRID-DCN][TRACE] enableDetailedAlgorithmTrace = true"
@@ -5647,56 +5764,6 @@ main(int argc, char* argv[])
             }
         }
 
-        std::vector<uint32_t> replayOcsDegree(numLeaves, 0);
-        std::vector<OcsCandidateEdge> replaySelectedEdges;
-        std::vector<std::string> replayRejectReasons(candidateEdges.size(),
-                                                     "not-selected-greedy-order");
-        for (const auto& holdEdge : holdOcsEdges)
-        {
-            replaySelectedEdges.push_back(holdEdge);
-            if (holdEdge.leafA < numLeaves)
-            {
-                replayOcsDegree[holdEdge.leafA]++;
-            }
-            if (holdEdge.leafB < numLeaves)
-            {
-                replayOcsDegree[holdEdge.leafB]++;
-            }
-        }
-        for (uint32_t candidateIndex = 0; candidateIndex < candidateEdges.size();
-             ++candidateIndex)
-        {
-            const auto& edge = candidateEdges[candidateIndex];
-            if (isEdgeInSet(holdOcsEdges, edge.leafA, edge.leafB))
-            {
-                replayRejectReasons[candidateIndex] = "hard-hold-preserved";
-                continue;
-            }
-            if (edge.selectionScore <= 0)
-            {
-                replayRejectReasons[candidateIndex] = "non-positive-score";
-                continue;
-            }
-            if (replaySelectedEdges.size() >= maxSelectedOcsLinks)
-            {
-                replayRejectReasons[candidateIndex] = "max-selected-links";
-                continue;
-            }
-            if (replayOcsDegree[edge.leafA] >= ocsPortK ||
-                replayOcsDegree[edge.leafB] >= ocsPortK)
-            {
-                replayRejectReasons[candidateIndex] = "ocs-port-budget";
-                continue;
-            }
-
-            replaySelectedEdges.push_back(edge);
-            replayOcsDegree[edge.leafA]++;
-            replayOcsDegree[edge.leafB]++;
-            replayRejectReasons[candidateIndex] = "selected";
-        }
-
-        const bool greedyReplayMatchesSelected =
-            makeEdgeSet(replaySelectedEdges) == makeEdgeSet(selectedOcsEdges);
         std::cout << "[HYBRID-DCN][TRACE] greedyReplayMatchesSelected = "
                   << (greedyReplayMatchesSelected ? "true" : "false") << std::endl;
         std::cout << "[HYBRID-DCN][TRACE] replaySelectedEdgeSet = "
@@ -6049,6 +6116,20 @@ main(int argc, char* argv[])
         std::cout << "[HYBRID-DCN][RESIDUAL] avgGoodputMbps   = 0 Mbps" << std::endl;
     }
 
+    auto isMatrixFlowCompleted =
+        [](const MatrixBulkFlowSpec& spec, const MatrixBulkFlowStats& stats) {
+            return spec.expectedBytes > 0 && stats.rxBytes >= spec.expectedBytes;
+        };
+    auto computeMatrixFlowCompletionRatio =
+        [](const MatrixBulkFlowSpec& spec, const MatrixBulkFlowStats& stats) {
+            if (spec.expectedBytes == 0)
+            {
+                return 0.0;
+            }
+            return static_cast<double>(stats.rxBytes) /
+                   static_cast<double>(spec.expectedBytes);
+        };
+
     std::cout << "[HYBRID-DCN][MATRIX-FLOW] enabled          = "
               << (enableMatrixFlows ? "true" : "false") << std::endl;
     if (enableMatrixFlows)
@@ -6069,7 +6150,7 @@ main(int argc, char* argv[])
             {
                 residualFlows++;
             }
-            if (stats.rxBytes >= matrixFlowMaxBytes)
+            if (isMatrixFlowCompleted(spec, stats))
             {
                 completedFlows++;
             }
@@ -6102,7 +6183,7 @@ main(int argc, char* argv[])
         {
             const auto& spec = matrixFlowSpecs[flowIndex];
             const auto& stats = matrixFlowStats[flowIndex];
-            const bool completed = stats.rxBytes >= matrixFlowMaxBytes;
+            const bool completed = isMatrixFlowCompleted(spec, stats);
             std::cout << "[HYBRID-DCN][MATRIX-FLOW] flow[" << flowIndex
                       << "] name=" << spec.name
                       << " src=" << makeServerName(spec.srcLeaf, spec.srcServer)
@@ -6136,13 +6217,13 @@ main(int argc, char* argv[])
         {
             const auto& spec = matrixFlowSpecs[flowIndex];
             const auto& stats = matrixFlowStats[flowIndex];
-            const bool completed = stats.rxBytes >= matrixFlowMaxBytes;
+            const bool completed = isMatrixFlowCompleted(spec, stats);
+            const double completionRatio = computeMatrixFlowCompletionRatio(spec, stats);
             const double firstRx = stats.seenFirstRx ? stats.firstRxTime : 0.0;
             const double lastRx = stats.seenFirstRx ? stats.lastRxTime : 0.0;
             const double duration = lastRx > firstRx ? (lastRx - firstRx) : 0.0;
             const double goodputMbps =
                 duration > 0 ? static_cast<double>(stats.rxBytes) * 8.0 / duration / 1e6 : 0.0;
-            const double flowStart = matrixFlowStart + (0.02 * static_cast<double>(flowIndex));
 
             std::cout << "[HYBRID-DCN][FLOW-TRACE] flow[" << flowIndex
                       << "] name = " << spec.name << std::endl;
@@ -6174,6 +6255,15 @@ main(int argc, char* argv[])
                       << "] fallbackToEps = " << (spec.epsFallback ? "true" : "false")
                       << std::endl;
             std::cout << "[HYBRID-DCN][FLOW-TRACE] flow[" << flowIndex
+                      << "] fallbackDataPlaneMode = " << spec.fallbackDataPlaneMode
+                      << std::endl;
+            std::cout << "[HYBRID-DCN][FLOW-TRACE] flow[" << flowIndex
+                      << "] fallbackEventMapped = "
+                      << (spec.fallbackEventMapped ? "true" : "false") << std::endl;
+            std::cout << "[HYBRID-DCN][FLOW-TRACE] flow[" << flowIndex
+                      << "] fallbackMappingType = " << spec.fallbackMappingType
+                      << std::endl;
+            std::cout << "[HYBRID-DCN][FLOW-TRACE] flow[" << flowIndex
                       << "] plannedResidualDemand = " << spec.plannedResidualDemand
                       << std::endl;
             std::cout << "[HYBRID-DCN][FLOW-TRACE] flow[" << flowIndex
@@ -6188,13 +6278,17 @@ main(int argc, char* argv[])
             std::cout << "[HYBRID-DCN][FLOW-TRACE] flow[" << flowIndex
                       << "] packetSinkPort = " << spec.port << std::endl;
             std::cout << "[HYBRID-DCN][FLOW-TRACE] flow[" << flowIndex
-                      << "] bulkStart = " << flowStart << std::endl;
+                      << "] bulkStart = " << spec.startTime << std::endl;
             std::cout << "[HYBRID-DCN][FLOW-TRACE] flow[" << flowIndex
                       << "] maxBytes = " << matrixFlowMaxBytes << std::endl;
+            std::cout << "[HYBRID-DCN][FLOW-TRACE] flow[" << flowIndex
+                      << "] expectedBytes = " << spec.expectedBytes << std::endl;
             std::cout << "[HYBRID-DCN][FLOW-TRACE] flow[" << flowIndex
                       << "] rxBytes = " << stats.rxBytes << std::endl;
             std::cout << "[HYBRID-DCN][FLOW-TRACE] flow[" << flowIndex
                       << "] completed = " << (completed ? "true" : "false") << std::endl;
+            std::cout << "[HYBRID-DCN][FLOW-TRACE] flow[" << flowIndex
+                      << "] completionRatio = " << completionRatio << std::endl;
             std::cout << "[HYBRID-DCN][FLOW-TRACE] flow[" << flowIndex
                       << "] firstRx = " << firstRx << std::endl;
             std::cout << "[HYBRID-DCN][FLOW-TRACE] flow[" << flowIndex
@@ -6236,7 +6330,7 @@ main(int argc, char* argv[])
             resultResidualMatrixRxBytes += stats.rxBytes;
         }
 
-        if (stats.rxBytes >= matrixFlowMaxBytes)
+        if (isMatrixFlowCompleted(spec, stats))
         {
             resultCompletedFlows++;
         }
@@ -6384,12 +6478,15 @@ main(int argc, char* argv[])
               << resultResidualMatrixRxBytes << std::endl;
     std::cout << "[HYBRID-DCN][RESULT] matrixAggregateGoodputMbps = "
               << resultMatrixAggregateGoodputMbps << std::endl;
+    std::cout << "[HYBRID-DCN][RESULT] matrixFlowRxBytesTolerance = "
+              << matrixFlowRxBytesTolerance << std::endl;
 
     for (uint32_t flowIndex = 0; flowIndex < matrixFlowSpecs.size(); ++flowIndex)
     {
         const auto& spec = matrixFlowSpecs[flowIndex];
         const auto& stats = matrixFlowStats[flowIndex];
-        const bool completed = stats.rxBytes >= matrixFlowMaxBytes;
+        const bool completed = isMatrixFlowCompleted(spec, stats);
+        const double completionRatio = computeMatrixFlowCompletionRatio(spec, stats);
         const double firstRx = stats.seenFirstRx ? stats.firstRxTime : 0.0;
         const double lastRx = stats.seenFirstRx ? stats.lastRxTime : 0.0;
         const double duration = lastRx > firstRx ? (lastRx - firstRx) : 0.0;
@@ -6399,8 +6496,10 @@ main(int argc, char* argv[])
                   << "] name=" << spec.name
                   << " pair=" << spec.srcLeaf << "-" << spec.dstLeaf
                   << " ocsCovered=" << (spec.ocsCovered ? "true" : "false")
+                  << " expectedBytes=" << spec.expectedBytes
                   << " rxBytes=" << stats.rxBytes
                   << " completed=" << (completed ? "true" : "false")
+                  << " completionRatio=" << completionRatio
                   << " firstRx=" << firstRx
                   << " lastRx=" << lastRx
                   << " duration=" << duration
@@ -6442,6 +6541,8 @@ main(int argc, char* argv[])
     std::cout << "[HYBRID-DCN][RESULT] dataPlaneValidationPass = "
               << (dataPlaneValidationPass ? "true" : "false") << std::endl;
 
+    std::string overallResultConsistencyStatus =
+        (enableResultValidation && validationMode == "warn") ? "not-run" : "skipped";
     std::cout << "[HYBRID-DCN][VALIDATION] enabled = "
               << (enableResultValidation ? "true" : "false") << std::endl;
     std::cout << "[HYBRID-DCN][VALIDATION] validationMode = " << validationMode
@@ -6637,7 +6738,367 @@ main(int argc, char* argv[])
                   << baselineConsistency << std::endl;
         std::cout << "[HYBRID-DCN][VALIDATION] overallResultConsistency = "
                   << passFail(overallResultConsistency) << std::endl;
+        overallResultConsistencyStatus = passFail(overallResultConsistency);
     }
+
+    auto csvEscape = [](const std::string& value) {
+        const bool needsQuotes = value.find_first_of(",\"\n\r") != std::string::npos;
+        if (!needsQuotes)
+        {
+            return value;
+        }
+
+        std::ostringstream escaped;
+        escaped << '"';
+        for (const char ch : value)
+        {
+            if (ch == '"')
+            {
+                escaped << "\"\"";
+            }
+            else
+            {
+                escaped << ch;
+            }
+        }
+        escaped << '"';
+        return escaped.str();
+    };
+    auto csvBool = [](bool value) {
+        return value ? std::string("true") : std::string("false");
+    };
+    auto csvValue = [](const auto& value) {
+        std::ostringstream stream;
+        stream << value;
+        return stream.str();
+    };
+    auto writeCsvRow = [&](std::ofstream& file, const std::vector<std::string>& values) {
+        for (std::size_t valueIndex = 0; valueIndex < values.size(); ++valueIndex)
+        {
+            if (valueIndex > 0)
+            {
+                file << ",";
+            }
+            file << csvEscape(values[valueIndex]);
+        }
+        file << "\n";
+    };
+    auto joinCsvPath = [](const std::string& directory, const std::string& fileName) {
+        if (directory.empty() || directory[directory.size() - 1] == '/')
+        {
+            return directory + fileName;
+        }
+        return directory + "/" + fileName;
+    };
+
+    const std::string summaryCsvPath =
+        joinCsvPath(structuredResultDir, experimentName + "-summary.csv");
+    const std::string flowsCsvPath =
+        joinCsvPath(structuredResultDir, experimentName + "-flows.csv");
+    const std::string wecmpCsvPath =
+        joinCsvPath(structuredResultDir, experimentName + "-wecmp.csv");
+    const std::string ocsCandidatesCsvPath =
+        joinCsvPath(structuredResultDir, experimentName + "-ocs-candidates.csv");
+    bool structuredExportCheck = !enableStructuredResultExport;
+    bool structuredExportEvaluated = false;
+
+    auto runStructuredResultExport = [&](const std::string& overallAlgorithmInvariantStatus) {
+        if (structuredExportEvaluated)
+        {
+            return structuredExportCheck;
+        }
+        structuredExportEvaluated = true;
+
+        std::cout << "[HYBRID-DCN][EXPORT] enabled = "
+                  << (enableStructuredResultExport ? "true" : "false") << std::endl;
+        std::cout << "[HYBRID-DCN][EXPORT] summaryCsv = " << summaryCsvPath
+                  << std::endl;
+        std::cout << "[HYBRID-DCN][EXPORT] flowsCsv = " << flowsCsvPath << std::endl;
+        std::cout << "[HYBRID-DCN][EXPORT] wecmpCsv = " << wecmpCsvPath << std::endl;
+        std::cout << "[HYBRID-DCN][EXPORT] ocsCandidatesCsv = "
+                  << ocsCandidatesCsvPath << std::endl;
+
+        if (!enableStructuredResultExport)
+        {
+            std::cout << "[HYBRID-DCN][EXPORT] exportSuccess = false" << std::endl;
+            structuredExportCheck = true;
+            return structuredExportCheck;
+        }
+
+        bool exportSuccess = true;
+        auto openCsv = [&](const std::string& path) {
+            std::ofstream file(path);
+            if (!file.is_open())
+            {
+                exportSuccess = false;
+                std::cout << "[HYBRID-DCN][EXPORT] error = failed-to-open:" << path
+                          << std::endl;
+            }
+            return file;
+        };
+
+        {
+            std::ofstream file = openCsv(summaryCsvPath);
+            if (file.is_open())
+            {
+                writeCsvRow(file,
+                            {"experimentName",
+                             "presetScenario",
+                             "trafficMatrixMode",
+                             "trafficMatrixSource",
+                             "enableEwmaSmoothing",
+                             "configScoreMode",
+                             "selectionMetric",
+                             "communityMode",
+                             "activeCommunityCount",
+                             "modularityQ",
+                             "selectedOcsEdges",
+                             "candidateConfigScore",
+                             "previousConfigScore",
+                             "configScoreImprovement",
+                             "ocsCoveredFlowCount",
+                             "epsResidualFlowCount",
+                             "fallbackFlowCount",
+                             "wecmpFrozenFlowCount",
+                             "ocsTxBytes",
+                             "epsTxBytes",
+                             "ocsObservedUse",
+                             "epsObservedUse",
+                             "matrixFlowCount",
+                             "completedFlows",
+                             "completionRatio",
+                             "avgGoodputMbps",
+                             "overallResultConsistency",
+                             "overallAlgorithmInvariant"});
+                writeCsvRow(file,
+                            {experimentName,
+                             presetScenario,
+                             trafficMatrixMode,
+                             trafficMatrixSource,
+                             csvBool(enableEwmaSmoothing),
+                             configScoreMode,
+                             selectionMetric,
+                             communityMode,
+                             csvValue(activeCommunityCount),
+                             csvValue(louvainResult.modularityQ),
+                             formatEdgeSet(selectedOcsEdges),
+                             csvValue(candidateConfigScore),
+                             csvValue(previousConfigScore),
+                             csvValue(configScoreImprovement),
+                             csvValue(resultCoveredFlows),
+                             csvValue(resultResidualFlows),
+                             csvValue(admissionFallbackFlows),
+                             csvValue(resultWecmpFrozenFlows),
+                             csvValue(g_ocsTxBytes),
+                             csvValue(g_epsTxBytes),
+                             csvBool(resultOcsObservedUse),
+                             csvBool(resultEpsObservedUse),
+                             csvValue(matrixFlowSpecs.size()),
+                             csvValue(resultCompletedFlows),
+                             csvValue(matrixFlowSpecs.empty()
+                                          ? 0.0
+                                          : static_cast<double>(resultCompletedFlows) /
+                                                static_cast<double>(matrixFlowSpecs.size())),
+                             csvValue(resultMatrixAggregateGoodputMbps),
+                             overallResultConsistencyStatus,
+                             overallAlgorithmInvariantStatus});
+                if (!file.good())
+                {
+                    exportSuccess = false;
+                    std::cout << "[HYBRID-DCN][EXPORT] error = failed-to-write:"
+                              << summaryCsvPath << std::endl;
+                }
+            }
+        }
+
+        {
+            std::ofstream file = openCsv(flowsCsvPath);
+            if (file.is_open())
+            {
+                writeCsvRow(file,
+                            {"flowIndex",
+                             "name",
+                             "srcLeaf",
+                             "dstLeaf",
+                             "rawDemand",
+                             "controlDemand",
+                             "ocsPairInstalled",
+                             "admissionMode",
+                             "ocsAdmitted",
+                             "ocsCovered",
+                             "fallbackToEps",
+                             "fallbackDataPlaneMode",
+                             "fallbackEventMapped",
+                             "fallbackMappingType",
+                             "plannedResidualDemand",
+                             "realResidualDemand",
+                             "wecmpResidualDemand",
+                             "epsPathFrozen",
+                             "frozenSpine",
+                             "packetSinkPort",
+                             "startTime",
+                             "expectedBytes",
+                             "rxBytes",
+                             "completed",
+                             "completionRatio",
+                             "firstRx",
+                             "lastRx",
+                             "goodputMbps"});
+                for (uint32_t flowIndex = 0; flowIndex < matrixFlowSpecs.size(); ++flowIndex)
+                {
+                    const auto& spec = matrixFlowSpecs[flowIndex];
+                    const auto& stats = matrixFlowStats[flowIndex];
+                    const double firstRx = stats.seenFirstRx ? stats.firstRxTime : 0.0;
+                    const double lastRx = stats.seenFirstRx ? stats.lastRxTime : 0.0;
+                    const double duration = lastRx > firstRx ? (lastRx - firstRx) : 0.0;
+                    const double goodputMbps =
+                        duration > 0
+                            ? static_cast<double>(stats.rxBytes) * 8.0 / duration / 1e6
+                            : 0.0;
+                    writeCsvRow(file,
+                                {csvValue(flowIndex),
+                                 spec.name,
+                                 csvValue(spec.srcLeaf),
+                                 csvValue(spec.dstLeaf),
+                                 csvValue(rawTrafficMatrix[spec.srcLeaf][spec.dstLeaf]),
+                                 csvValue(controlTrafficMatrix[spec.srcLeaf][spec.dstLeaf]),
+                                 csvBool(isOcsPairInstalled(spec.srcLeaf, spec.dstLeaf)),
+                                 enableOcsAdmissionControl ? "controlled"
+                                                           : "disabled-direct-ocs",
+                                 csvBool(spec.ocsAdmitted),
+                                 csvBool(spec.ocsCovered),
+                                 csvBool(spec.epsFallback),
+                                 spec.fallbackDataPlaneMode,
+                                 csvBool(spec.fallbackEventMapped),
+                                 spec.fallbackMappingType,
+                                 csvValue(spec.plannedResidualDemand),
+                                 csvValue(spec.realResidualDemand),
+                                 csvValue(spec.wecmpResidualDemand),
+                                 csvBool(spec.epsPathFrozen),
+                                 csvValue(spec.frozenSpine),
+                                 csvValue(spec.port),
+                                 csvValue(spec.startTime),
+                                 csvValue(spec.expectedBytes),
+                                 csvValue(stats.rxBytes),
+                                 csvBool(isMatrixFlowCompleted(spec, stats)),
+                                 csvValue(computeMatrixFlowCompletionRatio(spec, stats)),
+                                 csvValue(firstRx),
+                                 csvValue(lastRx),
+                                 csvValue(goodputMbps)});
+                }
+                if (!file.good())
+                {
+                    exportSuccess = false;
+                    std::cout << "[HYBRID-DCN][EXPORT] error = failed-to-write:"
+                              << flowsCsvPath << std::endl;
+                }
+            }
+        }
+
+        {
+            std::ofstream file = openCsv(wecmpCsvPath);
+            if (file.is_open())
+            {
+                writeCsvRow(file,
+                            {"decisionIndex",
+                             "srcLeaf",
+                             "dstLeaf",
+                             "residualDemand",
+                             "selectedSpine",
+                             "spineIndex",
+                             "pathLoadMetric",
+                             "candidatePathLoad",
+                             "attractiveness",
+                             "normalizedAttractiveness",
+                             "targetProbability",
+                             "previousProbability",
+                             "updatedProbability",
+                             "probabilityDelta",
+                             "boundedProbabilityDelta"});
+                for (uint32_t decisionIndex = 0; decisionIndex < epsWecmpDecisions.size();
+                     ++decisionIndex)
+                {
+                    const auto& decision = epsWecmpDecisions[decisionIndex];
+                    for (const auto& state : decision.linkStates)
+                    {
+                        writeCsvRow(file,
+                                    {csvValue(decisionIndex),
+                                     csvValue(decision.srcLeaf),
+                                     csvValue(decision.dstLeaf),
+                                     csvValue(decision.residualDemand),
+                                     csvValue(decision.selectedSpine),
+                                     csvValue(state.spineIndex),
+                                     csvValue(state.pathLoadMetric),
+                                     csvValue(state.candidatePathLoad),
+                                     csvValue(state.attractiveness),
+                                     csvValue(state.normalizedAttractiveness),
+                                     csvValue(state.targetProbability),
+                                     csvValue(state.previousProbability),
+                                     csvValue(state.updatedProbability),
+                                     csvValue(state.probabilityDelta),
+                                     csvValue(state.boundedProbabilityDelta)});
+                    }
+                }
+                if (!file.good())
+                {
+                    exportSuccess = false;
+                    std::cout << "[HYBRID-DCN][EXPORT] error = failed-to-write:"
+                              << wecmpCsvPath << std::endl;
+                }
+            }
+        }
+
+        {
+            std::ofstream file = openCsv(ocsCandidatesCsvPath);
+            if (file.is_open())
+            {
+                writeCsvRow(file,
+                            {"candidateIndex",
+                             "leafA",
+                             "leafB",
+                             "traffic",
+                             "expected",
+                             "modularityGain",
+                             "utility",
+                             "communityFactor",
+                             "stateHoldingGain",
+                             "selectionScore",
+                             "selected",
+                             "rejectReason"});
+                for (uint32_t candidateIndex = 0; candidateIndex < candidateEdges.size();
+                     ++candidateIndex)
+                {
+                    const auto& edge = candidateEdges[candidateIndex];
+                    writeCsvRow(file,
+                                {csvValue(candidateIndex),
+                                 csvValue(edge.leafA),
+                                 csvValue(edge.leafB),
+                                 csvValue(edge.traffic),
+                                 csvValue(edge.expected),
+                                 csvValue(edge.modularityGain),
+                                 csvValue(edge.utility),
+                                 csvValue(edge.communityFactor),
+                                 csvValue(edge.stateHoldingGain),
+                                 csvValue(edge.selectionScore),
+                                 csvBool(isEdgeInSet(replaySelectedEdges,
+                                                     edge.leafA,
+                                                     edge.leafB)),
+                                 replayRejectReasons[candidateIndex]});
+                }
+                if (!file.good())
+                {
+                    exportSuccess = false;
+                    std::cout << "[HYBRID-DCN][EXPORT] error = failed-to-write:"
+                              << ocsCandidatesCsvPath << std::endl;
+                }
+            }
+        }
+
+        structuredExportCheck = exportSuccess;
+        std::cout << "[HYBRID-DCN][EXPORT] exportSuccess = "
+                  << (exportSuccess ? "true" : "false") << std::endl;
+        return structuredExportCheck;
+    };
 
     std::cout << "[HYBRID-DCN][INVARIANT] enabled = "
               << (enableAlgorithmInvariantCheck ? "true" : "false") << std::endl;
@@ -7106,13 +7567,11 @@ main(int argc, char* argv[])
                 {
                     matrixFlowPortUniquenessCheck = false;
                 }
-                const double flowStart =
-                    matrixFlowStart + (0.02 * static_cast<double>(flowIndex));
-                if (flowStart >= simTime)
+                if (spec.startTime >= simTime)
                 {
                     matrixFlowStartBeforeStopCheck = false;
                 }
-                if (stats.rxBytes > matrixFlowMaxBytes + 65536)
+                if (stats.rxBytes > spec.expectedBytes + matrixFlowRxBytesTolerance)
                 {
                     matrixFlowRxBytesBoundCheck = false;
                 }
@@ -7179,6 +7638,8 @@ main(int argc, char* argv[])
                   << invariantStatus(matrixFlowStartBeforeStopCheck) << std::endl;
         std::cout << "[HYBRID-DCN][INVARIANT] matrixFlowRxBytesBoundCheck = "
                   << invariantStatus(matrixFlowRxBytesBoundCheck) << std::endl;
+        std::cout << "[HYBRID-DCN][INVARIANT] matrixFlowRxBytesTolerance = "
+                  << matrixFlowRxBytesTolerance << std::endl;
         std::cout << "[HYBRID-DCN][INVARIANT] ocsCoveredFlowsHaveInstalledPairCheck = "
                   << invariantStatus(ocsCoveredFlowsHaveInstalledPairCheck) << std::endl;
         std::cout << "[HYBRID-DCN][INVARIANT] fallbackFlowsAreResidualCheck = "
@@ -7190,6 +7651,16 @@ main(int argc, char* argv[])
         std::cout << "[HYBRID-DCN][INVARIANT] resultGoodputFiniteCheck = "
                   << invariantStatus(resultGoodputFiniteCheck) << std::endl;
 
+        structuredExportCheck = runStructuredResultExport(invariantStatus(overallAlgorithmInvariant));
+        if (enableStructuredResultExport)
+        {
+            updateOverallInvariant(overallAlgorithmInvariant, structuredExportCheck);
+        }
+        std::cout << "[HYBRID-DCN][INVARIANT] structuredExportCheck = "
+                  << (enableStructuredResultExport ? invariantStatus(structuredExportCheck)
+                                                   : "skipped")
+                  << std::endl;
+
         std::cout << "[HYBRID-DCN][INVARIANT] overallAlgorithmInvariant = "
                   << invariantStatus(overallAlgorithmInvariant) << std::endl;
 
@@ -7199,6 +7670,15 @@ main(int argc, char* argv[])
                       << std::endl;
             return 1;
         }
+    }
+    else
+    {
+        structuredExportCheck = runStructuredResultExport("skipped");
+        std::cout << "[HYBRID-DCN][INVARIANT] structuredExportCheck = "
+                  << (enableStructuredResultExport
+                          ? (structuredExportCheck ? "pass" : "fail")
+                          : "skipped")
+                  << std::endl;
     }
 
     std::cout << "[OK] Hybrid Core DCN topology build completed." << std::endl;
