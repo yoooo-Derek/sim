@@ -606,6 +606,8 @@ main(int argc, char* argv[])
     bool enableMultiPeriodWecmpState = true;
     bool enableAlgorithmInvariantCheck = true;
     bool strictAlgorithmInvariantCheck = false;
+    bool enableDetailedAlgorithmTrace = false;
+    uint32_t detailedCandidateLogLimit = 20;
     bool enableResultValidation = true;
     std::string validationMode = "warn";
 
@@ -689,6 +691,8 @@ main(int argc, char* argv[])
             "enableEpsWecmpRouting",
             "enableAlgorithmInvariantCheck",
             "strictAlgorithmInvariantCheck",
+            "enableDetailedAlgorithmTrace",
+            "detailedCandidateLogLimit",
             "numLeaves",
             "serversPerLeaf",
             "numSpines",
@@ -881,6 +885,12 @@ main(int argc, char* argv[])
     cmd.AddValue("strictAlgorithmInvariantCheck",
                  "Return non-zero when a Stage-40 invariant check fails.",
                  strictAlgorithmInvariantCheck);
+    cmd.AddValue("enableDetailedAlgorithmTrace",
+                 "Enable detailed Louvain and OCS candidate diagnostics.",
+                 enableDetailedAlgorithmTrace);
+    cmd.AddValue("detailedCandidateLogLimit",
+                 "Maximum number of detailed candidate diagnostics to print.",
+                 detailedCandidateLogLimit);
     cmd.AddValue("enableResultValidation",
                  "Enable Stage-24 result consistency validation logs.",
                  enableResultValidation);
@@ -2539,6 +2549,8 @@ main(int argc, char* argv[])
     };
 
     bool epsWecmpDiagnosticLoadApplied = false;
+    uint32_t epsWecmpDiagnosticLoadApplyCount = 0;
+    double epsWecmpDiagnosticTotalInjected = 0.0;
     auto applyEpsWecmpDiagnosticLoad = [&]() {
         if (epsWecmpDiagnosticLoadMode != "hot-spine" ||
             epsWecmpDiagnosticLoad <= 0 ||
@@ -2553,6 +2565,9 @@ main(int argc, char* argv[])
                 epsWecmpDiagnosticLoad;
         }
         epsWecmpDiagnosticLoadApplied = true;
+        epsWecmpDiagnosticLoadApplyCount++;
+        epsWecmpDiagnosticTotalInjected +=
+            epsWecmpDiagnosticLoad * static_cast<double>(numLeaves);
         return true;
     };
 
@@ -4540,6 +4555,14 @@ main(int argc, char* argv[])
               << epsWecmpDiagnosticHotSpine << std::endl;
     std::cout << "[HYBRID-DCN][WECMP] diagnosticLoadApplied = "
               << (epsWecmpDiagnosticLoadApplied ? "true" : "false") << std::endl;
+    std::cout << "[HYBRID-DCN][WECMP] diagnosticLoadApplyCount = "
+              << epsWecmpDiagnosticLoadApplyCount << std::endl;
+    std::cout << "[HYBRID-DCN][WECMP] diagnosticTotalInjected = "
+              << epsWecmpDiagnosticTotalInjected << std::endl;
+    std::cout << "[HYBRID-DCN][WECMP] diagnosticLoadScope = all-leaves-to-hot-spine"
+              << std::endl;
+    std::cout << "[HYBRID-DCN][WECMP] diagnosticLoadPurpose = synthetic-diagnostics-only"
+              << std::endl;
     std::cout << "[HYBRID-DCN][WECMP] residualDecisions = "
               << epsWecmpDecisions.size() << std::endl;
     std::cout << "[HYBRID-DCN][WECMP] pairStates = " << epsWecmpPairStates.size()
@@ -4652,6 +4675,18 @@ main(int argc, char* argv[])
                 std::cout << "[HYBRID-DCN][WECMP] decision[" << decisionIndex
                           << "] spine[" << state.spineIndex
                           << "] probabilityDelta = " << state.probabilityDelta
+                          << std::endl;
+                std::cout << "[HYBRID-DCN][WECMP] decision[" << decisionIndex
+                          << "] spine[" << state.spineIndex
+                          << "] boundedProbabilityDelta = "
+                          << state.boundedProbabilityDelta << std::endl;
+                std::cout << "[HYBRID-DCN][WECMP] decision[" << decisionIndex
+                          << "] spine[" << state.spineIndex
+                          << "] probabilityDeltaSemantic = decision-start-to-final"
+                          << std::endl;
+                std::cout << "[HYBRID-DCN][WECMP] decision[" << decisionIndex
+                          << "] spine[" << state.spineIndex
+                          << "] boundedProbabilityDeltaSemantic = per-update-step"
                           << std::endl;
             }
         }
@@ -5168,6 +5203,10 @@ main(int argc, char* argv[])
               << (enableMultiPeriodControl ? "true" : "false") << std::endl;
     std::cout << "[HYBRID-DCN][CONTROL] fullStackControlEnabled = "
               << (fullStackControlEnabled ? "true" : "false") << std::endl;
+    std::cout << "[HYBRID-DCN][CONTROL] enableDetailedAlgorithmTrace = "
+              << (enableDetailedAlgorithmTrace ? "true" : "false") << std::endl;
+    std::cout << "[HYBRID-DCN][CONTROL] detailedCandidateLogLimit = "
+              << detailedCandidateLogLimit << std::endl;
     std::cout << "[HYBRID-DCN][CONTROL] presetApplicationOrder = after-command-line-parse"
               << std::endl;
     std::cout << "[HYBRID-DCN][CONTROL] explicitArgCount = " << explicitArgNames.size()
@@ -5509,6 +5548,139 @@ main(int argc, char* argv[])
         std::cout << "[HYBRID-DCN][COMMUNITY] selectedEdge[" << edgeIndex
                   << "] intraCommunity = "
                   << (isIntraCommunity(edge.leafA, edge.leafB) ? "true" : "false")
+                  << std::endl;
+    }
+
+    auto formatCommunityLabelVector = [](const std::vector<uint32_t>& labels) {
+        if (labels.empty())
+        {
+            return std::string("none");
+        }
+        std::ostringstream stream;
+        for (uint32_t labelIndex = 0; labelIndex < labels.size(); ++labelIndex)
+        {
+            if (labelIndex > 0)
+            {
+                stream << ",";
+            }
+            stream << labelIndex << ":" << labels[labelIndex];
+        }
+        return stream.str();
+    };
+
+    if (enableDetailedAlgorithmTrace)
+    {
+        std::cout << "[HYBRID-DCN][TRACE] enableDetailedAlgorithmTrace = true"
+                  << std::endl;
+        std::cout << "[HYBRID-DCN][TRACE] detailedCandidateLogLimit = "
+                  << detailedCandidateLogLimit << std::endl;
+        std::cout << "[HYBRID-DCN][TRACE] louvainInputMatrixSemantic = controlMatrix"
+                  << std::endl;
+        std::cout << "[HYBRID-DCN][TRACE] louvainMode = " << louvainMode
+                  << std::endl;
+        std::cout << "[HYBRID-DCN][TRACE] louvainModularityQ = "
+                  << louvainResult.modularityQ << std::endl;
+        std::cout << "[HYBRID-DCN][TRACE] communityLabelVector = "
+                  << formatCommunityLabelVector(activeCommunityLabels) << std::endl;
+        for (uint32_t leafIndex = 0; leafIndex < numLeaves; ++leafIndex)
+        {
+            std::cout << "[HYBRID-DCN][TRACE] nodeDegree[" << leafIndex
+                      << "] = " << nodeDegree[leafIndex] << std::endl;
+        }
+        std::cout << "[HYBRID-DCN][TRACE] totalTraffic = " << totalTraffic
+                  << std::endl;
+
+        uint32_t matrixTraceCount = 0;
+        for (uint32_t leafA = 0;
+             leafA < numLeaves && matrixTraceCount < detailedCandidateLogLimit;
+             ++leafA)
+        {
+            for (uint32_t leafB = leafA + 1;
+                 leafB < numLeaves && matrixTraceCount < detailedCandidateLogLimit;
+                 ++leafB)
+            {
+                const OcsCandidateEdge traceEdge = makeCandidateEdge(leafA, leafB);
+                std::cout << "[HYBRID-DCN][TRACE] expectedTraffic[" << leafA << "]["
+                          << leafB << "] = " << expectedTraffic[leafA][leafB]
+                          << std::endl;
+                std::cout << "[HYBRID-DCN][TRACE] modularityGain[" << leafA << "]["
+                          << leafB << "] = " << modularityGain[leafA][leafB]
+                          << std::endl;
+                std::cout << "[HYBRID-DCN][TRACE] utility[" << leafA << "]["
+                          << leafB << "] = " << traceEdge.utility << std::endl;
+                std::cout << "[HYBRID-DCN][TRACE] communityFactor[" << leafA << "]["
+                          << leafB << "] = " << traceEdge.communityFactor << std::endl;
+                std::cout << "[HYBRID-DCN][TRACE] selectionScore[" << leafA << "]["
+                          << leafB << "] = " << traceEdge.selectionScore << std::endl;
+                matrixTraceCount++;
+            }
+        }
+
+        std::vector<uint32_t> selectedTraceDegree(numLeaves, 0);
+        for (const auto& selectedEdge : selectedOcsEdges)
+        {
+            if (selectedEdge.leafA < numLeaves)
+            {
+                selectedTraceDegree[selectedEdge.leafA]++;
+            }
+            if (selectedEdge.leafB < numLeaves)
+            {
+                selectedTraceDegree[selectedEdge.leafB]++;
+            }
+        }
+
+        const uint32_t sortedCandidateLogCount =
+            static_cast<uint32_t>(std::min<std::size_t>(candidateEdges.size(),
+                                                        detailedCandidateLogLimit));
+        for (uint32_t candidateIndex = 0; candidateIndex < sortedCandidateLogCount;
+             ++candidateIndex)
+        {
+            const auto& edge = candidateEdges[candidateIndex];
+            const bool selected = isEdgeInSet(selectedOcsEdges, edge.leafA, edge.leafB);
+            std::string rejectReason = "not-selected-greedy-order";
+            if (selected)
+            {
+                rejectReason = "selected";
+            }
+            else if (edge.selectionScore <= 0)
+            {
+                rejectReason = "non-positive-score";
+            }
+            else if (selectedOcsEdges.size() >= maxSelectedOcsLinks)
+            {
+                rejectReason = "max-selected-links";
+            }
+            else if (selectedTraceDegree[edge.leafA] >= ocsPortK ||
+                     selectedTraceDegree[edge.leafB] >= ocsPortK)
+            {
+                rejectReason = "ocs-port-budget";
+            }
+
+            std::cout << "[HYBRID-DCN][TRACE] sortedCandidate[" << candidateIndex
+                      << "] pair = " << edge.leafA << "-" << edge.leafB << std::endl;
+            std::cout << "[HYBRID-DCN][TRACE] sortedCandidate[" << candidateIndex
+                      << "] traffic = " << edge.traffic << std::endl;
+            std::cout << "[HYBRID-DCN][TRACE] sortedCandidate[" << candidateIndex
+                      << "] expected = " << edge.expected << std::endl;
+            std::cout << "[HYBRID-DCN][TRACE] sortedCandidate[" << candidateIndex
+                      << "] modularityGain = " << edge.modularityGain << std::endl;
+            std::cout << "[HYBRID-DCN][TRACE] sortedCandidate[" << candidateIndex
+                      << "] utility = " << edge.utility << std::endl;
+            std::cout << "[HYBRID-DCN][TRACE] sortedCandidate[" << candidateIndex
+                      << "] communityFactor = " << edge.communityFactor << std::endl;
+            std::cout << "[HYBRID-DCN][TRACE] sortedCandidate[" << candidateIndex
+                      << "] stateHoldingGain = " << edge.stateHoldingGain << std::endl;
+            std::cout << "[HYBRID-DCN][TRACE] sortedCandidate[" << candidateIndex
+                      << "] selectionScore = " << edge.selectionScore << std::endl;
+            std::cout << "[HYBRID-DCN][TRACE] sortedCandidate[" << candidateIndex
+                      << "] selected = " << (selected ? "true" : "false") << std::endl;
+            std::cout << "[HYBRID-DCN][TRACE] sortedCandidate[" << candidateIndex
+                      << "] rejectReason = " << rejectReason << std::endl;
+        }
+    }
+    else
+    {
+        std::cout << "[HYBRID-DCN][TRACE] enableDetailedAlgorithmTrace = false"
                   << std::endl;
     }
 
@@ -6401,6 +6573,81 @@ main(int argc, char* argv[])
             std::cout << "[HYBRID-DCN][INVARIANT] ewmaMatrixCheck = skipped"
                       << std::endl;
         }
+
+        bool nodeDegreeNonNegativeCheck = true;
+        for (const auto degree : nodeDegree)
+        {
+            if (degree < -1e-9)
+            {
+                nodeDegreeNonNegativeCheck = false;
+                break;
+            }
+        }
+
+        bool expectedTrafficSymmetryCheck = true;
+        bool modularityGainSymmetryCheck = true;
+        bool utilityNonNegativeCheck = true;
+        for (uint32_t i = 0; i < numLeaves; ++i)
+        {
+            for (uint32_t j = 0; j < numLeaves; ++j)
+            {
+                if (std::abs(expectedTraffic[i][j] - expectedTraffic[j][i]) > 1e-9)
+                {
+                    expectedTrafficSymmetryCheck = false;
+                }
+                if (std::abs(modularityGain[i][j] - modularityGain[j][i]) > 1e-9)
+                {
+                    modularityGainSymmetryCheck = false;
+                }
+                if (ocsUtility[i][j] < -1e-9)
+                {
+                    utilityNonNegativeCheck = false;
+                }
+            }
+        }
+
+        bool communityLabelRangeCheck = activeCommunityLabels.size() == numLeaves;
+        if (communityLabelRangeCheck && activeCommunityCount > 0)
+        {
+            for (const auto label : activeCommunityLabels)
+            {
+                if (label >= activeCommunityCount)
+                {
+                    communityLabelRangeCheck = false;
+                    break;
+                }
+            }
+        }
+
+        bool selectedEdgesPositiveScoreCheck = true;
+        for (const auto& edge : selectedOcsEdges)
+        {
+            if (edge.selectionScore <= 0 &&
+                !isEdgeInSet(holdOcsEdges, edge.leafA, edge.leafB))
+            {
+                selectedEdgesPositiveScoreCheck = false;
+                break;
+            }
+        }
+
+        updateOverallInvariant(overallAlgorithmInvariant, nodeDegreeNonNegativeCheck);
+        updateOverallInvariant(overallAlgorithmInvariant, expectedTrafficSymmetryCheck);
+        updateOverallInvariant(overallAlgorithmInvariant, modularityGainSymmetryCheck);
+        updateOverallInvariant(overallAlgorithmInvariant, utilityNonNegativeCheck);
+        updateOverallInvariant(overallAlgorithmInvariant, communityLabelRangeCheck);
+        updateOverallInvariant(overallAlgorithmInvariant, selectedEdgesPositiveScoreCheck);
+        std::cout << "[HYBRID-DCN][INVARIANT] nodeDegreeNonNegativeCheck = "
+                  << invariantStatus(nodeDegreeNonNegativeCheck) << std::endl;
+        std::cout << "[HYBRID-DCN][INVARIANT] expectedTrafficSymmetryCheck = "
+                  << invariantStatus(expectedTrafficSymmetryCheck) << std::endl;
+        std::cout << "[HYBRID-DCN][INVARIANT] modularityGainSymmetryCheck = "
+                  << invariantStatus(modularityGainSymmetryCheck) << std::endl;
+        std::cout << "[HYBRID-DCN][INVARIANT] utilityNonNegativeCheck = "
+                  << invariantStatus(utilityNonNegativeCheck) << std::endl;
+        std::cout << "[HYBRID-DCN][INVARIANT] communityLabelRangeCheck = "
+                  << invariantStatus(communityLabelRangeCheck) << std::endl;
+        std::cout << "[HYBRID-DCN][INVARIANT] selectedEdgesPositiveScoreCheck = "
+                  << invariantStatus(selectedEdgesPositiveScoreCheck) << std::endl;
 
         std::vector<uint32_t> invariantOcsDegree(numLeaves, 0);
         bool ocsPortConstraintCheck = true;
