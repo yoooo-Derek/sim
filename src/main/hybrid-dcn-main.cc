@@ -334,6 +334,21 @@ struct EpsWecmpEpochSummary
     double totalRealResidualDemand;
 };
 
+struct MatrixEpochSummary
+{
+    uint32_t epoch;
+    std::string rawTrafficMatrixMode;
+    std::string matrixUsedForControl;
+    bool ewmaEnabled;
+    double ewmaBeta;
+    double rawTotalTraffic;
+    double controlTotalTraffic;
+    double rawTraffic03;
+    double controlTraffic03;
+    double rawTraffic12;
+    double controlTraffic12;
+};
+
 struct EpsWecmpRouteBinding
 {
     uint32_t flowIndex;
@@ -1611,12 +1626,15 @@ main(int argc, char* argv[])
         return abar;
     };
 
-    const WeightedMatrix initialRawTrafficMatrix =
+    WeightedMatrix rawTrafficMatrix =
         buildSyntheticUndirectedTrafficMatrix(trafficMatrixMode, numLeaves);
-    std::vector<std::vector<double>> torTrafficMatrix =
+    WeightedMatrix controlTrafficMatrix =
         enableEwmaSmoothing
-            ? updateEwmaMatrix(WeightedMatrix{}, initialRawTrafficMatrix, ewmaBeta, false)
-            : initialRawTrafficMatrix;
+            ? updateEwmaMatrix(WeightedMatrix{}, rawTrafficMatrix, ewmaBeta, false)
+            : rawTrafficMatrix;
+    // Compatibility name used by the existing control-plane code path. It
+    // represents the control matrix, not necessarily the raw demand matrix.
+    std::vector<std::vector<double>> torTrafficMatrix = controlTrafficMatrix;
     std::string matrixUsedForControl = enableEwmaSmoothing ? "ewma" : "raw";
 
     auto buildCommunityPreview = [](const std::string& mode, uint32_t leafCount) {
@@ -2250,6 +2268,7 @@ main(int argc, char* argv[])
     }
 
     std::vector<ControlEpochSummary> controlEpochSummaries;
+    std::vector<MatrixEpochSummary> matrixEpochSummaries;
     std::vector<EpsWecmpEpochSummary> epsWecmpEpochSummaries;
     std::vector<EpsWecmpPairState> epsWecmpPairStates;
     std::vector<std::vector<EpsPhysicalLinkState>> epsPhysicalLinkStates(
@@ -2873,6 +2892,17 @@ main(int argc, char* argv[])
             holdTimeActive = epochDecision.holdTimeActive;
             configGateDecision = epochDecision.decision;
             epochPreviousAge = epochDecision.selectedConfigAge;
+            matrixEpochSummaries.push_back({epoch,
+                                            epochMatrixMode,
+                                            enableEwmaSmoothing ? "ewma" : "raw",
+                                            enableEwmaSmoothing,
+                                            ewmaBeta,
+                                            computeTotalTraffic(currentA),
+                                            computeTotalTraffic(epochControlMatrix),
+                                            numLeaves >= 4 ? currentA[0][3] : 0.0,
+                                            numLeaves >= 4 ? epochControlMatrix[0][3] : 0.0,
+                                            numLeaves >= 3 ? currentA[1][2] : 0.0,
+                                            numLeaves >= 3 ? epochControlMatrix[1][2] : 0.0});
             controlEpochSummaries.push_back(epochDecision.summary);
 
             if (multiPeriodWecmpStateEnabled)
@@ -2890,7 +2920,7 @@ main(int argc, char* argv[])
                 {
                     for (uint32_t leafB = leafA + 1; leafB < numLeaves; ++leafB)
                     {
-                        const double demand = epochControlMatrix[leafA][leafB];
+                        const double demand = currentA[leafA][leafB];
                         const bool pairSelected =
                             isEdgeInSet(epochDecision.selectedOcsEdges, leafA, leafB);
                         double plannedResidualDemand = 0.0;
@@ -2935,7 +2965,9 @@ main(int argc, char* argv[])
             epochPreviousEdges = selectedOcsEdges;
             epochPreviousAgeMatrix = selectedOcsEdgeAges;
             finalEpochMatrixMode = epochMatrixMode;
-            torTrafficMatrix = epochControlMatrix;
+            rawTrafficMatrix = currentA;
+            controlTrafficMatrix = epochControlMatrix;
+            torTrafficMatrix = controlTrafficMatrix;
             matrixUsedForControl = enableEwmaSmoothing ? "ewma" : "raw";
         }
 
@@ -2943,7 +2975,7 @@ main(int argc, char* argv[])
         previousConfigAge =
             controlEpochSummaries.empty() ? previousConfigAge
                                           : controlEpochSummaries.back().previousConfigAgeAfter;
-        recomputeTrafficMetrics(torTrafficMatrix);
+        recomputeTrafficMetrics(controlTrafficMatrix);
         previousConfigAvailable = !selectedOcsEdges.empty();
 
         intraCandidateEdges = 0;
@@ -3593,7 +3625,7 @@ main(int argc, char* argv[])
                                                      std::vector<double>(numLeaves, 0.0));
 
     auto computePlannedResidualDemand = [&](uint32_t srcLeaf, uint32_t dstLeaf) {
-        const double demand = torTrafficMatrix[srcLeaf][dstLeaf];
+        const double demand = rawTrafficMatrix[srcLeaf][dstLeaf];
         const bool pairAvailable = isOcsPairInstalled(srcLeaf, dstLeaf);
         const double theta = enableOcsAdmissionControl ? ocsAdmissionThreshold : demand;
         const double plannedResidual = demand - (pairAvailable ? theta : 0.0);
@@ -3695,7 +3727,7 @@ main(int argc, char* argv[])
         {
             for (uint32_t dstLeaf = srcLeaf + 1; dstLeaf < numLeaves; ++dstLeaf)
             {
-                if (torTrafficMatrix[srcLeaf][dstLeaf] <= 0 ||
+                if (rawTrafficMatrix[srcLeaf][dstLeaf] <= 0 ||
                     isOcsPairInstalled(srcLeaf, dstLeaf) ||
                     matrixFlowPairUsed[srcLeaf][dstLeaf])
                 {
@@ -4125,6 +4157,9 @@ main(int argc, char* argv[])
     std::cout << "[HYBRID-DCN] matrixFlowPortBase     = "
               << (enableMatrixFlows ? matrixFlowPortBase : 0) << std::endl;
 
+    uint32_t ocsCoveredFlows = 0;
+    uint32_t admissionControlledAdmittedFlows = 0;
+    uint32_t directOcsFlows = 0;
     uint32_t admissionAdmittedFlows = 0;
     uint32_t admissionFallbackFlows = 0;
     uint32_t admissionResidualFlows = 0;
@@ -4132,7 +4167,14 @@ main(int argc, char* argv[])
     {
         if (event.ocsAdmitted)
         {
-            admissionAdmittedFlows++;
+            if (enableOcsAdmissionControl)
+            {
+                admissionControlledAdmittedFlows++;
+            }
+            else
+            {
+                directOcsFlows++;
+            }
         }
         if (event.epsFallback)
         {
@@ -4145,16 +4187,34 @@ main(int argc, char* argv[])
         {
             admissionResidualFlows++;
         }
+        else
+        {
+            ocsCoveredFlows++;
+        }
     }
-    admissionResidualFlows += admissionFallbackFlows;
+    admissionAdmittedFlows =
+        enableOcsAdmissionControl ? admissionControlledAdmittedFlows : 0;
 
     std::cout << "[HYBRID-DCN][ADMISSION] enabled = "
               << (enableOcsAdmissionControl ? "true" : "false") << std::endl;
+    std::cout << "[HYBRID-DCN][ADMISSION] mode = "
+              << (enableOcsAdmissionControl ? "controlled" : "disabled-direct-ocs")
+              << std::endl;
     std::cout << "[HYBRID-DCN][ADMISSION] threshold = " << ocsAdmissionThreshold
               << std::endl;
     std::cout << "[HYBRID-DCN][ADMISSION] matrixFlowDemand = " << matrixFlowDemand
               << std::endl;
+    std::cout << "[HYBRID-DCN][ADMISSION] ocsCoveredFlows = " << ocsCoveredFlows
+              << std::endl;
+    std::cout << "[HYBRID-DCN][ADMISSION] admissionControlledAdmittedFlows = "
+              << admissionControlledAdmittedFlows << std::endl;
+    std::cout << "[HYBRID-DCN][ADMISSION] directOcsFlows = " << directOcsFlows
+              << std::endl;
     std::cout << "[HYBRID-DCN][ADMISSION] admittedFlows = " << admissionAdmittedFlows
+              << std::endl;
+    std::cout << "[HYBRID-DCN][ADMISSION] admittedFlowsSemantic = "
+              << (enableOcsAdmissionControl ? "admission-controlled"
+                                            : "disabled-zero-see-directOcsFlows")
               << std::endl;
     std::cout << "[HYBRID-DCN][ADMISSION] fallbackFlows = " << admissionFallbackFlows
               << std::endl;
@@ -4392,6 +4452,22 @@ main(int argc, char* argv[])
               << matrixUsedForControl << std::endl;
     std::cout << "[HYBRID-DCN][MATRIX] matrixSemantic = undirected-synthetic-A"
               << std::endl;
+    std::cout << "[HYBRID-DCN][MATRIX] rawMatrixSemantic = undirected-synthetic-demand-A"
+              << std::endl;
+    std::cout << "[HYBRID-DCN][MATRIX] controlMatrixSemantic = "
+              << (enableEwmaSmoothing ? "ewma-smoothed-Abar" : "raw") << std::endl;
+    std::cout << "[HYBRID-DCN][MATRIX] rawTotalTraffic = "
+              << computeTotalTraffic(rawTrafficMatrix) << std::endl;
+    std::cout << "[HYBRID-DCN][MATRIX] controlTotalTraffic = "
+              << computeTotalTraffic(controlTrafficMatrix) << std::endl;
+    std::cout << "[HYBRID-DCN][MATRIX] rawTraffic[0][3] = "
+              << (numLeaves >= 4 ? rawTrafficMatrix[0][3] : 0.0) << std::endl;
+    std::cout << "[HYBRID-DCN][MATRIX] controlTraffic[0][3] = "
+              << (numLeaves >= 4 ? controlTrafficMatrix[0][3] : 0.0) << std::endl;
+    std::cout << "[HYBRID-DCN][MATRIX] rawTraffic[1][2] = "
+              << (numLeaves >= 3 ? rawTrafficMatrix[1][2] : 0.0) << std::endl;
+    std::cout << "[HYBRID-DCN][MATRIX] controlTraffic[1][2] = "
+              << (numLeaves >= 3 ? controlTrafficMatrix[1][2] : 0.0) << std::endl;
     std::cout << "[HYBRID-DCN][MATRIX] selectionMetric = " << selectionMetric << std::endl;
     std::cout << "[HYBRID-DCN][MATRIX] eta             = " << eta << std::endl;
     std::cout << "[HYBRID-DCN][MATRIX] totalTraffic    = " << totalTraffic << std::endl;
@@ -4598,6 +4674,28 @@ main(int argc, char* argv[])
                       << "] trafficMatrixMode = " << summary.trafficMatrixMode << std::endl;
             std::cout << "[HYBRID-DCN][MULTI] epoch[" << summary.epoch
                       << "] rawTrafficMatrixMode = " << summary.trafficMatrixMode << std::endl;
+            if (summary.epoch < matrixEpochSummaries.size())
+            {
+                const auto& matrixSummary = matrixEpochSummaries[summary.epoch];
+                std::cout << "[HYBRID-DCN][MULTI] epoch[" << summary.epoch
+                          << "] rawTotalTraffic = " << matrixSummary.rawTotalTraffic
+                          << std::endl;
+                std::cout << "[HYBRID-DCN][MULTI] epoch[" << summary.epoch
+                          << "] controlTotalTraffic = "
+                          << matrixSummary.controlTotalTraffic << std::endl;
+                std::cout << "[HYBRID-DCN][MULTI] epoch[" << summary.epoch
+                          << "] rawTraffic[0][3] = " << matrixSummary.rawTraffic03
+                          << std::endl;
+                std::cout << "[HYBRID-DCN][MULTI] epoch[" << summary.epoch
+                          << "] controlTraffic[0][3] = "
+                          << matrixSummary.controlTraffic03 << std::endl;
+                std::cout << "[HYBRID-DCN][MULTI] epoch[" << summary.epoch
+                          << "] rawTraffic[1][2] = " << matrixSummary.rawTraffic12
+                          << std::endl;
+                std::cout << "[HYBRID-DCN][MULTI] epoch[" << summary.epoch
+                          << "] controlTraffic[1][2] = "
+                          << matrixSummary.controlTraffic12 << std::endl;
+            }
             std::cout << "[HYBRID-DCN][MULTI] epoch[" << summary.epoch
                       << "] matrixUsedForControl = "
                       << (enableEwmaSmoothing ? "ewma" : "raw") << std::endl;
@@ -5855,33 +5953,65 @@ main(int argc, char* argv[])
         std::cout << "[HYBRID-DCN][INVARIANT] stage = stage-40-core-algorithm-invariants"
                   << std::endl;
 
-        bool trafficMatrixSymmetryCheck = true;
-        bool trafficMatrixDiagonalZeroCheck = true;
-        bool trafficMatrixNonNegativeCheck = true;
-        for (uint32_t i = 0; i < torTrafficMatrix.size(); ++i)
+        struct MatrixInvariantResult
         {
-            if (i >= torTrafficMatrix[i].size() ||
-                std::abs(torTrafficMatrix[i][i]) > 1e-9)
+            bool symmetric;
+            bool diagonalZero;
+            bool nonNegative;
+        };
+        auto checkTrafficMatrixInvariant = [](const WeightedMatrix& matrix) {
+            MatrixInvariantResult result{true, true, true};
+            for (uint32_t i = 0; i < matrix.size(); ++i)
             {
-                trafficMatrixDiagonalZeroCheck = false;
-            }
-            for (uint32_t j = 0; j < torTrafficMatrix[i].size(); ++j)
-            {
-                if (torTrafficMatrix[i][j] < -1e-9)
+                if (i >= matrix[i].size() || std::abs(matrix[i][i]) > 1e-9)
                 {
-                    trafficMatrixNonNegativeCheck = false;
+                    result.diagonalZero = false;
                 }
-                if (j < torTrafficMatrix.size() &&
-                    i < torTrafficMatrix[j].size() &&
-                    std::abs(torTrafficMatrix[i][j] - torTrafficMatrix[j][i]) > 1e-9)
+                for (uint32_t j = 0; j < matrix[i].size(); ++j)
                 {
-                    trafficMatrixSymmetryCheck = false;
+                    if (matrix[i][j] < -1e-9)
+                    {
+                        result.nonNegative = false;
+                    }
+                    if (j < matrix.size() &&
+                        i < matrix[j].size() &&
+                        std::abs(matrix[i][j] - matrix[j][i]) > 1e-9)
+                    {
+                        result.symmetric = false;
+                    }
                 }
             }
-        }
-        updateOverallInvariant(overallAlgorithmInvariant, trafficMatrixSymmetryCheck);
-        updateOverallInvariant(overallAlgorithmInvariant, trafficMatrixDiagonalZeroCheck);
-        updateOverallInvariant(overallAlgorithmInvariant, trafficMatrixNonNegativeCheck);
+            return result;
+        };
+
+        const MatrixInvariantResult rawMatrixInvariant =
+            checkTrafficMatrixInvariant(rawTrafficMatrix);
+        const MatrixInvariantResult controlMatrixInvariant =
+            checkTrafficMatrixInvariant(controlTrafficMatrix);
+        const bool trafficMatrixSymmetryCheck =
+            rawMatrixInvariant.symmetric && controlMatrixInvariant.symmetric;
+        const bool trafficMatrixDiagonalZeroCheck =
+            rawMatrixInvariant.diagonalZero && controlMatrixInvariant.diagonalZero;
+        const bool trafficMatrixNonNegativeCheck =
+            rawMatrixInvariant.nonNegative && controlMatrixInvariant.nonNegative;
+        updateOverallInvariant(overallAlgorithmInvariant, rawMatrixInvariant.symmetric);
+        updateOverallInvariant(overallAlgorithmInvariant, rawMatrixInvariant.diagonalZero);
+        updateOverallInvariant(overallAlgorithmInvariant, rawMatrixInvariant.nonNegative);
+        updateOverallInvariant(overallAlgorithmInvariant, controlMatrixInvariant.symmetric);
+        updateOverallInvariant(overallAlgorithmInvariant, controlMatrixInvariant.diagonalZero);
+        updateOverallInvariant(overallAlgorithmInvariant, controlMatrixInvariant.nonNegative);
+        std::cout << "[HYBRID-DCN][INVARIANT] rawTrafficMatrixSymmetryCheck = "
+                  << invariantStatus(rawMatrixInvariant.symmetric) << std::endl;
+        std::cout << "[HYBRID-DCN][INVARIANT] rawTrafficMatrixDiagonalZeroCheck = "
+                  << invariantStatus(rawMatrixInvariant.diagonalZero) << std::endl;
+        std::cout << "[HYBRID-DCN][INVARIANT] rawTrafficMatrixNonNegativeCheck = "
+                  << invariantStatus(rawMatrixInvariant.nonNegative) << std::endl;
+        std::cout << "[HYBRID-DCN][INVARIANT] controlTrafficMatrixSymmetryCheck = "
+                  << invariantStatus(controlMatrixInvariant.symmetric) << std::endl;
+        std::cout << "[HYBRID-DCN][INVARIANT] controlTrafficMatrixDiagonalZeroCheck = "
+                  << invariantStatus(controlMatrixInvariant.diagonalZero) << std::endl;
+        std::cout << "[HYBRID-DCN][INVARIANT] controlTrafficMatrixNonNegativeCheck = "
+                  << invariantStatus(controlMatrixInvariant.nonNegative) << std::endl;
         std::cout << "[HYBRID-DCN][INVARIANT] trafficMatrixSymmetryCheck = "
                   << invariantStatus(trafficMatrixSymmetryCheck) << std::endl;
         std::cout << "[HYBRID-DCN][INVARIANT] trafficMatrixDiagonalZeroCheck = "
@@ -5891,9 +6021,9 @@ main(int argc, char* argv[])
 
         if (enableEwmaSmoothing)
         {
-            const bool ewmaMatrixCheck = trafficMatrixSymmetryCheck &&
-                                         trafficMatrixDiagonalZeroCheck &&
-                                         trafficMatrixNonNegativeCheck;
+            const bool ewmaMatrixCheck = controlMatrixInvariant.symmetric &&
+                                         controlMatrixInvariant.diagonalZero &&
+                                         controlMatrixInvariant.nonNegative;
             updateOverallInvariant(overallAlgorithmInvariant, ewmaMatrixCheck);
             std::cout << "[HYBRID-DCN][INVARIANT] ewmaMatrixCheck = "
                       << invariantStatus(ewmaMatrixCheck) << std::endl;
