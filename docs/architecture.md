@@ -83,6 +83,12 @@ Current telemetry semantics:
 - `utilization` is computed as estimated residual load divided by `epsWecmpCapacity`.
 - Multi-period WECMP summaries currently copy planned residual demand into the real-residual field as a placeholder; they are not data-plane observed residual measurements.
 
+Current admission fallback semantics:
+
+- If OCS admission rejects a selected OCS pair, `main.cc` creates a same-pair EPS fallback matrix flow.
+- That fallback flow is marked as requiring an EPS residual path and is eligible for EPS-WECMP decision and route binding.
+- Synthetic residual flows remain supplemental coverage for residual-path validation. They do not stand in for an admission-rejected selected OCS pair.
+
 ## Result
 
 `src/result/` is reserved for later extraction of result summaries, CSV export, validation, and invariant checks. These are still in `main.cc` in the current phase.

@@ -8,14 +8,17 @@ ns-3 measured telemetry implementation.
 Current data flow:
 
 1. OCS admission computes planned and real residual demand for matrix flows.
-2. EPS-WECMP uses `wecmpResidualDemand` as the residual input.
-3. `accumulateEpsResidualTraffic` distributes residual demand over candidate spines
+2. Matrix flows that actually require EPS residual forwarding are marked with
+   `requiresEpsResidualPath`.
+3. EPS-WECMP uses `wecmpResidualDemand` as the residual input for those EPS
+   residual-path flows.
+4. `accumulateEpsResidualTraffic` distributes residual demand over candidate spines
    according to the current WECMP probabilities.
-4. `EpsPhysicalLinkState::observedTraffic` stores that estimated residual load.
-5. `utilization` is computed as estimated residual load divided by
+5. `EpsPhysicalLinkState::observedTraffic` stores that estimated residual load.
+6. `utilization` is computed as estimated residual load divided by
    `epsWecmpCapacity`.
-6. `smoothedUtilization` is updated by EWMA.
-7. WECMP probabilities are updated from path attractiveness derived from the
+7. `smoothedUtilization` is updated by EWMA.
+8. WECMP probabilities are updated from path attractiveness derived from the
    smoothed utilization.
 
 This means `observedTraffic` should be read as control-plane estimated residual
@@ -48,7 +51,19 @@ Single-period matrix flows currently distinguish:
 - `realResidualDemand`: per-flow admission outcome, either zero or
   `matrixFlowDemand`;
 - `wecmpResidualDemand`: the WECMP control input, computed as the maximum of the
-  planned and real residual demand.
+  planned and real residual demand;
+- `requiresEpsResidualPath`: whether this flow actually needs EPS residual
+  forwarding and is eligible for EPS-WECMP input.
+
+If OCS admission rejects a selected OCS pair, the implementation now creates a
+same-pair EPS fallback matrix flow with `fallbackMappingType=admission-direct`.
+Synthetic residual flows are only supplemental residual-path validation flows and
+should not be interpreted as replacements for admission fallback events.
+
+If a flow is OCS-admitted but still has positive planned residual demand, the
+current implementation logs that condition and does not automatically split the
+flow across OCS and EPS. Implementing OCS+EPS flow splitting requires a separate
+paper-boundary decision.
 
 Multi-period WECMP currently has no data-plane admission or measured feedback
 loop. Its `totalRealResidualDemand` field is a planned-residual placeholder and

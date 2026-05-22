@@ -45,6 +45,8 @@ The simulated architecture contains:
 7. Select OCS lightpaths under optical port constraints.
 8. Admit new flows to OCS when lightpath and capacity conditions hold.
 9. Route residual traffic through EPS.
-10. Update EPS-WECMP weights according to measured link utilization.
+10. Update EPS-WECMP weights according to control-plane estimated residual load.
 
+Measured per-link EPS utilization is a future telemetry enhancement. It is not
+part of the current implementation.
 

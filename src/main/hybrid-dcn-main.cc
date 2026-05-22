@@ -67,11 +67,13 @@ struct MatrixBulkFlowSpec
     bool epsPathFrozen;
     int32_t frozenSpine;
     std::string name;
-    std::string fallbackDataPlaneMode = "synthetic-residual-flow-validation";
+    std::string fallbackDataPlaneMode = "none";
     bool fallbackEventMapped = false;
     std::string fallbackMappingType = "none";
     double startTime = 0.0;
     uint64_t expectedBytes = 0;
+    bool requiresEpsResidualPath = false;
+    std::string residualPathReason = "none";
 };
 
 struct OcsAdmissionEvent
@@ -3298,51 +3300,7 @@ main(int argc, char* argv[])
                            : Ipv4Address("0.0.0.0");
     bool ocsForced = false;
     uint32_t ocsPairHostRoutes = 0;
-    if (routeMode == "ocs-forced")
-    {
-        Ipv4StaticRoutingHelper staticRoutingHelper;
-
-        auto applyOcsPairHostRoutes = [&](const OcsInstalledLink& link) {
-            Ptr<Ipv4StaticRouting> leafARouting =
-                staticRoutingHelper.GetStaticRouting(leaves.Get(link.leafA)->GetObject<Ipv4>());
-            Ptr<Ipv4StaticRouting> leafBRouting =
-                staticRoutingHelper.GetStaticRouting(leaves.Get(link.leafB)->GetObject<Ipv4>());
-
-            for (uint32_t serverOffsetA = 0; serverOffsetA < serversPerLeaf; ++serverOffsetA)
-            {
-                Ptr<Ipv4StaticRouting> serverARouting = staticRoutingHelper.GetStaticRouting(
-                    servers.Get(serverIndex(link.leafA, serverOffsetA))->GetObject<Ipv4>());
-
-                for (uint32_t serverOffsetB = 0; serverOffsetB < serversPerLeaf; ++serverOffsetB)
-                {
-                    const Ipv4Address dstB = serverIpv4[link.leafB][serverOffsetB];
-                    const Ipv4Address dstA = serverIpv4[link.leafA][serverOffsetA];
-
-                    serverARouting->AddHostRouteTo(dstB,
-                                                   leafServerIpv4[link.leafA][serverOffsetA],
-                                                   serverIfIndex[link.leafA][serverOffsetA]);
-                    leafARouting->AddHostRouteTo(dstB, link.leafBAddress, link.leafAIfIndex);
-
-                    leafBRouting->AddHostRouteTo(dstA, link.leafAAddress, link.leafBIfIndex);
-
-                    Ptr<Ipv4StaticRouting> serverBRouting = staticRoutingHelper.GetStaticRouting(
-                        servers.Get(serverIndex(link.leafB, serverOffsetB))->GetObject<Ipv4>());
-                    serverBRouting->AddHostRouteTo(dstA,
-                                                   leafServerIpv4[link.leafB][serverOffsetB],
-                                                   serverIfIndex[link.leafB][serverOffsetB]);
-                }
-            }
-
-            ocsPairHostRoutes += serversPerLeaf * serversPerLeaf * 4;
-        };
-
-        for (const auto& link : installedOcsLinks)
-        {
-            applyOcsPairHostRoutes(link);
-        }
-
-        ocsForced = true;
-    }
+    uint32_t ocsPairHostRoutesSkippedForEpsResidual = 0;
 
     const uint32_t echoPort = 9000;
     const uint32_t echoSrcLeaf = 0;
@@ -3442,32 +3400,59 @@ main(int argc, char* argv[])
             ocsAdmissionEvents.push_back(admission);
             matrixFlowPairUsed[link.leafA][link.leafB] = true;
             matrixFlowPairUsed[link.leafB][link.leafA] = true;
-            if (!admission.ocsAdmitted)
-            {
-                continue;
-            }
 
             std::ostringstream flowName;
             flowName << "matrix-flow-" << matrixFlowSpecs.size();
-            matrixFlowSpecs.push_back({link.leafA,
-                                       link.leafB,
-                                       0,
-                                       0,
-                                       static_cast<uint16_t>(matrixFlowPortBase +
-                                                             matrixFlowSpecs.size()),
-                                       admission.ocsAdmitted,
-                                       admission.ocsPairAvailable,
-                                       admission.ocsAdmitted,
-                                       admission.epsFallback,
-                                       admission.estimatedDemand,
-                                       admission.ocsLoadBefore,
-                                       admission.ocsLoadAfter,
-                                       admission.plannedResidualDemand,
-                                       admission.realResidualDemand,
-                                       admission.wecmpResidualDemand,
-                                       false,
-                                       -1,
-                                       flowName.str()});
+            if (admission.ocsAdmitted)
+            {
+                matrixFlowSpecs.push_back({link.leafA,
+                                           link.leafB,
+                                           0,
+                                           0,
+                                           static_cast<uint16_t>(matrixFlowPortBase +
+                                                                 matrixFlowSpecs.size()),
+                                           true,
+                                           admission.ocsPairAvailable,
+                                           true,
+                                           false,
+                                           admission.estimatedDemand,
+                                           admission.ocsLoadBefore,
+                                           admission.ocsLoadAfter,
+                                           admission.plannedResidualDemand,
+                                           admission.realResidualDemand,
+                                           admission.wecmpResidualDemand,
+                                           false,
+                                           -1,
+                                           flowName.str()});
+            }
+            else if (admission.epsFallback)
+            {
+                matrixFlowSpecs.push_back({link.leafA,
+                                           link.leafB,
+                                           0,
+                                           0,
+                                           static_cast<uint16_t>(matrixFlowPortBase +
+                                                                 matrixFlowSpecs.size()),
+                                           false,
+                                           admission.ocsPairAvailable,
+                                           false,
+                                           true,
+                                           admission.estimatedDemand,
+                                           admission.ocsLoadBefore,
+                                           admission.ocsLoadAfter,
+                                           admission.plannedResidualDemand,
+                                           admission.realResidualDemand,
+                                           admission.wecmpResidualDemand,
+                                           false,
+                                           -1,
+                                           flowName.str()});
+                MatrixBulkFlowSpec& fallbackSpec = matrixFlowSpecs.back();
+                fallbackSpec.fallbackDataPlaneMode = "admission-direct-eps-fallback";
+                fallbackSpec.fallbackEventMapped = true;
+                fallbackSpec.fallbackMappingType = "admission-direct";
+                fallbackSpec.requiresEpsResidualPath = true;
+                fallbackSpec.residualPathReason = "admission-fallback";
+            }
         }
 
         const size_t minMatrixFlowCount = 3;
@@ -3509,6 +3494,10 @@ main(int argc, char* argv[])
                                            false,
                                            -1,
                                            flowName.str()});
+                MatrixBulkFlowSpec& residualSpec = matrixFlowSpecs.back();
+                residualSpec.fallbackDataPlaneMode = "eps-residual-path";
+                residualSpec.requiresEpsResidualPath = true;
+                residualSpec.residualPathReason = "ordinary-residual";
                 matrixFlowPairUsed[srcLeaf][dstLeaf] = true;
                 matrixFlowPairUsed[dstLeaf][srcLeaf] = true;
                 residualMatrixFlowsAdded++;
@@ -3529,13 +3518,17 @@ main(int argc, char* argv[])
         matrixFlowStats.resize(matrixFlowSpecs.size(), {0, false, 0.0, 0.0});
     }
 
+    auto requiresEpsResidualPath = [](const MatrixBulkFlowSpec& spec) {
+        return spec.requiresEpsResidualPath && !spec.ocsAdmitted && spec.wecmpResidualDemand > 0;
+    };
+
     matrixFlowWecmpDecisionIndex.assign(matrixFlowSpecs.size(), -1);
     if (enableEpsWecmp && enableMatrixFlows)
     {
         resetEpsPhysicalObservedTraffic();
         for (const auto& spec : matrixFlowSpecs)
         {
-            if (!spec.ocsCovered && spec.wecmpResidualDemand > 0)
+            if (requiresEpsResidualPath(spec))
             {
                 accumulateEpsResidualTraffic(spec.srcLeaf,
                                              spec.dstLeaf,
@@ -3548,11 +3541,7 @@ main(int argc, char* argv[])
         for (uint32_t flowIndex = 0; flowIndex < matrixFlowSpecs.size(); ++flowIndex)
         {
             const auto& spec = matrixFlowSpecs[flowIndex];
-            if (spec.ocsCovered)
-            {
-                continue;
-            }
-            if (spec.wecmpResidualDemand <= 0)
+            if (!requiresEpsResidualPath(spec))
             {
                 continue;
             }
@@ -3568,13 +3557,91 @@ main(int argc, char* argv[])
         }
     }
 
+    if (routeMode == "ocs-forced")
+    {
+        Ipv4StaticRoutingHelper staticRoutingHelper;
+
+        auto shouldSkipOcsHostRouteForEpsResidual = [&](const OcsInstalledLink& link,
+                                                        uint32_t serverOffsetA,
+                                                        uint32_t serverOffsetB) {
+            for (const auto& spec : matrixFlowSpecs)
+            {
+                if (!requiresEpsResidualPath(spec))
+                {
+                    continue;
+                }
+                const bool forwardMatch = spec.srcLeaf == link.leafA &&
+                                          spec.dstLeaf == link.leafB &&
+                                          spec.srcServer == serverOffsetA &&
+                                          spec.dstServer == serverOffsetB;
+                const bool reverseMatch = spec.srcLeaf == link.leafB &&
+                                          spec.dstLeaf == link.leafA &&
+                                          spec.srcServer == serverOffsetB &&
+                                          spec.dstServer == serverOffsetA;
+                if (forwardMatch || reverseMatch)
+                {
+                    return true;
+                }
+            }
+            return false;
+        };
+
+        auto applyOcsPairHostRoutes = [&](const OcsInstalledLink& link) {
+            Ptr<Ipv4StaticRouting> leafARouting =
+                staticRoutingHelper.GetStaticRouting(leaves.Get(link.leafA)->GetObject<Ipv4>());
+            Ptr<Ipv4StaticRouting> leafBRouting =
+                staticRoutingHelper.GetStaticRouting(leaves.Get(link.leafB)->GetObject<Ipv4>());
+
+            for (uint32_t serverOffsetA = 0; serverOffsetA < serversPerLeaf; ++serverOffsetA)
+            {
+                Ptr<Ipv4StaticRouting> serverARouting = staticRoutingHelper.GetStaticRouting(
+                    servers.Get(serverIndex(link.leafA, serverOffsetA))->GetObject<Ipv4>());
+
+                for (uint32_t serverOffsetB = 0; serverOffsetB < serversPerLeaf; ++serverOffsetB)
+                {
+                    if (shouldSkipOcsHostRouteForEpsResidual(link,
+                                                             serverOffsetA,
+                                                             serverOffsetB))
+                    {
+                        ocsPairHostRoutesSkippedForEpsResidual += 4;
+                        continue;
+                    }
+
+                    const Ipv4Address dstB = serverIpv4[link.leafB][serverOffsetB];
+                    const Ipv4Address dstA = serverIpv4[link.leafA][serverOffsetA];
+
+                    serverARouting->AddHostRouteTo(dstB,
+                                                   leafServerIpv4[link.leafA][serverOffsetA],
+                                                   serverIfIndex[link.leafA][serverOffsetA]);
+                    leafARouting->AddHostRouteTo(dstB, link.leafBAddress, link.leafAIfIndex);
+
+                    leafBRouting->AddHostRouteTo(dstA, link.leafAAddress, link.leafBIfIndex);
+
+                    Ptr<Ipv4StaticRouting> serverBRouting = staticRoutingHelper.GetStaticRouting(
+                        servers.Get(serverIndex(link.leafB, serverOffsetB))->GetObject<Ipv4>());
+                    serverBRouting->AddHostRouteTo(dstA,
+                                                   leafServerIpv4[link.leafB][serverOffsetB],
+                                                   serverIfIndex[link.leafB][serverOffsetB]);
+                    ocsPairHostRoutes += 4;
+                }
+            }
+        };
+
+        for (const auto& link : installedOcsLinks)
+        {
+            applyOcsPairHostRoutes(link);
+        }
+
+        ocsForced = true;
+    }
+
     if (enableEpsWecmpRouting && enableMatrixFlows && enableEpsWecmp)
     {
         Ipv4StaticRoutingHelper staticRoutingHelper;
         for (uint32_t flowIndex = 0; flowIndex < matrixFlowSpecs.size(); ++flowIndex)
         {
             auto& spec = matrixFlowSpecs[flowIndex];
-            if (spec.ocsCovered || spec.wecmpResidualDemand <= 0)
+            if (!requiresEpsResidualPath(spec))
             {
                 continue;
             }
@@ -3954,40 +4021,77 @@ main(int argc, char* argv[])
         enableOcsAdmissionControl ? admissionControlledAdmittedFlows : 0;
     const uint32_t ocsPairAvailableFlows =
         admissionControlledAdmittedFlows + directOcsFlows + admissionFallbackFlows;
-    const std::string fallbackDataPlaneMode = "synthetic-residual-flow-validation";
+    const std::string fallbackDataPlaneMode = "eps-residual-path";
     uint32_t fallbackMatrixFlowCount = 0;
+    uint32_t directFallbackMatrixFlowCount = 0;
+    uint32_t syntheticFallbackMatrixFlowCount = 0;
+    uint32_t epsResidualPathFlowCount = 0;
+    uint32_t plannedResidualPositiveButOcsAdmitted = 0;
     for (auto& spec : matrixFlowSpecs)
     {
-        if (spec.epsFallback ||
-            (admissionFallbackFlows > 0 && !spec.ocsCovered && spec.realResidualDemand > 0))
+        if (requiresEpsResidualPath(spec))
+        {
+            epsResidualPathFlowCount++;
+        }
+        if (spec.ocsAdmitted && spec.plannedResidualDemand > 0)
+        {
+            plannedResidualPositiveButOcsAdmitted++;
+        }
+        if (spec.epsFallback)
         {
             fallbackMatrixFlowCount++;
+            directFallbackMatrixFlowCount++;
+        }
+        else if (admissionFallbackFlows > 0 && requiresEpsResidualPath(spec))
+        {
+            fallbackMatrixFlowCount++;
+            syntheticFallbackMatrixFlowCount++;
         }
     }
     std::string fallbackEventToMatrixFlowMapping = "none";
     if (admissionFallbackFlows > 0)
     {
-        fallbackEventToMatrixFlowMapping =
-            fallbackMatrixFlowCount > 0 ? "synthetic-residual" : "none";
+        if (directFallbackMatrixFlowCount >= admissionFallbackFlows)
+        {
+            fallbackEventToMatrixFlowMapping = "admission-direct";
+        }
+        else if (fallbackMatrixFlowCount > 0)
+        {
+            fallbackEventToMatrixFlowMapping = "synthetic-residual";
+        }
     }
     for (auto& spec : matrixFlowSpecs)
     {
-        spec.fallbackDataPlaneMode = fallbackDataPlaneMode;
         if (spec.epsFallback)
         {
             spec.fallbackEventMapped = true;
-            spec.fallbackMappingType = "direct";
+            if (spec.fallbackDataPlaneMode.empty() ||
+                spec.fallbackDataPlaneMode == "synthetic-residual-flow-validation")
+            {
+                spec.fallbackDataPlaneMode = "admission-direct-eps-fallback";
+            }
+            if (spec.fallbackMappingType == "none")
+            {
+                spec.fallbackMappingType = "admission-direct";
+            }
         }
         else if (fallbackEventToMatrixFlowMapping == "synthetic-residual" &&
-                 !spec.ocsCovered && spec.realResidualDemand > 0)
+                 requiresEpsResidualPath(spec))
         {
             spec.fallbackEventMapped = true;
+            spec.fallbackDataPlaneMode = "synthetic-residual-flow-validation";
             spec.fallbackMappingType = "synthetic-residual";
         }
         else
         {
-            spec.fallbackEventMapped = false;
-            spec.fallbackMappingType = "none";
+            if (!spec.fallbackEventMapped)
+            {
+                spec.fallbackMappingType = "none";
+            }
+            if (spec.fallbackDataPlaneMode.empty())
+            {
+                spec.fallbackDataPlaneMode = fallbackDataPlaneMode;
+            }
         }
     }
 
@@ -4006,8 +4110,16 @@ main(int argc, char* argv[])
               << admissionFallbackFlows << std::endl;
     std::cout << "[HYBRID-DCN][ADMISSION] fallbackMatrixFlowCount = "
               << fallbackMatrixFlowCount << std::endl;
+    std::cout << "[HYBRID-DCN][ADMISSION] directFallbackMatrixFlowCount = "
+              << directFallbackMatrixFlowCount << std::endl;
+    std::cout << "[HYBRID-DCN][ADMISSION] syntheticFallbackMatrixFlowCount = "
+              << syntheticFallbackMatrixFlowCount << std::endl;
     std::cout << "[HYBRID-DCN][ADMISSION] fallbackEventToMatrixFlowMapping = "
               << fallbackEventToMatrixFlowMapping << std::endl;
+    std::cout << "[HYBRID-DCN][ADMISSION] epsResidualPathFlowCount = "
+              << epsResidualPathFlowCount << std::endl;
+    std::cout << "[HYBRID-DCN][ADMISSION] plannedResidualPositiveButOcsAdmitted = "
+              << plannedResidualPositiveButOcsAdmitted << std::endl;
     std::cout << "[HYBRID-DCN][ADMISSION] ocsCoveredFlows = " << ocsCoveredFlows
               << std::endl;
     std::cout << "[HYBRID-DCN][ADMISSION] ocsPairAvailableFlows = "
@@ -4133,16 +4245,23 @@ main(int argc, char* argv[])
         for (uint32_t flowIndex = 0; flowIndex < matrixFlowSpecs.size(); ++flowIndex)
         {
             const auto& spec = matrixFlowSpecs[flowIndex];
-            if (spec.ocsCovered)
+            if (!requiresEpsResidualPath(spec))
             {
                 std::cout << "[HYBRID-DCN][WECMP] matrixFlow[" << flowIndex
-                          << "] skipped = ocs-covered" << std::endl;
-                continue;
-            }
-            if (spec.wecmpResidualDemand <= 0)
-            {
-                std::cout << "[HYBRID-DCN][WECMP] matrixFlow[" << flowIndex
-                          << "] skipped = no-residual-demand" << std::endl;
+                          << "] skipped = ";
+                if (spec.ocsAdmitted && spec.plannedResidualDemand > 0)
+                {
+                    std::cout << "ocs-admitted-planned-residual-pending-flow-splitting";
+                }
+                else if (spec.ocsAdmitted || spec.ocsCovered)
+                {
+                    std::cout << "ocs-admitted-no-eps-residual-path";
+                }
+                else
+                {
+                    std::cout << "no-eps-residual-path";
+                }
+                std::cout << std::endl;
                 continue;
             }
 
@@ -4295,6 +4414,11 @@ main(int argc, char* argv[])
                   << (spec.epsPathFrozen ? "true" : "false") << std::endl;
         std::cout << "[HYBRID-DCN][FLOW-PATH] matrixFlow[" << flowIndex
                   << "] frozenSpine = " << spec.frozenSpine << std::endl;
+        std::cout << "[HYBRID-DCN][FLOW-PATH] matrixFlow[" << flowIndex
+                  << "] requiresEpsResidualPath = "
+                  << (requiresEpsResidualPath(spec) ? "true" : "false") << std::endl;
+        std::cout << "[HYBRID-DCN][FLOW-PATH] matrixFlow[" << flowIndex
+                  << "] residualPathReason = " << spec.residualPathReason << std::endl;
     }
     std::cout << "[HYBRID-DCN][FLOW-PATH] epsFrozenFlows = " << epsFrozenFlows
               << std::endl;
@@ -5340,6 +5464,8 @@ main(int argc, char* argv[])
     }
     std::cout << "[HYBRID-DCN][ROUTE] ocsPairHostRoutes = " << ocsPairHostRoutes
               << std::endl;
+    std::cout << "[HYBRID-DCN][ROUTE] ocsPairHostRoutesSkippedForEpsResidual = "
+              << ocsPairHostRoutesSkippedForEpsResidual << std::endl;
     if (routeMode == "ocs-forced")
     {
         std::cout << "[HYBRID-DCN][VERIFY] primaryCoveredPairExpectedPath   = "
@@ -5730,6 +5856,11 @@ main(int argc, char* argv[])
                       << "] realResidualDemand = " << spec.realResidualDemand << std::endl;
             std::cout << "[HYBRID-DCN][FLOW-TRACE] flow[" << flowIndex
                       << "] wecmpResidualDemand = " << spec.wecmpResidualDemand << std::endl;
+            std::cout << "[HYBRID-DCN][FLOW-TRACE] flow[" << flowIndex
+                      << "] requiresEpsResidualPath = "
+                      << (requiresEpsResidualPath(spec) ? "true" : "false") << std::endl;
+            std::cout << "[HYBRID-DCN][FLOW-TRACE] flow[" << flowIndex
+                      << "] residualPathReason = " << spec.residualPathReason << std::endl;
             std::cout << "[HYBRID-DCN][FLOW-TRACE] flow[" << flowIndex
                       << "] epsPathFrozen = " << (spec.epsPathFrozen ? "true" : "false")
                       << std::endl;
@@ -6397,6 +6528,8 @@ main(int argc, char* argv[])
                              "plannedResidualDemand",
                              "realResidualDemand",
                              "wecmpResidualDemand",
+                             "requiresEpsResidualPath",
+                             "residualPathReason",
                              "epsPathFrozen",
                              "frozenSpine",
                              "packetSinkPort",
@@ -6438,6 +6571,8 @@ main(int argc, char* argv[])
                                  csvValue(spec.plannedResidualDemand),
                                  csvValue(spec.realResidualDemand),
                                  csvValue(spec.wecmpResidualDemand),
+                                 csvBool(requiresEpsResidualPath(spec)),
+                                 spec.residualPathReason,
                                  csvBool(spec.epsPathFrozen),
                                  csvValue(spec.frozenSpine),
                                  csvValue(spec.port),
@@ -6974,7 +7109,7 @@ main(int argc, char* argv[])
                     (binding.pathFrozen && !spec.epsPathFrozen) ||
                     (binding.pathFrozen &&
                      spec.frozenSpine != static_cast<int32_t>(binding.selectedSpine)) ||
-                    spec.ocsCovered)
+                    !requiresEpsResidualPath(spec))
                 {
                     routeBindingFreezeCheck = false;
                     break;
@@ -6993,7 +7128,7 @@ main(int argc, char* argv[])
         bool ocsAdmittedNotEpsFrozenCheck = true;
         for (const auto& spec : matrixFlowSpecs)
         {
-            if (spec.ocsCovered && (spec.epsPathFrozen || spec.frozenSpine != -1))
+            if (spec.ocsAdmitted && (spec.epsPathFrozen || spec.frozenSpine != -1))
             {
                 ocsAdmittedNotEpsFrozenCheck = false;
                 break;
@@ -7044,12 +7179,13 @@ main(int argc, char* argv[])
                     ocsCoveredFlowsHaveInstalledPairCheck = false;
                 }
                 if (spec.epsFallback &&
-                    (spec.ocsCovered || spec.wecmpResidualDemand <= 0 ||
+                    (spec.ocsAdmitted || spec.ocsCovered || !requiresEpsResidualPath(spec) ||
+                     spec.wecmpResidualDemand <= 0 ||
                      spec.realResidualDemand <= 0))
                 {
                     fallbackFlowsAreResidualCheck = false;
                 }
-                if (spec.epsPathFrozen && (spec.ocsCovered || spec.wecmpResidualDemand <= 0))
+                if (spec.epsPathFrozen && !requiresEpsResidualPath(spec))
                 {
                     wecmpFrozenFlowsAreResidualCheck = false;
                 }

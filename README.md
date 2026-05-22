@@ -90,6 +90,8 @@ The current code still uses command-line presets and built-in synthetic traffic 
 
 EPS-WECMP still uses control-plane residual demand as its utilization signal. It has not yet been changed to consume ns-3 measured per-link utilization traces.
 
+When OCS admission rejects a selected OCS pair, the current code creates a same-pair EPS fallback matrix flow. Synthetic residual flows are only supplemental residual-path coverage and do not replace an admission fallback pair.
+
 See `docs/algorithm_mapping.md` for the current paper-to-code mapping and known EPS-WECMP telemetry limitations.
 
 `experiments/configs/` and `experiments/runs/` are reserved for future configuration files and run manifests. They do not currently define official experiment groups, traffic patterns, or performance metrics.
