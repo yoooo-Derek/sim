@@ -46,6 +46,7 @@ This repository contains the thesis simulation project for:
 
     docs/
         architecture.md
+        algorithm_mapping.md
 
     build-meta/
 
@@ -88,6 +89,8 @@ The scratch entry now builds the control matrix as:
 The current code still uses command-line presets and built-in synthetic traffic modes inside the simulation entry. Formal experiment modules have not been developed in this repository yet.
 
 EPS-WECMP still uses control-plane residual demand as its utilization signal. It has not yet been changed to consume ns-3 measured per-link utilization traces.
+
+See `docs/algorithm_mapping.md` for the current paper-to-code mapping and known EPS-WECMP telemetry limitations.
 
 `experiments/configs/` and `experiments/runs/` are reserved for future configuration files and run manifests. They do not currently define official experiment groups, traffic patterns, or performance metrics.
 

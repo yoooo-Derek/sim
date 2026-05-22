@@ -75,6 +75,14 @@ OCS candidate scoring, greedy port-constrained selection, config-gate decisions,
 
 The EPS-WECMP update algorithm and route binding logic remain in `main.cc`.
 
+Current telemetry semantics:
+
+- `observedTraffic` in EPS-WECMP state means control-plane estimated residual load.
+- It is computed from residual demand and current WECMP probabilities.
+- It is not ns-3 measured per-link byte or utilization telemetry.
+- `utilization` is computed as estimated residual load divided by `epsWecmpCapacity`.
+- Multi-period WECMP summaries currently copy planned residual demand into the real-residual field as a placeholder; they are not data-plane observed residual measurements.
+
 ## Result
 
 `src/result/` is reserved for later extraction of result summaries, CSV export, validation, and invariant checks. These are still in `main.cc` in the current phase.
@@ -110,5 +118,6 @@ Recommended next refactor steps:
 1. Move config and preset data into an `ExperimentConfig` header without changing defaults.
 2. Move OCS candidate scoring and config-gate helpers into `src/controller/`.
 3. Move EPS-WECMP update helpers into `src/eps/` while preserving current state updates and log fields.
-4. Move result export and invariant checks into `src/result/`.
-5. Move ns-3 topology and routing installation into `src/helper/` only after algorithm-level modules are stable.
+4. Add an EPS telemetry module only after the measurement window, event schedule, and per-link utilization definition are fixed.
+5. Move result export and invariant checks into `src/result/`.
+6. Move ns-3 topology and routing installation into `src/helper/` only after algorithm-level modules are stable.

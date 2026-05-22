@@ -4057,7 +4057,12 @@ main(int argc, char* argv[])
 
     std::cout << "[HYBRID-DCN][WECMP] enabled = "
               << (enableEpsWecmp ? "true" : "false") << std::endl;
-    std::cout << "[HYBRID-DCN][WECMP] source = shared-eps-physical-link-telemetry"
+    std::cout << "[HYBRID-DCN][WECMP] source = control-plane-estimated-residual-load"
+              << std::endl;
+    std::cout << "[HYBRID-DCN][WECMP] ns3MeasuredUtilization = false"
+              << std::endl;
+    std::cout << "[HYBRID-DCN][WECMP] observedTrafficSemantic = "
+                 "residual-demand-weighted-by-current-wecmp-probability"
               << std::endl;
     std::cout << "[HYBRID-DCN][WECMP] rho = " << epsWecmpRho << std::endl;
     std::cout << "[HYBRID-DCN][WECMP] gamma = " << epsWecmpGamma << std::endl;
@@ -4639,6 +4644,12 @@ main(int argc, char* argv[])
 
     std::cout << "[HYBRID-DCN][MULTI-WECMP] enabled = "
               << (multiPeriodWecmpStateEnabled ? "true" : "false") << std::endl;
+    std::cout << "[HYBRID-DCN][MULTI-WECMP] residualTelemetrySource = "
+                 "control-plane-estimated-residual-load"
+              << std::endl;
+    std::cout << "[HYBRID-DCN][MULTI-WECMP] realResidualSemantic = "
+                 "planned-residual-placeholder"
+              << std::endl;
     std::cout << "[HYBRID-DCN][MULTI-WECMP] epochSummaries = "
               << epsWecmpEpochSummaries.size() << std::endl;
     for (const auto& summary : epsWecmpEpochSummaries)

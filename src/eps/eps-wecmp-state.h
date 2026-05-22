@@ -8,6 +8,8 @@
 struct EpsWecmpLinkState
 {
     uint32_t spineIndex;
+    // Current implementation stores control-plane estimated residual load here,
+    // not ns-3 measured per-link bytes.
     double observedTraffic;
     double utilization;
     double smoothedUtilization;
@@ -45,6 +47,8 @@ struct EpsPhysicalLinkState
 {
     uint32_t leafIndex;
     uint32_t spineIndex;
+    // Current implementation stores control-plane estimated residual load here,
+    // not ns-3 measured per-link bytes.
     double observedTraffic;
     double utilization;
     double smoothedUtilization;
