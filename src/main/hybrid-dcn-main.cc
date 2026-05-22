@@ -9,6 +9,18 @@
 #include "ns3/netanim-module.h"
 #include "ns3/point-to-point-module.h"
 
+#if __has_include("../eps/eps-wecmp-state.h")
+#include "../eps/eps-wecmp-state.h"
+#include "../model/louvain.h"
+#include "../ocs/ocs-state.h"
+#include "../traffic/traffic-matrix.h"
+#else
+#include "../../sim/src/eps/eps-wecmp-state.h"
+#include "../../sim/src/model/louvain.h"
+#include "../../sim/src/ocs/ocs-state.h"
+#include "../../sim/src/traffic/traffic-matrix.h"
+#endif
+
 #include <algorithm>
 #include <cmath>
 #include <fstream>
@@ -21,114 +33,6 @@
 #include <vector>
 
 using namespace ns3;
-
-using OcsEdgeAgeMatrix = std::vector<std::vector<uint32_t>>;
-
-std::pair<uint32_t, uint32_t>
-NormalizeEdgePair(uint32_t leafA, uint32_t leafB)
-{
-    return {std::min(leafA, leafB), std::max(leafA, leafB)};
-}
-
-OcsEdgeAgeMatrix
-MakeZeroOcsEdgeAgeMatrix(uint32_t numLeaves)
-{
-    return OcsEdgeAgeMatrix(numLeaves, std::vector<uint32_t>(numLeaves, 0));
-}
-
-uint32_t
-GetOcsEdgeAge(const OcsEdgeAgeMatrix& ageMatrix, uint32_t leafA, uint32_t leafB)
-{
-    if (ageMatrix.empty() || leafA >= ageMatrix.size() || leafB >= ageMatrix.size())
-    {
-        return 0;
-    }
-    const auto pair = NormalizeEdgePair(leafA, leafB);
-    return ageMatrix[pair.first][pair.second];
-}
-
-void
-SetOcsEdgeAge(OcsEdgeAgeMatrix& ageMatrix, uint32_t leafA, uint32_t leafB, uint32_t age)
-{
-    if (ageMatrix.empty() || leafA >= ageMatrix.size() || leafB >= ageMatrix.size())
-    {
-        return;
-    }
-    const auto pair = NormalizeEdgePair(leafA, leafB);
-    ageMatrix[pair.first][pair.second] = age;
-    ageMatrix[pair.second][pair.first] = age;
-}
-
-struct OcsCandidateEdge
-{
-    uint32_t leafA;
-    uint32_t leafB;
-    double traffic;
-    double expected;
-    double modularityGain;
-    double utility;
-    double baseUtility;
-    double communityFactor;
-    double communityUtility;
-    bool intraCommunity;
-    bool wasPreviouslyInstalled;
-    double stateHoldingGain;
-    double selectionScore;
-};
-
-bool
-IsOcsEdgeInSet(const std::vector<OcsCandidateEdge>& edges, uint32_t leafA, uint32_t leafB)
-{
-    for (const auto& edge : edges)
-    {
-        if ((edge.leafA == leafA && edge.leafB == leafB) ||
-            (edge.leafA == leafB && edge.leafB == leafA))
-        {
-            return true;
-        }
-    }
-    return false;
-}
-
-OcsEdgeAgeMatrix
-UpdateOcsEdgeAges(const OcsEdgeAgeMatrix& previousAgeMatrix,
-                  const std::vector<OcsCandidateEdge>& previousEdges,
-                  const std::vector<OcsCandidateEdge>& selectedEdges)
-{
-    OcsEdgeAgeMatrix nextAgeMatrix = MakeZeroOcsEdgeAgeMatrix(previousAgeMatrix.size());
-    for (const auto& edge : selectedEdges)
-    {
-        const bool wasSelectedPreviously =
-            IsOcsEdgeInSet(previousEdges, edge.leafA, edge.leafB);
-        const uint32_t previousAge =
-            wasSelectedPreviously ? GetOcsEdgeAge(previousAgeMatrix, edge.leafA, edge.leafB) : 0;
-        SetOcsEdgeAge(nextAgeMatrix,
-                      edge.leafA,
-                      edge.leafB,
-                      wasSelectedPreviously ? previousAge + 1 : 1);
-    }
-    return nextAgeMatrix;
-}
-
-std::pair<uint32_t, uint32_t>
-GetOcsEdgeAgeRange(const OcsEdgeAgeMatrix& ageMatrix,
-                   const std::vector<OcsCandidateEdge>& edges)
-{
-    if (edges.empty())
-    {
-        return {0, 0};
-    }
-
-    uint32_t minAge = std::numeric_limits<uint32_t>::max();
-    uint32_t maxAge = 0;
-    for (const auto& edge : edges)
-    {
-        const uint32_t age = GetOcsEdgeAge(ageMatrix, edge.leafA, edge.leafB);
-        minAge = std::min(minAge, age);
-        maxAge = std::max(maxAge, age);
-    }
-    return {minAge, maxAge};
-}
 
 struct OcsInstalledLink
 {
@@ -217,35 +121,6 @@ MatrixBulkSinkRxTrace(std::vector<MatrixBulkFlowStats>* stats,
     flowStats.lastRxTime = now;
 }
 
-struct CommunityPreview
-{
-    std::vector<uint32_t> labels;
-    uint32_t communityCount;
-};
-
-struct LouvainLevelSummary
-{
-    uint32_t level;
-    uint32_t nodeCountBefore;
-    uint32_t nodeCountAfter;
-    uint32_t communityCount;
-    uint32_t passes;
-    bool moved;
-    double modularityQ;
-};
-
-struct LouvainResult
-{
-    std::vector<uint32_t> labels;
-    uint32_t communityCount;
-    uint32_t passes;
-    bool moved;
-    double modularityQ;
-    uint32_t levels;
-    bool foldedGraph;
-    std::vector<LouvainLevelSummary> levelSummaries;
-};
-
 struct ControlEpochSummary
 {
     uint32_t epoch;
@@ -303,61 +178,6 @@ struct OcsControllerDecision
     uint32_t selectedConfigAge;
     ControlEpochSummary summary;
     bool success;
-};
-
-struct EpsWecmpLinkState
-{
-    uint32_t spineIndex;
-    double observedTraffic;
-    double utilization;
-    double smoothedUtilization;
-    double attractiveness;
-    double normalizedAttractiveness;
-    double targetProbability;
-    double previousProbability;
-    double updatedProbability;
-    double probabilityDelta;
-    double boundedProbabilityDelta;
-    double pathLoadMetric;
-    double candidatePathLoad;
-};
-
-struct EpsWecmpDecision
-{
-    bool enabled;
-    uint32_t srcLeaf;
-    uint32_t dstLeaf;
-    double residualDemand;
-    uint32_t selectedSpine;
-    std::vector<EpsWecmpLinkState> linkStates;
-};
-
-struct EpsWecmpPairState
-{
-    uint32_t srcLeaf;
-    uint32_t dstLeaf;
-    std::vector<double> probabilities;
-    std::vector<double> smoothedUtilizations;
-    bool initialized;
-};
-
-struct EpsPhysicalLinkState
-{
-    uint32_t leafIndex;
-    uint32_t spineIndex;
-    double observedTraffic;
-    double utilization;
-    double smoothedUtilization;
-};
-
-struct EpsWecmpEpochSummary
-{
-    uint32_t epoch;
-    std::string trafficMatrixMode;
-    uint32_t residualPairs;
-    uint32_t updatedPairs;
-    double totalPlannedResidualDemand;
-    double totalRealResidualDemand;
 };
 
 struct MatrixEpochSummary
@@ -1673,93 +1493,6 @@ main(int argc, char* argv[])
         }
     }
 
-    using WeightedMatrix = std::vector<std::vector<double>>;
-
-    // Synthetic source currently emits the undirected ToR-level communication
-    // intensity matrix A(t), not a directed packet/byte matrix W(t).
-    auto buildSyntheticUndirectedTrafficMatrix = [](const std::string& mode,
-                                                    uint32_t leafCount) {
-        WeightedMatrix matrix(leafCount, std::vector<double>(leafCount, 0.0));
-
-        if (mode == "skewed")
-        {
-            for (uint32_t i = 0; i < leafCount; ++i)
-            {
-                for (uint32_t j = i + 1; j < leafCount; ++j)
-                {
-                    matrix[i][j] = 10.0;
-                    matrix[j][i] = 10.0;
-                }
-            }
-
-            if (leafCount >= 4)
-            {
-                matrix[0][3] = 100.0;
-                matrix[3][0] = 100.0;
-            }
-
-            if (leafCount >= 3)
-            {
-                matrix[1][2] = 30.0;
-                matrix[2][1] = 30.0;
-            }
-        }
-        else if (mode == "clustered")
-        {
-            const uint32_t split = leafCount / 2;
-            for (uint32_t i = 0; i < leafCount; ++i)
-            {
-                for (uint32_t j = i + 1; j < leafCount; ++j)
-                {
-                    const bool sameCluster = (i < split && j < split) || (i >= split && j >= split);
-                    matrix[i][j] = sameCluster ? 80.0 : 10.0;
-                    matrix[j][i] = matrix[i][j];
-                }
-            }
-        }
-        else
-        {
-            for (uint32_t i = 0; i < leafCount; ++i)
-            {
-                for (uint32_t j = i + 1; j < leafCount; ++j)
-                {
-                    matrix[i][j] = 20.0;
-                    matrix[j][i] = 20.0;
-                }
-            }
-        }
-
-        return matrix;
-    };
-
-    auto updateEwmaMatrix = [](const WeightedMatrix& previousAbar,
-                               const WeightedMatrix& currentA,
-                               double beta,
-                               bool hasPreviousAbar) {
-        if (!hasPreviousAbar)
-        {
-            return currentA;
-        }
-
-        WeightedMatrix abar(currentA.size(), std::vector<double>(currentA.size(), 0.0));
-        for (uint32_t i = 0; i < currentA.size(); ++i)
-        {
-            for (uint32_t j = i + 1; j < currentA[i].size(); ++j)
-            {
-                double previous = 0.0;
-                if (i < previousAbar.size() && j < previousAbar[i].size())
-                {
-                    previous = previousAbar[i][j];
-                }
-                const double value =
-                    std::max(beta * previous + (1.0 - beta) * currentA[i][j], 0.0);
-                abar[i][j] = value;
-                abar[j][i] = value;
-            }
-        }
-        return abar;
-    };
-
     WeightedMatrix rawTrafficMatrix =
         buildSyntheticUndirectedTrafficMatrix(trafficMatrixMode, numLeaves);
     WeightedMatrix controlTrafficMatrix =
@@ -1771,77 +1504,11 @@ main(int argc, char* argv[])
     std::vector<std::vector<double>> torTrafficMatrix = controlTrafficMatrix;
     std::string matrixUsedForControl = enableEwmaSmoothing ? "ewma" : "raw";
 
-    auto buildCommunityPreview = [](const std::string& mode, uint32_t leafCount) {
-        CommunityPreview preview;
-        preview.labels.assign(leafCount, 0);
-        preview.communityCount = 0;
-
-        if (mode == "clustered")
-        {
-            const uint32_t split = leafCount / 2;
-            for (uint32_t leafIndex = 0; leafIndex < leafCount; ++leafIndex)
-            {
-                preview.labels[leafIndex] = leafIndex < split ? 0 : 1;
-            }
-            preview.communityCount = leafCount == 0 ? 0 : 2;
-        }
-        else if (mode == "skewed")
-        {
-            if (leafCount >= 4)
-            {
-                preview.labels[0] = 0;
-                preview.labels[3] = 0;
-                preview.labels[1] = 1;
-                preview.labels[2] = 1;
-                uint32_t nextCommunity = 2;
-                for (uint32_t leafIndex = 4; leafIndex < leafCount; ++leafIndex)
-                {
-                    preview.labels[leafIndex] = nextCommunity++;
-                }
-                preview.communityCount = nextCommunity;
-            }
-            else
-            {
-                for (uint32_t leafIndex = 0; leafIndex < leafCount; ++leafIndex)
-                {
-                    preview.labels[leafIndex] = leafIndex;
-                }
-                preview.communityCount = leafCount;
-            }
-        }
-        else
-        {
-            for (uint32_t leafIndex = 0; leafIndex < leafCount; ++leafIndex)
-            {
-                preview.labels[leafIndex] = 0;
-            }
-            preview.communityCount = leafCount == 0 ? 0 : 1;
-        }
-
-        return preview;
-    };
-
     const CommunityPreview communityPreview =
         buildCommunityPreview(trafficMatrixMode, numLeaves);
 
-    std::vector<double> nodeDegree(numLeaves, 0.0);
-    for (uint32_t i = 0; i < numLeaves; ++i)
-    {
-        for (uint32_t j = 0; j < numLeaves; ++j)
-        {
-            nodeDegree[i] += torTrafficMatrix[i][j];
-        }
-    }
-
-    double totalTraffic = 0.0;
-    for (uint32_t i = 0; i < numLeaves; ++i)
-    {
-        for (uint32_t j = 0; j < numLeaves; ++j)
-        {
-            totalTraffic += torTrafficMatrix[i][j];
-        }
-    }
-    totalTraffic *= 0.5;
+    std::vector<double> nodeDegree = computeNodeDegree(torTrafficMatrix);
+    double totalTraffic = computeTotalTraffic(torTrafficMatrix);
 
     if (enableMatrixSelect && selectionMetric == "excess" && totalTraffic <= 0)
     {
@@ -1873,286 +1540,29 @@ main(int argc, char* argv[])
         }
     }
 
-    auto normalizeCommunityLabels = [](std::vector<uint32_t>& labels) {
-        std::vector<uint32_t> oldLabels;
-        for (uint32_t& label : labels)
-        {
-            uint32_t normalized = 0;
-            bool found = false;
-            for (uint32_t index = 0; index < oldLabels.size(); ++index)
-            {
-                if (oldLabels[index] == label)
-                {
-                    normalized = index;
-                    found = true;
-                    break;
-                }
-            }
-
-            if (!found)
-            {
-                normalized = static_cast<uint32_t>(oldLabels.size());
-                oldLabels.push_back(label);
-            }
-            label = normalized;
-        }
-        return static_cast<uint32_t>(oldLabels.size());
-    };
-
-    auto computeNodeDegree = [](const WeightedMatrix& matrix) {
-        std::vector<double> degree(matrix.size(), 0.0);
-        for (uint32_t i = 0; i < matrix.size(); ++i)
-        {
-            for (uint32_t j = 0; j < matrix[i].size(); ++j)
-            {
-                degree[i] += matrix[i][j];
-            }
-        }
-        return degree;
-    };
-
-    auto computeTotalTraffic = [](const WeightedMatrix& matrix) {
-        double traffic = 0.0;
-        for (uint32_t i = 0; i < matrix.size(); ++i)
-        {
-            for (uint32_t j = 0; j < matrix[i].size(); ++j)
-            {
-                traffic += matrix[i][j];
-            }
-        }
-        return traffic * 0.5;
-    };
-
-    auto computeModularityQ = [&](const WeightedMatrix& matrix,
-                                  const std::vector<uint32_t>& labels) {
-        const double graphTraffic = computeTotalTraffic(matrix);
-        if (graphTraffic <= 0 || matrix.empty())
-        {
-            return 0.0;
-        }
-
-        const std::vector<double> degree = computeNodeDegree(matrix);
-        const double twoM = 2.0 * graphTraffic;
-        double modularitySum = 0.0;
-        for (uint32_t i = 0; i < matrix.size(); ++i)
-        {
-            for (uint32_t j = 0; j < matrix[i].size(); ++j)
-            {
-                if (labels[i] != labels[j])
-                {
-                    continue;
-                }
-                const double expected = degree[i] * degree[j] / twoM;
-                modularitySum += matrix[i][j] - (eta * expected);
-            }
-        }
-        return modularitySum / twoM;
-    };
-
-    auto runLocalMoving = [&](const WeightedMatrix& matrix) {
-        LouvainResult result;
-        const uint32_t nodeCount = static_cast<uint32_t>(matrix.size());
-        result.labels.resize(nodeCount);
-        for (uint32_t nodeIndex = 0; nodeIndex < nodeCount; ++nodeIndex)
-        {
-            result.labels[nodeIndex] = nodeIndex;
-        }
-        result.communityCount = nodeCount;
-        result.passes = 0;
-        result.moved = false;
-        result.modularityQ = computeModularityQ(matrix, result.labels);
-        result.levels = 1;
-        result.foldedGraph = false;
-
-        for (uint32_t pass = 0; pass < louvainMaxPasses; ++pass)
-        {
-            bool passMoved = false;
-            for (uint32_t nodeIndex = 0; nodeIndex < nodeCount; ++nodeIndex)
-            {
-                const uint32_t oldLabel = result.labels[nodeIndex];
-                std::vector<uint32_t> candidateLabels;
-                candidateLabels.push_back(oldLabel);
-                for (uint32_t neighbor = 0; neighbor < nodeCount; ++neighbor)
-                {
-                    if (matrix[nodeIndex][neighbor] <= 0)
-                    {
-                        continue;
-                    }
-
-                    const uint32_t neighborLabel = result.labels[neighbor];
-                    if (std::find(candidateLabels.begin(),
-                                  candidateLabels.end(),
-                                  neighborLabel) == candidateLabels.end())
-                    {
-                        candidateLabels.push_back(neighborLabel);
-                    }
-                }
-                std::sort(candidateLabels.begin(), candidateLabels.end());
-
-                const double currentQ = computeModularityQ(matrix, result.labels);
-                double bestQ = currentQ;
-                uint32_t bestLabel = oldLabel;
-                std::vector<uint32_t> bestLabels = result.labels;
-
-                for (uint32_t candidateLabel : candidateLabels)
-                {
-                    std::vector<uint32_t> trialLabels = result.labels;
-                    trialLabels[nodeIndex] = candidateLabel;
-                    normalizeCommunityLabels(trialLabels);
-                    const double trialQ = computeModularityQ(matrix, trialLabels);
-                    const uint32_t trialLabel = trialLabels[nodeIndex];
-
-                    if (trialQ > bestQ + louvainEpsilon ||
-                        (std::abs(trialQ - bestQ) <= louvainEpsilon &&
-                         trialLabel < bestLabel))
-                    {
-                        bestQ = trialQ;
-                        bestLabel = trialLabel;
-                        bestLabels = trialLabels;
-                    }
-                }
-
-                if (bestLabels != result.labels)
-                {
-                    result.labels = bestLabels;
-                    result.communityCount = normalizeCommunityLabels(result.labels);
-                    passMoved = true;
-                    result.moved = true;
-                }
-            }
-
-            result.passes = pass + 1;
-            if (!passMoved)
-            {
-                break;
-            }
-        }
-
-        result.communityCount = normalizeCommunityLabels(result.labels);
-        result.modularityQ = computeModularityQ(matrix, result.labels);
-        result.levelSummaries.push_back(LouvainLevelSummary{0,
-                                                            nodeCount,
-                                                            result.communityCount,
-                                                            result.communityCount,
-                                                            result.passes,
-                                                            result.moved,
-                                                            result.modularityQ});
-        return result;
-    };
-
-    auto buildCoarsenedGraph = [](const WeightedMatrix& matrix,
-                                  const std::vector<uint32_t>& labels,
-                                  uint32_t communityCount) {
-        WeightedMatrix coarsened(communityCount, std::vector<double>(communityCount, 0.0));
-        for (uint32_t i = 0; i < matrix.size(); ++i)
-        {
-            for (uint32_t j = 0; j < matrix[i].size(); ++j)
-            {
-                coarsened[labels[i]][labels[j]] += matrix[i][j];
-            }
-        }
-        return coarsened;
-    };
-
-    auto runSingleLevelLouvain = [&]() {
-        LouvainResult result = runLocalMoving(torTrafficMatrix);
-        result.modularityQ = computeModularityQ(torTrafficMatrix, result.labels);
-        result.levels = 1;
-        result.foldedGraph = false;
-        if (!result.levelSummaries.empty())
-        {
-            result.levelSummaries[0].level = 0;
-            result.levelSummaries[0].nodeCountBefore = numLeaves;
-            result.levelSummaries[0].nodeCountAfter = result.communityCount;
-            result.levelSummaries[0].communityCount = result.communityCount;
-            result.levelSummaries[0].modularityQ = result.modularityQ;
-        }
-        return result;
-    };
-
-    auto runMultiLevelLouvain = [&]() {
-        WeightedMatrix currentMatrix = torTrafficMatrix;
-        std::vector<uint32_t> originalToCurrent(numLeaves);
-        for (uint32_t leafIndex = 0; leafIndex < numLeaves; ++leafIndex)
-        {
-            originalToCurrent[leafIndex] = leafIndex;
-        }
-
-        LouvainResult result;
-        result.labels = originalToCurrent;
-        result.communityCount = numLeaves;
-        result.passes = 0;
-        result.moved = false;
-        result.modularityQ = computeModularityQ(torTrafficMatrix, result.labels);
-        result.levels = 0;
-        result.foldedGraph = false;
-
-        double previousLevelQ = 0.0;
-        bool havePreviousLevelQ = false;
-        for (uint32_t level = 0; level < louvainMaxLevels; ++level)
-        {
-            LouvainResult local = runLocalMoving(currentMatrix);
-            result.passes += local.passes;
-            result.moved = result.moved || local.moved;
-
-            for (uint32_t leafIndex = 0; leafIndex < numLeaves; ++leafIndex)
-            {
-                originalToCurrent[leafIndex] = local.labels[originalToCurrent[leafIndex]];
-            }
-            result.communityCount = normalizeCommunityLabels(originalToCurrent);
-
-            const uint32_t nodeCountBefore = static_cast<uint32_t>(currentMatrix.size());
-            result.levelSummaries.push_back(LouvainLevelSummary{level,
-                                                                nodeCountBefore,
-                                                                local.communityCount,
-                                                                local.communityCount,
-                                                                local.passes,
-                                                                local.moved,
-                                                                local.modularityQ});
-            result.levels = static_cast<uint32_t>(result.levelSummaries.size());
-
-            if (local.communityCount == nodeCountBefore)
-            {
-                break;
-            }
-
-            if (havePreviousLevelQ &&
-                std::abs(local.modularityQ - previousLevelQ) <= louvainEpsilon)
-            {
-                break;
-            }
-
-            WeightedMatrix coarsened =
-                buildCoarsenedGraph(currentMatrix, local.labels, local.communityCount);
-            if (coarsened.size() == currentMatrix.size())
-            {
-                break;
-            }
-
-            result.foldedGraph = true;
-            previousLevelQ = local.modularityQ;
-            havePreviousLevelQ = true;
-            currentMatrix = coarsened;
-        }
-
-        result.labels = originalToCurrent;
-        result.communityCount = normalizeCommunityLabels(result.labels);
-        result.modularityQ = computeModularityQ(torTrafficMatrix, result.labels);
-        return result;
-    };
-
     LouvainResult louvainResult{communityPreview.labels,
                                 communityPreview.communityCount,
                                 0,
                                 false,
-                                computeModularityQ(torTrafficMatrix, communityPreview.labels),
+                                computeModularityQ(torTrafficMatrix, communityPreview.labels, eta),
                                 0,
                                 false,
                                 {}};
     if (communityMode == "louvain")
     {
         louvainResult =
-            louvainMode == "multi-level" ? runMultiLevelLouvain() : runSingleLevelLouvain();
+            louvainMode == "multi-level"
+                ? runMultiLevelLouvain(torTrafficMatrix,
+                                       numLeaves,
+                                       louvainMaxPasses,
+                                       louvainMaxLevels,
+                                       louvainEpsilon,
+                                       eta)
+                : runSingleLevelLouvain(torTrafficMatrix,
+                                        numLeaves,
+                                        louvainMaxPasses,
+                                        louvainEpsilon,
+                                        eta);
     }
     std::vector<uint32_t> activeCommunityLabels =
         communityMode == "louvain" ? louvainResult.labels : communityPreview.labels;
@@ -2852,22 +2262,30 @@ main(int argc, char* argv[])
 
             const CommunityPreview epochPreview =
                 buildCommunityPreview(matrixModeName, numLeaves);
-            const WeightedMatrix savedMatrix = torTrafficMatrix;
-            torTrafficMatrix = matrix;
             LouvainResult epochLouvain{epochPreview.labels,
                                        epochPreview.communityCount,
                                        0,
                                        false,
-                                       computeModularityQ(matrix, epochPreview.labels),
+                                       computeModularityQ(matrix, epochPreview.labels, eta),
                                        0,
                                        false,
                                        {}};
             if (communityMode == "louvain")
             {
-                epochLouvain = louvainMode == "multi-level" ? runMultiLevelLouvain()
-                                                            : runSingleLevelLouvain();
+                epochLouvain =
+                    louvainMode == "multi-level"
+                        ? runMultiLevelLouvain(matrix,
+                                               numLeaves,
+                                               louvainMaxPasses,
+                                               louvainMaxLevels,
+                                               louvainEpsilon,
+                                               eta)
+                        : runSingleLevelLouvain(matrix,
+                                                numLeaves,
+                                                louvainMaxPasses,
+                                                louvainEpsilon,
+                                                eta);
             }
-            torTrafficMatrix = savedMatrix;
 
             std::vector<uint32_t> epochLabels =
                 communityMode == "louvain" ? epochLouvain.labels : epochPreview.labels;
