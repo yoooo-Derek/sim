@@ -7,9 +7,8 @@
 #include <vector>
 
 using WeightedMatrix = std::vector<std::vector<double>>;
+using DirectedTrafficMatrix = WeightedMatrix;
 
-// Synthetic source currently emits the undirected ToR-level communication
-// intensity matrix A(t), not a directed packet/byte matrix W(t).
 inline WeightedMatrix
 buildSyntheticUndirectedTrafficMatrix(const std::string& mode, uint32_t leafCount)
 {
@@ -64,6 +63,72 @@ buildSyntheticUndirectedTrafficMatrix(const std::string& mode, uint32_t leafCoun
     }
 
     return matrix;
+}
+
+inline DirectedTrafficMatrix
+buildSyntheticDirectedTrafficMatrix(const std::string& mode, uint32_t leafCount)
+{
+    const WeightedMatrix undirected = buildSyntheticUndirectedTrafficMatrix(mode, leafCount);
+    DirectedTrafficMatrix directed(leafCount, std::vector<double>(leafCount, 0.0));
+
+    for (uint32_t i = 0; i < leafCount; ++i)
+    {
+        for (uint32_t j = i + 1; j < leafCount; ++j)
+        {
+            const double directionalDemand = std::max(undirected[i][j], 0.0) * 0.5;
+            directed[i][j] = directionalDemand;
+            directed[j][i] = directionalDemand;
+        }
+    }
+
+    return directed;
+}
+
+inline WeightedMatrix
+buildUndirectedCommunicationIntensityMatrix(const DirectedTrafficMatrix& directed)
+{
+    const uint32_t size = static_cast<uint32_t>(directed.size());
+    WeightedMatrix undirected(size, std::vector<double>(size, 0.0));
+
+    for (uint32_t i = 0; i < size; ++i)
+    {
+        for (uint32_t j = i + 1; j < size; ++j)
+        {
+            double reverse = 0.0;
+            if (j < directed.size() && i < directed[j].size())
+            {
+                reverse = directed[j][i];
+            }
+            const double forward = j < directed[i].size() ? directed[i][j] : 0.0;
+            const double communicationIntensity = std::max(forward + reverse, 0.0);
+            undirected[i][j] = communicationIntensity;
+            undirected[j][i] = communicationIntensity;
+        }
+    }
+
+    return undirected;
+}
+
+inline WeightedMatrix
+applyTrafficGraphThreshold(const WeightedMatrix& matrix, double threshold)
+{
+    WeightedMatrix filtered(matrix.size(), std::vector<double>(matrix.size(), 0.0));
+    const double effectiveThreshold = std::max(threshold, 0.0);
+
+    for (uint32_t i = 0; i < matrix.size(); ++i)
+    {
+        for (uint32_t j = i + 1; j < matrix[i].size(); ++j)
+        {
+            const double value = matrix[i][j] >= effectiveThreshold ? matrix[i][j] : 0.0;
+            filtered[i][j] = value;
+            if (j < filtered.size() && i < filtered[j].size())
+            {
+                filtered[j][i] = value;
+            }
+        }
+    }
+
+    return filtered;
 }
 
 inline WeightedMatrix

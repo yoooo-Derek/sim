@@ -4,7 +4,7 @@
 
 The project remains an ns-3 scratch-compatible simulation. The executable entry is still `src/main/hybrid-dcn-main.cc`, and `~/ns-3.47/scratch/hybrid-dcn-main.cc` should remain a symbolic link to that file.
 
-The first refactor phase only moved pure data structures and pure algorithm helpers out of `main.cc`. It did not change the Louvain logic, OCS scheduling behavior, OCS admission behavior, EPS-WECMP behavior, ns-3 topology construction, routing installation, flow installation, result semantics, or experiment presets.
+The first refactor phase moved pure data structures and pure algorithm helpers out of `main.cc`. The follow-up algorithm-alignment pass added the explicit paper traffic pipeline `W(t) -> A(t) -> G_f(t) -> A_bar(t)` while preserving default synthetic matrix values. It did not rewrite Louvain logic, OCS scheduling behavior, OCS admission behavior, EPS-WECMP behavior, ns-3 topology construction, routing installation, flow installation, result semantics, or experiment presets.
 
 ## `main.cc`
 
@@ -24,7 +24,9 @@ It is intentionally kept as the scratch entry so the existing ns-3 run path rema
 `src/traffic/traffic-matrix.h` owns the first extracted traffic helpers:
 
 - `WeightedMatrix`
-- synthetic undirected ToR-level traffic matrix generation
+- synthetic directed ToR-level traffic matrix `W(t)` generation
+- conversion from directed `W(t)` to undirected communication intensity `A(t)`
+- traffic graph sparsification using `trafficGraphThreshold` / `theta_f`
 - EWMA matrix update
 - node degree calculation
 - total traffic calculation
@@ -96,6 +98,7 @@ The following logic intentionally remains in `main.cc` after this first low-risk
 - hold-time gate orchestration
 - OCS admission control
 - EPS-WECMP probability update behavior
+- EPS-WECMP utilization telemetry, which currently uses control-plane residual demand rather than ns-3 measured link utilization
 - ns-3 topology, route, and application installation
 - structured result export
 - result validation and invariant checks

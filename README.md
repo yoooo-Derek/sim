@@ -64,7 +64,7 @@ The scratch-compatible entry is preserved so the existing run command continues 
 ## Current Module Responsibilities
 
 - `src/main/hybrid-dcn-main.cc`: ns-3 scratch entry, command-line parsing, preset application, topology construction, routing installation, application installation, result logging, validation, and invariant orchestration.
-- `src/traffic/traffic-matrix.h`: `WeightedMatrix`, synthetic undirected traffic matrix generation, node degree, total traffic, and EWMA update helpers.
+- `src/traffic/traffic-matrix.h`: `WeightedMatrix`, synthetic directed traffic matrix `W(t)` generation, conversion from `W(t)` to undirected communication intensity `A(t)`, `theta_f` traffic-graph sparsification, node degree, total traffic, and EWMA update helpers.
 - `src/model/louvain.h`: community preview, modularity Q, local moving, graph coarsening, single-level Louvain, and multi-level Louvain helpers.
 - `src/ocs/ocs-state.h`: OCS candidate edge data and OCS edge age/state helper functions.
 - `src/eps/eps-wecmp-state.h`: EPS-WECMP data structures only.
@@ -77,9 +77,17 @@ Run from the ns-3 root:
     cd ~/ns-3.47
     ./ns3 run "hybrid-dcn-main --simTime=1.0 --experimentName=refactor-smoke"
 
+The scratch entry now builds the control matrix as:
+
+    synthetic W(t) -> A(t) -> thresholded G_f(t) -> optional EWMA A_bar(t)
+
+`trafficGraphThreshold` defaults to `0.0`, so the default synthetic runs preserve the previous unfiltered behavior.
+
 ## Experiment Status
 
 The current code still uses command-line presets and built-in synthetic traffic modes inside the simulation entry. Formal experiment modules have not been developed in this repository yet.
+
+EPS-WECMP still uses control-plane residual demand as its utilization signal. It has not yet been changed to consume ns-3 measured per-link utilization traces.
 
 `experiments/configs/` and `experiments/runs/` are reserved for future configuration files and run manifests. They do not currently define official experiment groups, traffic patterns, or performance metrics.
 

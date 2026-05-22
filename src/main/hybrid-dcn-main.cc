@@ -385,6 +385,7 @@ main(int argc, char* argv[])
     bool enableEwmaSmoothing = false;
     double ewmaBeta = 0.7;
     std::string trafficMatrixSource = "synthetic";
+    double trafficGraphThreshold = 0.0;
     std::string communityMode = "preview";
     std::string louvainMode = "single-level";
     uint32_t louvainMaxPasses = 10;
@@ -505,6 +506,7 @@ main(int argc, char* argv[])
             "enableEwmaSmoothing",
             "ewmaBeta",
             "trafficMatrixSource",
+            "trafficGraphThreshold",
             "enableOcsAdmissionControl",
             "ocsAdmissionThreshold",
             "matrixFlowDemand",
@@ -634,6 +636,9 @@ main(int argc, char* argv[])
     cmd.AddValue("trafficMatrixSource",
                  "Traffic matrix source. Current implementation supports synthetic only.",
                  trafficMatrixSource);
+    cmd.AddValue("trafficGraphThreshold",
+                 "Traffic graph sparsification threshold theta_f applied to A(t).",
+                 trafficGraphThreshold);
     cmd.AddValue("communityMode", "Community label source: preview or louvain.", communityMode);
     cmd.AddValue("louvainMode", "Louvain mode: single-level or multi-level.", louvainMode);
     cmd.AddValue("louvainMaxPasses", "Maximum passes per Louvain local-moving level.", louvainMaxPasses);
@@ -1222,6 +1227,13 @@ main(int argc, char* argv[])
         return 1;
     }
 
+    if (trafficGraphThreshold < 0)
+    {
+        std::cerr << "[HYBRID-DCN][ERROR] trafficGraphThreshold must be non-negative."
+                  << std::endl;
+        return 1;
+    }
+
     if (trafficMatrixSequence != "static" && trafficMatrixSequence != "skewed-to-clustered" &&
         trafficMatrixSequence != "clustered-to-skewed" && trafficMatrixSequence != "alternating")
     {
@@ -1493,12 +1505,16 @@ main(int argc, char* argv[])
         }
     }
 
+    DirectedTrafficMatrix rawDirectedTrafficMatrix =
+        buildSyntheticDirectedTrafficMatrix(trafficMatrixMode, numLeaves);
     WeightedMatrix rawTrafficMatrix =
-        buildSyntheticUndirectedTrafficMatrix(trafficMatrixMode, numLeaves);
+        buildUndirectedCommunicationIntensityMatrix(rawDirectedTrafficMatrix);
+    WeightedMatrix trafficGraphMatrix =
+        applyTrafficGraphThreshold(rawTrafficMatrix, trafficGraphThreshold);
     WeightedMatrix controlTrafficMatrix =
         enableEwmaSmoothing
-            ? updateEwmaMatrix(WeightedMatrix{}, rawTrafficMatrix, ewmaBeta, false)
-            : rawTrafficMatrix;
+            ? updateEwmaMatrix(WeightedMatrix{}, trafficGraphMatrix, ewmaBeta, false)
+            : trafficGraphMatrix;
     // Compatibility name used by the existing control-plane code path. It
     // represents the control matrix, not necessarily the raw demand matrix.
     std::vector<std::vector<double>> torTrafficMatrix = controlTrafficMatrix;
@@ -2575,12 +2591,19 @@ main(int argc, char* argv[])
         for (uint32_t epoch = 0; epoch < controlEpochs; ++epoch)
         {
             const std::string epochMatrixMode = getEpochMatrixMode(epoch);
+            const DirectedTrafficMatrix currentW =
+                buildSyntheticDirectedTrafficMatrix(epochMatrixMode, numLeaves);
             const WeightedMatrix currentA =
-                buildSyntheticUndirectedTrafficMatrix(epochMatrixMode, numLeaves);
+                buildUndirectedCommunicationIntensityMatrix(currentW);
+            const WeightedMatrix currentTrafficGraph =
+                applyTrafficGraphThreshold(currentA, trafficGraphThreshold);
             const WeightedMatrix epochControlMatrix =
                 enableEwmaSmoothing
-                    ? updateEwmaMatrix(previousAbar, currentA, ewmaBeta, hasPreviousAbar)
-                    : currentA;
+                    ? updateEwmaMatrix(previousAbar,
+                                       currentTrafficGraph,
+                                       ewmaBeta,
+                                       hasPreviousAbar)
+                    : currentTrafficGraph;
             if (enableEwmaSmoothing)
             {
                 previousAbar = epochControlMatrix;
@@ -4282,14 +4305,18 @@ main(int argc, char* argv[])
     std::cout << "[HYBRID-DCN][MATRIX] enableEwmaSmoothing = "
               << (enableEwmaSmoothing ? "true" : "false") << std::endl;
     std::cout << "[HYBRID-DCN][MATRIX] ewmaBeta = " << ewmaBeta << std::endl;
+    std::cout << "[HYBRID-DCN][MATRIX] trafficGraphThreshold = "
+              << trafficGraphThreshold << std::endl;
     std::cout << "[HYBRID-DCN][MATRIX] matrixUsedForControl = "
               << matrixUsedForControl << std::endl;
-    std::cout << "[HYBRID-DCN][MATRIX] matrixSemantic = undirected-synthetic-A"
+    std::cout << "[HYBRID-DCN][MATRIX] matrixSemantic = directed-W-to-undirected-A"
               << std::endl;
-    std::cout << "[HYBRID-DCN][MATRIX] rawMatrixSemantic = undirected-synthetic-demand-A"
+    std::cout << "[HYBRID-DCN][MATRIX] rawMatrixSemantic = synthetic-directed-W-derived-A"
               << std::endl;
     std::cout << "[HYBRID-DCN][MATRIX] controlMatrixSemantic = "
-              << (enableEwmaSmoothing ? "ewma-smoothed-Abar" : "raw") << std::endl;
+              << (enableEwmaSmoothing ? "thresholded-ewma-smoothed-Abar"
+                                       : "thresholded-traffic-graph")
+              << std::endl;
     std::cout << "[HYBRID-DCN][MATRIX] rawTotalTraffic = "
               << computeTotalTraffic(rawTrafficMatrix) << std::endl;
     std::cout << "[HYBRID-DCN][MATRIX] controlTotalTraffic = "
@@ -4655,6 +4682,8 @@ main(int argc, char* argv[])
               << trafficMatrixSource << std::endl;
     std::cout << "[HYBRID-DCN][PAPER] ewmaEnabled = "
               << (enableEwmaSmoothing ? "true" : "false") << std::endl;
+    std::cout << "[HYBRID-DCN][PAPER] trafficGraphThreshold = "
+              << trafficGraphThreshold << std::endl;
     std::cout << "[HYBRID-DCN][PAPER] ocsAdmissionControlEnabled = "
               << (enableOcsAdmissionControl ? "true" : "false") << std::endl;
     std::cout << "[HYBRID-DCN][PAPER] epsWecmpEnabled = "
@@ -4695,6 +4724,8 @@ main(int argc, char* argv[])
     std::cout << "[HYBRID-DCN][CONTROL] ewmaEnabled = "
               << (enableEwmaSmoothing ? "true" : "false") << std::endl;
     std::cout << "[HYBRID-DCN][CONTROL] ewmaBeta = " << ewmaBeta << std::endl;
+    std::cout << "[HYBRID-DCN][CONTROL] trafficGraphThreshold = "
+              << trafficGraphThreshold << std::endl;
     std::cout << "[HYBRID-DCN][CONTROL] ocsAdmissionControlEnabled = "
               << (enableOcsAdmissionControl ? "true" : "false") << std::endl;
     std::cout << "[HYBRID-DCN][CONTROL] epsWecmpEnabled = "
@@ -5854,6 +5885,8 @@ main(int argc, char* argv[])
     std::cout << "[HYBRID-DCN][RESULT] ewmaEnabled = "
               << (enableEwmaSmoothing ? "true" : "false") << std::endl;
     std::cout << "[HYBRID-DCN][RESULT] ewmaBeta = " << ewmaBeta << std::endl;
+    std::cout << "[HYBRID-DCN][RESULT] trafficGraphThreshold = "
+              << trafficGraphThreshold << std::endl;
     std::cout << "[HYBRID-DCN][RESULT] ocsAdmissionControlEnabled = "
               << (enableOcsAdmissionControl ? "true" : "false") << std::endl;
     std::cout << "[HYBRID-DCN][RESULT] epsWecmpEnabled = "
@@ -6265,6 +6298,7 @@ main(int argc, char* argv[])
                              "trafficMatrixMode",
                              "trafficMatrixSource",
                              "enableEwmaSmoothing",
+                             "trafficGraphThreshold",
                              "configScoreMode",
                              "selectionMetric",
                              "communityMode",
@@ -6294,6 +6328,7 @@ main(int argc, char* argv[])
                              trafficMatrixMode,
                              trafficMatrixSource,
                              csvBool(enableEwmaSmoothing),
+                             csvValue(trafficGraphThreshold),
                              configScoreMode,
                              selectionMetric,
                              communityMode,
