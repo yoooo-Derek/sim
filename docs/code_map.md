@@ -229,8 +229,8 @@ sim/
 |---|---|---|
 | 创建 spine、leaf、server nodes | `src/main/hybrid-dcn-main.cc:3118-3123` | `NodeContainer spines/leaves/servers` |
 | 安装 Internet stack | `src/main/hybrid-dcn-main.cc:3129-3132` | 对 spine、leaf、server 安装协议栈 |
-| server-leaf P2P helper | `src/main/hybrid-dcn-main.cc:3158-3160` | 默认 `25Gbps`、`10us` |
-| leaf-spine EPS P2P helper | `src/main/hybrid-dcn-main.cc:3162-3164` | 默认 `100Gbps`、`20us` |
+| server-leaf P2P helper | `src/main/hybrid-dcn-main.cc:3158-3160` | 默认 `25Gbps`、`1us`，已按当前源码复核 |
+| leaf-spine EPS P2P helper | `src/main/hybrid-dcn-main.cc:3162-3164` | 默认 `40Gbps`、`2us`，已按当前源码复核 |
 | 安装 server-leaf 链路 | `src/main/hybrid-dcn-main.cc:3190-3203` | 给 server 和 leaf 分配子网 |
 | 安装 leaf-spine EPS 链路 | `src/main/hybrid-dcn-main.cc:3206-3221` | 同时接 EPS MacTx trace |
 
@@ -487,3 +487,42 @@ sim/
 1. 第五节“论文算法到代码的对应关系”：确认公式和代码位置是否与 V2 文稿一致。
 2. 第六节“当前工程能力判断”：确认哪些能力只能用于小规模控制面验证。
 3. 第七节“风险清单”：优先处理 WECMP 真实链路利用率、OCS 动态重构、FCT/p99 指标不足三类问题。
+
+## 文档校准记录
+
+校准时间：2026-05-25
+
+### 本次复核的源码文件
+
+- `src/main/hybrid-dcn-main.cc`
+- `src/traffic/traffic-matrix.h`
+- `src/model/louvain.h`
+- `src/ocs/ocs-state.h`
+- `src/eps/eps-wecmp-state.h`
+
+### 本次修正的具体条目
+
+- 已按当前源码复核并修正拓扑链路参数：
+  - server-leaf `PointToPointHelper serverLeafP2p` 为 `25Gbps / 1us`，位置 `src/main/hybrid-dcn-main.cc:3158-3160`。
+  - leaf-spine `PointToPointHelper leafSpineP2p` 为 `40Gbps / 2us`，位置 `src/main/hybrid-dcn-main.cc:3162-3164`。
+  - OCS 默认参数保持为 `ocsDataRate="100Gbps"`、`ocsDelay="5us"`，位置 `src/main/hybrid-dcn-main.cc:382-383`。
+- 已复核 `main()` 位置：函数名在 `src/main/hybrid-dcn-main.cc:354`。
+- 已复核 `CommandLine` 参数默认值和注册位置：默认值集中在 `src/main/hybrid-dcn-main.cc:356-447`，注册集中在 `src/main/hybrid-dcn-main.cc:599-754`。
+- 已复核 CSV 输出位置和字段：summary `6437-6505`，flows `6513-6593`，WECMP `6601-6646`，OCS candidates `6654-6692`。
+- 已复核 WECMP `observedTraffic` 语义：`src/eps/eps-wecmp-state.h:11-13`、`49-52` 明确标注为 control-plane estimated residual load，不是 ns-3 measured per-link bytes。
+- 已复核 `trafficMatrixSource`：当前校验只允许 `synthetic`，位置 `src/main/hybrid-dcn-main.cc:1219-1224`。
+- 已复核目录状态：`scripts/`、`experiments/configs/`、`experiments/runs/`、`build-meta/`、`src/utils/` 当前未发现文件；`results/raw/` 包含历史日志、CSV 和 NetAnim XML；`results/figures/`、`results/tables/` 仅有 `.gitkeep`。
+
+### 是否修改源码
+
+否。未修改任何 `src/` 下源码或头文件。
+
+### 是否运行实验
+
+否。未运行仿真、构建或大规模实验，只执行只读检查命令。
+
+### 当前仍需人工 review 的事项
+
+- 多周期控制是否只是控制面状态推进，而不是 ns-3 时间线上的动态 OCS 重构。
+- WECMP 是否需要接入真实 per-link NetDevice/Queue 观测，避免把控制面估计误写为链路遥测。
+- 结构化 CSV 是否需要补充平均 FCT、99% FCT、per-link utilization 和明确 reconfiguration count 字段。

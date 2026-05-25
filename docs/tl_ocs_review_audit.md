@@ -48,6 +48,10 @@
 当前工程不是模块化 ns-3 应用，而是 scratch-compatible 单入口仿真：
 
 - 主入口：`src/main/hybrid-dcn-main.cc:354` 的 `main()`。
+- 已按当前源码复核的基础链路参数：
+  - server-leaf `PointToPointHelper serverLeafP2p`：`25Gbps / 1us`，位置 `src/main/hybrid-dcn-main.cc:3158-3160`。
+  - leaf-spine `PointToPointHelper leafSpineP2p`：`40Gbps / 2us`，位置 `src/main/hybrid-dcn-main.cc:3162-3164`。
+  - OCS 默认参数：`ocsDataRate="100Gbps"`、`ocsDelay="5us"`，位置 `src/main/hybrid-dcn-main.cc:382-383`。
 - 真实 ns-3 拓扑、路由、应用、结果导出、校验和大部分控制逻辑仍在 `main()` 内。
 - 头文件只承担部分纯数据结构和纯算法辅助：
   - `src/traffic/traffic-matrix.h`：流量矩阵辅助。
@@ -61,23 +65,23 @@
 
 | 论文模块 | 代码位置 | 关键参数/字段 | 输出字段 | 当前状态 |
 |---|---|---|---|---|
-| 原始有向流量矩阵 `W(t)` | `buildSyntheticDirectedTrafficMatrix()`，`src/traffic/traffic-matrix.h:68`；调用点 `src/main/hybrid-dcn-main.cc:1510`、`2596` | `trafficMatrixMode`、`trafficMatrixSource` | `[MATRIX] rawMatrixSemantic`、CSV `rawDemand` | 仅支持 synthetic，不支持外部 trace 或 ns-3 实测矩阵 |
-| 无向通信强度 `A_ij=w_ij+w_ji` | `buildUndirectedCommunicationIntensityMatrix()`，`src/traffic/traffic-matrix.h:87`；调用点 `src/main/hybrid-dcn-main.cc:1512`、`2598` | `rawTrafficMatrix`、`currentA` | `[MATRIX] matrixSemantic`、`rawTraffic[0][3]` | 已实现；输入仍是合成流量 |
-| 流量图稀疏化 `theta_f` | `applyTrafficGraphThreshold()`，`src/traffic/traffic-matrix.h:112`；调用点 `src/main/hybrid-dcn-main.cc:1514`、`2600` | `trafficGraphThreshold` | `[MATRIX] trafficGraphThreshold`、CSV summary `trafficGraphThreshold`（当前代码） | 已实现；历史 CSV 有字段版本不一致 |
-| EWMA `A_bar` | `updateEwmaMatrix()`，`src/traffic/traffic-matrix.h:134`；调用点 `src/main/hybrid-dcn-main.cc:1516`、`2602` | `enableEwmaSmoothing`、`ewmaBeta` | `[MATRIX] matrixUsedForControl`、`controlTraffic[...]` | 单周期无历史时直接等于当前矩阵；多周期才有真实 EWMA 历史 |
-| 节点吞吐度 `d_i` | `computeNodeDegree()`，`src/traffic/traffic-matrix.h:163`；调用点 `src/main/hybrid-dcn-main.cc:1528`、`2258` | `nodeDegree`、`epochDegree` | `[MATRIX] degree[0]`、`degree[3]`、`[TRACE] nodeDegree[i]` | 已实现 |
-| 有效总流量 `M` | `computeTotalTraffic()`，`src/traffic/traffic-matrix.h:177`；调用点 `src/main/hybrid-dcn-main.cc:1529`、`2259` | `totalTraffic`、`epochTotalTraffic` | `[MATRIX] totalTraffic`、`rawTotalTraffic`、`controlTotalTraffic` | 已实现 |
+| 原始有向流量矩阵 `W(t)` | `buildSyntheticDirectedTrafficMatrix()`，`src/traffic/traffic-matrix.h:69`；调用点 `src/main/hybrid-dcn-main.cc:1510`、`2596` | `trafficMatrixMode`、`trafficMatrixSource` | `[MATRIX] rawMatrixSemantic`、CSV `rawDemand` | 仅支持 synthetic，不支持外部 trace 或 ns-3 实测矩阵 |
+| 无向通信强度 `A_ij=w_ij+w_ji` | `buildUndirectedCommunicationIntensityMatrix()`，`src/traffic/traffic-matrix.h:88`；调用点 `src/main/hybrid-dcn-main.cc:1512`、`2598` | `rawTrafficMatrix`、`currentA` | `[MATRIX] matrixSemantic`、`rawTraffic[0][3]` | 已实现；输入仍是合成流量 |
+| 流量图稀疏化 `theta_f` | `applyTrafficGraphThreshold()`，`src/traffic/traffic-matrix.h:113`；调用点 `src/main/hybrid-dcn-main.cc:1514`、`2600` | `trafficGraphThreshold` | `[MATRIX] trafficGraphThreshold`、CSV summary `trafficGraphThreshold`（当前代码） | 已实现；历史 CSV 有字段版本不一致 |
+| EWMA `A_bar` | `updateEwmaMatrix()`，`src/traffic/traffic-matrix.h:135`；调用点 `src/main/hybrid-dcn-main.cc:1516`、`2602` | `enableEwmaSmoothing`、`ewmaBeta` | `[MATRIX] matrixUsedForControl`、`controlTraffic[...]` | 单周期无历史时直接等于当前矩阵；多周期才有真实 EWMA 历史 |
+| 节点吞吐度 `d_i` | `computeNodeDegree()`，`src/traffic/traffic-matrix.h:164`；调用点 `src/main/hybrid-dcn-main.cc:1528`、`2258` | `nodeDegree`、`epochDegree` | `[MATRIX] degree[0]`、`degree[3]`、`[TRACE] nodeDegree[i]` | 已实现 |
+| 有效总流量 `M` | `computeTotalTraffic()`，`src/traffic/traffic-matrix.h:178`；调用点 `src/main/hybrid-dcn-main.cc:1529`、`2259` | `totalTraffic`、`epochTotalTraffic` | `[MATRIX] totalTraffic`、`rawTotalTraffic`、`controlTotalTraffic` | 已实现 |
 | 随机图零模型 `P_ij=d_i*d_j/(2M)` | `src/main/hybrid-dcn-main.cc:1538-1558`、`2260-2278` | `expectedTraffic`、`epochExpected`、`eta` | `[MATRIX] expected[0][3]`、CSV OCS `expected` | 已实现 |
 | 模块度增益 `B_ij=A_bar_ij-eta*P_ij` | `src/main/hybrid-dcn-main.cc:1555`、`2275` | `modularityGain`、`epochGain` | `[MATRIX] B[0][3]`、CSV OCS `modularityGain` | 已实现 |
 | `[B_ij]^+` | `src/main/hybrid-dcn-main.cc:1556`、`2276` | `ocsUtility`、`baseUtility` | `[MATRIX] U[0][3]`、`selectedBaseUtility` | 已实现 |
-| Louvain 社区划分 | `runSingleLevelLouvain()`、`runMultiLevelLouvain()`，`src/model/louvain.h:259`、`281`；调用点 `src/main/hybrid-dcn-main.cc:1569-1584`、`2291-2305` | `communityMode`、`louvainMode`、`louvainMaxPasses`、`louvainMaxLevels` | `[LOUVAIN] modularityQ`、`[COMMUNITY] leaf-* community` | 有实现；`preview` 模式是按 trafficMatrixMode 的预设标签，不是算法结果 |
+| Louvain 社区划分 | `runSingleLevelLouvain()`、`runMultiLevelLouvain()`，`src/model/louvain.h:260`、`282`；调用点 `src/main/hybrid-dcn-main.cc:1569-1584`、`2291-2305` | `communityMode`、`louvainMode`、`louvainMaxPasses`、`louvainMaxLevels` | `[LOUVAIN] modularityQ`、`[COMMUNITY] leaf-* community` | 有实现；`preview` 模式是按 trafficMatrixMode 的预设标签，不是算法结果 |
 | 社区折减 `h(c_i,c_j)` | `makeCandidateEdge`，`src/main/hybrid-dcn-main.cc:1652-1675`；多周期 `2319-2342` | `communityAlpha`、`intraCommunity`、`communityFactor` | `[MATRIX] selectedCommunityFactor`、CSV OCS `communityFactor` | 已实现 |
 | 综合光调度增益 `G_ij=[B]^+h` | `src/main/hybrid-dcn-main.cc:1653-1657`、`2320-2323` | `baseUtility`、`communityUtility` | `communityUtility`、`utility` | 已实现；实际排序指标还受 `selectionMetric` 和 state holding 影响 |
 | 上一周期保持项 `S_ij=G_ij+lambda*x(t-1)` | `src/main/hybrid-dcn-main.cc:1657-1674`、`2324-2341` | `enableStateHolding`、`stateHoldingLambda`、`selectionScore` | `stateHoldingGain`、`selectionScore` | 已实现为加分项 |
 | 端口约束 `sum x_ij <= k` | `src/main/hybrid-dcn-main.cc:1724-1776`、`2377-2487` | `ocsPortK`、`maxSelectedOcsLinks` | `[INVARIANT] ocsPortConstraintCheck` | 已实现贪心近似 |
 | 配置更新阈值 | `src/main/hybrid-dcn-main.cc:1842-1895`、`2489-2517` | `enableConfigUpdateGate`、`configUpdateThreshold`、`configScoreMode` | `[CONFIG] decision`、`configScoreImprovement` | 已实现；`paper-objective` 才包含重构惩罚 |
 | 最小保持周期 | `src/main/hybrid-dcn-main.cc:1689-1693`、`1727-1761`、`2519-2527` | `enableHoldTimeGate`、`minHoldCycles`、`previousConfigAge` | `[HOLD] hardHoldEdges`、`[HOLD-AGE] edge age` | 已实现为硬保留，先占用端口 |
-| NS-3 OCS 物理链路安装 | `AddOcsLink()`，`src/main/hybrid-dcn-main.cc:330`；安装点 `3223-3275` | `enableStaticOcs`、`selectedOcsEdges`、`ocsDataRate`、`ocsDelay` | `[OCS-LINK] installedOcsLinks`、`[RESULT] installedOcsLinks` | 有真实 PointToPoint OCS 链路安装 |
+| NS-3 OCS 物理链路安装 | `AddOcsLink()`，`src/main/hybrid-dcn-main.cc:331`；安装点 `3223-3275` | `enableStaticOcs`、`selectedOcsEdges`、`ocsDataRate`、`ocsDelay` | `[OCS-LINK] installedOcsLinks`、`[RESULT] installedOcsLinks` | 有真实 PointToPoint OCS 链路安装；OCS 默认 `100Gbps / 5us` |
 | OCS/EPS 路由选择 | OCS host route `src/main/hybrid-dcn-main.cc:3560-3636`；WECMP route `3638-3704` | `routeMode=ocs-forced`、`enableEpsWecmpRouting` | `[ROUTE] ocsPairHostRoutes`、`[WECMP-ROUTE] bindings` | 有静态路由绑定；不是动态设备级权重下发 |
 | OCS 准入 | `applyOcsAdmission`，`src/main/hybrid-dcn-main.cc:3345-3391` | `enableOcsAdmissionControl`、`ocsAdmissionThreshold`、`matrixFlowDemand` | `[ADMISSION] ocsAdmitted`、`plannedResidualDemand`、`realResidualDemand` | 有抽象准入；用矩阵单位，不是按真实链路速率/字节窗口计算 |
 | EPS 残余需求 | `computePlannedResidualDemand`，`src/main/hybrid-dcn-main.cc:3337-3343`；矩阵流标记 `3393-3518` | `requiresEpsResidualPath`、`wecmpResidualDemand` | CSV flows `plannedResidualDemand`、`realResidualDemand`、`wecmpResidualDemand` | 已实现控制面残余需求 |
@@ -148,7 +152,7 @@ OCS 使用 PointToPoint 链路并统计 `MacTx`，位置 `src/main/hybrid-dcn-ma
 建议按以下顺序 review：
 
 1. 流量矩阵与 EWMA
-   - `src/traffic/traffic-matrix.h:68-160`
+   - `src/traffic/traffic-matrix.h:69-178`
    - `src/main/hybrid-dcn-main.cc:1510-1524`
    - `src/main/hybrid-dcn-main.cc:2593-2613`
 
@@ -169,7 +173,7 @@ OCS 使用 PointToPoint 链路并统计 `MacTx`，位置 `src/main/hybrid-dcn-ma
    - `src/ocs/ocs-state.h:78-115`
 
 5. OCS 数据面安装和路由强制
-   - `src/main/hybrid-dcn-main.cc:330-350`
+   - `src/main/hybrid-dcn-main.cc:331-350`
    - `src/main/hybrid-dcn-main.cc:3223-3275`
    - `src/main/hybrid-dcn-main.cc:3560-3636`
 
@@ -205,3 +209,50 @@ OCS 使用 PointToPoint 链路并统计 `MacTx`，位置 `src/main/hybrid-dcn-ma
 
 但当前工程还不能被描述为完整论文级实验平台：流量矩阵、OCS 准入容量、WECMP 链路状态大多仍是控制面抽象或合成估计；结果指标不足以支撑平均 FCT、99% FCT、真实吞吐、真实链路利用率和重构次数等完整论文结论。
 
+## 文档校准记录
+
+校准时间：2026-05-25
+
+### 本次复核的源码文件
+
+- `src/main/hybrid-dcn-main.cc`
+- `src/traffic/traffic-matrix.h`
+- `src/model/louvain.h`
+- `src/ocs/ocs-state.h`
+- `src/eps/eps-wecmp-state.h`
+
+### 本次修正的具体条目
+
+- 已按当前源码复核并补充基础拓扑链路参数：
+  - server-leaf `PointToPointHelper serverLeafP2p` 为 `25Gbps / 1us`，位置 `src/main/hybrid-dcn-main.cc:3158-3160`。
+  - leaf-spine `PointToPointHelper leafSpineP2p` 为 `40Gbps / 2us`，位置 `src/main/hybrid-dcn-main.cc:3162-3164`。
+  - OCS 默认参数为 `ocsDataRate="100Gbps"`、`ocsDelay="5us"`，位置 `src/main/hybrid-dcn-main.cc:382-383`。
+- 已校准若干源码函数入口行号：
+  - `buildSyntheticDirectedTrafficMatrix()`：`src/traffic/traffic-matrix.h:69`。
+  - `buildUndirectedCommunicationIntensityMatrix()`：`src/traffic/traffic-matrix.h:88`。
+  - `applyTrafficGraphThreshold()`：`src/traffic/traffic-matrix.h:113`。
+  - `updateEwmaMatrix()`：`src/traffic/traffic-matrix.h:135`。
+  - `computeNodeDegree()`：`src/traffic/traffic-matrix.h:164`。
+  - `computeTotalTraffic()`：`src/traffic/traffic-matrix.h:178`。
+  - `runSingleLevelLouvain()`：`src/model/louvain.h:260`。
+  - `runMultiLevelLouvain()`：`src/model/louvain.h:282`。
+  - `AddOcsLink()`：`src/main/hybrid-dcn-main.cc:331`。
+- 已复核 `main()` 位置：函数名在 `src/main/hybrid-dcn-main.cc:354`。
+- 已复核 `trafficMatrixSource`：当前源码只允许 `synthetic`，位置 `src/main/hybrid-dcn-main.cc:1219-1224`。
+- 已复核 WECMP `observedTraffic` 语义：`src/eps/eps-wecmp-state.h:11-13`、`49-52` 明确标注不是 ns-3 measured per-link bytes。
+- 已复核结构化 CSV 输出区域：`src/main/hybrid-dcn-main.cc:6437-6699`。
+- 已复核目录状态：`scripts/`、`experiments/configs/`、`experiments/runs/`、`build-meta/`、`src/utils/` 当前未发现文件；`results/raw/` 包含历史日志、CSV 和 NetAnim XML。
+
+### 是否修改源码
+
+否。未修改任何源码、脚本、配置、README、PROJECT_CONTEXT、V2.md 或结果文件。
+
+### 是否运行实验
+
+否。未运行仿真、构建或大规模实验，只执行只读检查命令。
+
+### 当前仍需人工 review 的事项
+
+- 当前多周期控制和 OCS 链路安装之间是否存在真实 ns-3 时间线动态重构。
+- WECMP 是否需要接入真实 per-link utilization trace，避免将控制面 residual load 解释为链路遥测。
+- 论文指标口径，尤其是平均 FCT、99% FCT、吞吐量、链路利用率和重构次数，仍需与 CSV schema 对齐。

@@ -5715,6 +5715,34 @@ main(int argc, char* argv[])
             return static_cast<double>(stats.rxBytes) /
                    static_cast<double>(spec.expectedBytes);
         };
+    auto computeMatrixFlowRxDurationSeconds = [](const MatrixBulkFlowStats& stats) {
+        const double firstRx = stats.seenFirstRx ? stats.firstRxTime : 0.0;
+        const double lastRx = stats.seenFirstRx ? stats.lastRxTime : 0.0;
+        return lastRx > firstRx ? (lastRx - firstRx) : 0.0;
+    };
+    auto computeMatrixFlowFctSeconds =
+        [&](const MatrixBulkFlowSpec& spec, const MatrixBulkFlowStats& stats) {
+            if (!isMatrixFlowCompleted(spec, stats) || !stats.seenFirstRx)
+            {
+                return 0.0;
+            }
+            return stats.lastRxTime > spec.startTime ? (stats.lastRxTime - spec.startTime) : 0.0;
+        };
+    auto classifyMatrixFlowPathType = [&](const MatrixBulkFlowSpec& spec) {
+        if (spec.ocsCovered)
+        {
+            return std::string("ocs");
+        }
+        if (spec.epsFallback)
+        {
+            return std::string("eps-fallback");
+        }
+        if (requiresEpsResidualPath(spec))
+        {
+            return std::string("eps-residual");
+        }
+        return std::string("unknown");
+    };
 
     std::cout << "[HYBRID-DCN][MATRIX-FLOW] enabled          = "
               << (enableMatrixFlows ? "true" : "false") << std::endl;
@@ -5906,6 +5934,8 @@ main(int argc, char* argv[])
     uint64_t resultTotalMatrixRxBytes = 0;
     uint64_t resultCoveredMatrixRxBytes = 0;
     uint64_t resultResidualMatrixRxBytes = 0;
+    std::vector<double> resultCompletedFctSeconds;
+    resultCompletedFctSeconds.reserve(matrixFlowSpecs.size());
     for (uint32_t flowIndex = 0; flowIndex < matrixFlowSpecs.size(); ++flowIndex)
     {
         const auto& spec = matrixFlowSpecs[flowIndex];
@@ -5924,9 +5954,41 @@ main(int argc, char* argv[])
         if (isMatrixFlowCompleted(spec, stats))
         {
             resultCompletedFlows++;
+            resultCompletedFctSeconds.push_back(computeMatrixFlowFctSeconds(spec, stats));
         }
         resultTotalMatrixRxBytes += stats.rxBytes;
     }
+
+    double resultAvgFctSeconds = 0.0;
+    for (const auto fctSeconds : resultCompletedFctSeconds)
+    {
+        resultAvgFctSeconds += fctSeconds;
+    }
+    if (!resultCompletedFctSeconds.empty())
+    {
+        resultAvgFctSeconds /= static_cast<double>(resultCompletedFctSeconds.size());
+    }
+
+    auto computeNearestRankP99 = [](std::vector<double> samples) {
+        if (samples.empty())
+        {
+            return 0.0;
+        }
+        std::sort(samples.begin(), samples.end());
+        std::size_t index =
+            static_cast<std::size_t>(std::ceil(0.99 * static_cast<double>(samples.size())));
+        if (index == 0)
+        {
+            index = 1;
+        }
+        index -= 1;
+        if (index >= samples.size())
+        {
+            index = samples.size() - 1;
+        }
+        return samples[index];
+    };
+    const double resultP99FctSeconds = computeNearestRankP99(resultCompletedFctSeconds);
 
     const double resultEffectiveDuration =
         simTime > matrixFlowStart ? (simTime - matrixFlowStart) : 0.0;
@@ -5936,6 +5998,26 @@ main(int argc, char* argv[])
             : 0.0;
     const bool resultOcsObservedUse = g_ocsTxPackets > 0;
     const bool resultEpsObservedUse = g_epsTxPackets > 0;
+    const double resultOcsByteShare =
+        (g_ocsTxBytes + g_epsTxBytes) > 0
+            ? static_cast<double>(g_ocsTxBytes) /
+                  static_cast<double>(g_ocsTxBytes + g_epsTxBytes)
+            : 0.0;
+    const double resultOcsHitRatio =
+        matrixFlowSpecs.empty()
+            ? 0.0
+            : static_cast<double>(resultCoveredFlows) /
+                  static_cast<double>(matrixFlowSpecs.size());
+    const double resultEpsFallbackRatio =
+        matrixFlowSpecs.empty()
+            ? 0.0
+            : static_cast<double>(admissionFallbackFlows) /
+                  static_cast<double>(matrixFlowSpecs.size());
+    const double resultResidualFlowRatio =
+        matrixFlowSpecs.empty()
+            ? 0.0
+            : static_cast<double>(resultResidualFlows) /
+                  static_cast<double>(matrixFlowSpecs.size());
     std::string ocsToEpsByteRatio = "0";
     if (g_epsTxBytes > 0)
     {
@@ -6063,7 +6145,11 @@ main(int argc, char* argv[])
               << std::endl;
     std::cout << "[HYBRID-DCN][RESULT] completedFlows = " << resultCompletedFlows
               << std::endl;
+    std::cout << "[HYBRID-DCN][RESULT] completedFlowCount = " << resultCompletedFlows
+              << std::endl;
     std::cout << "[HYBRID-DCN][RESULT] matrixTotalRxBytes = "
+              << resultTotalMatrixRxBytes << std::endl;
+    std::cout << "[HYBRID-DCN][RESULT] totalRxBytes = "
               << resultTotalMatrixRxBytes << std::endl;
     std::cout << "[HYBRID-DCN][RESULT] matrixCoveredRxBytes = "
               << resultCoveredMatrixRxBytes << std::endl;
@@ -6071,6 +6157,20 @@ main(int argc, char* argv[])
               << resultResidualMatrixRxBytes << std::endl;
     std::cout << "[HYBRID-DCN][RESULT] matrixAggregateGoodputMbps = "
               << resultMatrixAggregateGoodputMbps << std::endl;
+    std::cout << "[HYBRID-DCN][RESULT] aggregateGoodputMbps = "
+              << resultMatrixAggregateGoodputMbps << std::endl;
+    std::cout << "[HYBRID-DCN][RESULT] avgFctSeconds = "
+              << resultAvgFctSeconds << std::endl;
+    std::cout << "[HYBRID-DCN][RESULT] p99FctSeconds = "
+              << resultP99FctSeconds << std::endl;
+    std::cout << "[HYBRID-DCN][RESULT] ocsByteShare = "
+              << resultOcsByteShare << std::endl;
+    std::cout << "[HYBRID-DCN][RESULT] ocsHitRatio = "
+              << resultOcsHitRatio << std::endl;
+    std::cout << "[HYBRID-DCN][RESULT] epsFallbackRatio = "
+              << resultEpsFallbackRatio << std::endl;
+    std::cout << "[HYBRID-DCN][RESULT] residualFlowRatio = "
+              << resultResidualFlowRatio << std::endl;
     std::cout << "[HYBRID-DCN][RESULT] matrixFlowRxBytesTolerance = "
               << matrixFlowRxBytesTolerance << std::endl;
 
@@ -6082,12 +6182,14 @@ main(int argc, char* argv[])
         const double completionRatio = computeMatrixFlowCompletionRatio(spec, stats);
         const double firstRx = stats.seenFirstRx ? stats.firstRxTime : 0.0;
         const double lastRx = stats.seenFirstRx ? stats.lastRxTime : 0.0;
-        const double duration = lastRx > firstRx ? (lastRx - firstRx) : 0.0;
+        const double duration = computeMatrixFlowRxDurationSeconds(stats);
+        const double fctSeconds = computeMatrixFlowFctSeconds(spec, stats);
         const double goodputMbps =
             duration > 0 ? static_cast<double>(stats.rxBytes) * 8.0 / duration / 1e6 : 0.0;
         std::cout << "[HYBRID-DCN][RESULT] matrixFlow[" << flowIndex
                   << "] name=" << spec.name
                   << " pair=" << spec.srcLeaf << "-" << spec.dstLeaf
+                  << " pathType=" << classifyMatrixFlowPathType(spec)
                   << " ocsCovered=" << (spec.ocsCovered ? "true" : "false")
                   << " expectedBytes=" << spec.expectedBytes
                   << " rxBytes=" << stats.rxBytes
@@ -6095,6 +6197,8 @@ main(int argc, char* argv[])
                   << " completionRatio=" << completionRatio
                   << " firstRx=" << firstRx
                   << " lastRx=" << lastRx
+                  << " fctSeconds=" << fctSeconds
+                  << " rxDurationSeconds=" << duration
                   << " duration=" << duration
                   << " goodputMbps=" << goodputMbps << std::endl;
     }
@@ -6463,7 +6567,16 @@ main(int argc, char* argv[])
                              "completionRatio",
                              "avgGoodputMbps",
                              "overallResultConsistency",
-                             "overallAlgorithmInvariant"});
+                             "overallAlgorithmInvariant",
+                             "completedFlowCount",
+                             "totalRxBytes",
+                             "aggregateGoodputMbps",
+                             "avgFctSeconds",
+                             "p99FctSeconds",
+                             "ocsByteShare",
+                             "ocsHitRatio",
+                             "epsFallbackRatio",
+                             "residualFlowRatio"});
                 writeCsvRow(file,
                             {experimentName,
                              presetScenario,
@@ -6496,7 +6609,16 @@ main(int argc, char* argv[])
                                                 static_cast<double>(matrixFlowSpecs.size())),
                              csvValue(resultMatrixAggregateGoodputMbps),
                              overallResultConsistencyStatus,
-                             overallAlgorithmInvariantStatus});
+                             overallAlgorithmInvariantStatus,
+                             csvValue(resultCompletedFlows),
+                             csvValue(resultTotalMatrixRxBytes),
+                             csvValue(resultMatrixAggregateGoodputMbps),
+                             csvValue(resultAvgFctSeconds),
+                             csvValue(resultP99FctSeconds),
+                             csvValue(resultOcsByteShare),
+                             csvValue(resultOcsHitRatio),
+                             csvValue(resultEpsFallbackRatio),
+                             csvValue(resultResidualFlowRatio)});
                 if (!file.good())
                 {
                     exportSuccess = false;
@@ -6540,17 +6662,21 @@ main(int argc, char* argv[])
                              "completionRatio",
                              "firstRx",
                              "lastRx",
-                             "goodputMbps"});
+                             "goodputMbps",
+                             "pathType",
+                             "fctSeconds",
+                             "rxDurationSeconds"});
                 for (uint32_t flowIndex = 0; flowIndex < matrixFlowSpecs.size(); ++flowIndex)
                 {
                     const auto& spec = matrixFlowSpecs[flowIndex];
                     const auto& stats = matrixFlowStats[flowIndex];
                     const double firstRx = stats.seenFirstRx ? stats.firstRxTime : 0.0;
                     const double lastRx = stats.seenFirstRx ? stats.lastRxTime : 0.0;
-                    const double duration = lastRx > firstRx ? (lastRx - firstRx) : 0.0;
+                    const double rxDurationSeconds = computeMatrixFlowRxDurationSeconds(stats);
+                    const double fctSeconds = computeMatrixFlowFctSeconds(spec, stats);
                     const double goodputMbps =
-                        duration > 0
-                            ? static_cast<double>(stats.rxBytes) * 8.0 / duration / 1e6
+                        rxDurationSeconds > 0
+                            ? static_cast<double>(stats.rxBytes) * 8.0 / rxDurationSeconds / 1e6
                             : 0.0;
                     writeCsvRow(file,
                                 {csvValue(flowIndex),
@@ -6583,7 +6709,10 @@ main(int argc, char* argv[])
                                  csvValue(computeMatrixFlowCompletionRatio(spec, stats)),
                                  csvValue(firstRx),
                                  csvValue(lastRx),
-                                 csvValue(goodputMbps)});
+                                 csvValue(goodputMbps),
+                                 classifyMatrixFlowPathType(spec),
+                                 csvValue(fctSeconds),
+                                 csvValue(rxDurationSeconds)});
                 }
                 if (!file.good())
                 {
