@@ -99,6 +99,22 @@ struct MatrixBulkFlowStats
     double lastRxTime;
 };
 
+struct LinkCounter
+{
+    std::string linkId;
+    std::string linkType;
+    std::string direction;
+    std::string endpointAType;
+    uint32_t endpointA;
+    std::string endpointBType;
+    uint32_t endpointB;
+    double capacityGbps;
+    std::string delay;
+    uint64_t txPackets;
+    uint64_t txBytes;
+    std::string note;
+};
+
 void
 MatrixBulkSinkRxTrace(std::vector<MatrixBulkFlowStats>* stats,
                       uint32_t flowIndex,
@@ -121,6 +137,19 @@ MatrixBulkSinkRxTrace(std::vector<MatrixBulkFlowStats>* stats,
         flowStats.firstRxTime = now;
     }
     flowStats.lastRxTime = now;
+}
+
+void
+LinkTxTrace(std::vector<LinkCounter>* counters, uint32_t counterIndex, Ptr<const Packet> packet)
+{
+    if (counters == nullptr || counterIndex >= counters->size())
+    {
+        return;
+    }
+
+    LinkCounter& counter = counters->at(counterIndex);
+    counter.txPackets += 1;
+    counter.txBytes += packet->GetSize();
 }
 
 struct ControlEpochSummary
@@ -3183,6 +3212,39 @@ main(int argc, char* argv[])
                                                           std::vector<uint32_t>(numSpines, 0));
     std::vector<std::vector<uint32_t>> spineToLeafIfIndex(numSpines,
                                                           std::vector<uint32_t>(numLeaves, 0));
+    std::vector<LinkCounter> linkCounters;
+
+    auto dataRateToGbps = [](const std::string& dataRate) {
+        return static_cast<double>(DataRate(dataRate).GetBitRate()) / 1e9;
+    };
+    const double leafSpineCapacityGbps = dataRateToGbps("40Gbps");
+    const std::string leafSpineDelay = "2us";
+    const double ocsCapacityGbps = dataRateToGbps(ocsDataRate);
+
+    auto addLinkCounter = [&](const std::string& linkId,
+                              const std::string& linkType,
+                              const std::string& direction,
+                              const std::string& endpointAType,
+                              uint32_t endpointA,
+                              const std::string& endpointBType,
+                              uint32_t endpointB,
+                              double capacityGbps,
+                              const std::string& delay,
+                              const std::string& note) {
+        linkCounters.push_back({linkId,
+                                linkType,
+                                direction,
+                                endpointAType,
+                                endpointA,
+                                endpointBType,
+                                endpointB,
+                                capacityGbps,
+                                delay,
+                                0,
+                                0,
+                                note});
+        return static_cast<uint32_t>(linkCounters.size() - 1);
+    };
 
     Ipv4AddressHelper ipv4;
     ipv4.SetBase("10.0.0.0", "255.255.255.252");
@@ -3211,6 +3273,40 @@ main(int argc, char* argv[])
             NetDeviceContainer devices = leafSpineP2p.Install(pair);
             devices.Get(0)->TraceConnectWithoutContext("MacTx", MakeCallback(&EpsTxTrace));
             devices.Get(1)->TraceConnectWithoutContext("MacTx", MakeCallback(&EpsTxTrace));
+            std::ostringstream leafToSpineId;
+            leafToSpineId << "eps-leaf" << leafIndex << "-spine" << spineIndex
+                          << "-leaf-to-spine";
+            const uint32_t leafToSpineCounterIndex =
+                addLinkCounter(leafToSpineId.str(),
+                               "eps-leaf-spine",
+                               "a-to-b",
+                               "leaf",
+                               leafIndex,
+                               "spine",
+                               spineIndex,
+                               leafSpineCapacityGbps,
+                               leafSpineDelay,
+                               "eps-fabric");
+            devices.Get(0)->TraceConnectWithoutContext(
+                "MacTx",
+                MakeBoundCallback(&LinkTxTrace, &linkCounters, leafToSpineCounterIndex));
+            std::ostringstream spineToLeafId;
+            spineToLeafId << "eps-leaf" << leafIndex << "-spine" << spineIndex
+                          << "-spine-to-leaf";
+            const uint32_t spineToLeafCounterIndex =
+                addLinkCounter(spineToLeafId.str(),
+                               "eps-leaf-spine",
+                               "b-to-a",
+                               "spine",
+                               spineIndex,
+                               "leaf",
+                               leafIndex,
+                               leafSpineCapacityGbps,
+                               leafSpineDelay,
+                               "eps-fabric");
+            devices.Get(1)->TraceConnectWithoutContext(
+                "MacTx",
+                MakeBoundCallback(&LinkTxTrace, &linkCounters, spineToLeafCounterIndex));
             Ipv4InterfaceContainer interfaces = ipv4.Assign(devices);
             leafToSpineNextHop[leafIndex][spineIndex] = interfaces.GetAddress(1);
             spineToLeafNextHop[spineIndex][leafIndex] = interfaces.GetAddress(0);
@@ -3247,6 +3343,38 @@ main(int argc, char* argv[])
                            linkDevices);
             linkDevices.Get(0)->TraceConnectWithoutContext("MacTx", MakeCallback(&OcsTxTrace));
             linkDevices.Get(1)->TraceConnectWithoutContext("MacTx", MakeCallback(&OcsTxTrace));
+            std::ostringstream ocsAToBId;
+            ocsAToBId << "ocs-leaf" << edge.leafA << "-leaf" << edge.leafB << "-a-to-b";
+            const uint32_t ocsAToBCounterIndex =
+                addLinkCounter(ocsAToBId.str(),
+                               "ocs",
+                               "a-to-b",
+                               "leaf",
+                               edge.leafA,
+                               "leaf",
+                               edge.leafB,
+                               ocsCapacityGbps,
+                               ocsDelay,
+                               "selected-ocs");
+            linkDevices.Get(0)->TraceConnectWithoutContext(
+                "MacTx",
+                MakeBoundCallback(&LinkTxTrace, &linkCounters, ocsAToBCounterIndex));
+            std::ostringstream ocsBToAId;
+            ocsBToAId << "ocs-leaf" << edge.leafA << "-leaf" << edge.leafB << "-b-to-a";
+            const uint32_t ocsBToACounterIndex =
+                addLinkCounter(ocsBToAId.str(),
+                               "ocs",
+                               "b-to-a",
+                               "leaf",
+                               edge.leafB,
+                               "leaf",
+                               edge.leafA,
+                               ocsCapacityGbps,
+                               ocsDelay,
+                               "selected-ocs");
+            linkDevices.Get(1)->TraceConnectWithoutContext(
+                "MacTx",
+                MakeBoundCallback(&LinkTxTrace, &linkCounters, ocsBToACounterIndex));
 
             installedOcsLinks.push_back({edge.leafA,
                                          edge.leafB,
@@ -3301,6 +3429,22 @@ main(int argc, char* argv[])
     bool ocsForced = false;
     uint32_t ocsPairHostRoutes = 0;
     uint32_t ocsPairHostRoutesSkippedForEpsResidual = 0;
+    uint32_t routeFixSkippedOcsRoutesForFallback = 0;
+    uint32_t routeFixEpsResidualHostRoutes = 0;
+    uint32_t routeFixDeterministicEpsRoutes = 0;
+    uint32_t routeFixWecmpFrozenRoutes = 0;
+    struct RouteFixRecord
+    {
+        uint32_t flowIndex;
+        uint32_t srcLeaf;
+        uint32_t dstLeaf;
+        uint32_t spine;
+        std::string reason;
+        std::string mode;
+        uint32_t hostRoutes;
+        bool installed;
+    };
+    std::vector<RouteFixRecord> routeFixRecords;
 
     const uint32_t echoPort = 9000;
     const uint32_t echoSrcLeaf = 0;
@@ -3570,14 +3714,12 @@ main(int argc, char* argv[])
                 {
                     continue;
                 }
-                const bool forwardMatch = spec.srcLeaf == link.leafA &&
-                                          spec.dstLeaf == link.leafB &&
-                                          spec.srcServer == serverOffsetA &&
-                                          spec.dstServer == serverOffsetB;
-                const bool reverseMatch = spec.srcLeaf == link.leafB &&
-                                          spec.dstLeaf == link.leafA &&
-                                          spec.srcServer == serverOffsetB &&
-                                          spec.dstServer == serverOffsetA;
+                const bool forwardMatch =
+                    spec.srcLeaf == link.leafA && spec.dstLeaf == link.leafB &&
+                    (spec.srcServer == serverOffsetA || spec.dstServer == serverOffsetB);
+                const bool reverseMatch =
+                    spec.srcLeaf == link.leafB && spec.dstLeaf == link.leafA &&
+                    (spec.srcServer == serverOffsetB || spec.dstServer == serverOffsetA);
                 if (forwardMatch || reverseMatch)
                 {
                     return true;
@@ -3604,6 +3746,7 @@ main(int argc, char* argv[])
                                                              serverOffsetB))
                     {
                         ocsPairHostRoutesSkippedForEpsResidual += 4;
+                        routeFixSkippedOcsRoutesForFallback += 4;
                         continue;
                     }
 
@@ -3635,7 +3778,7 @@ main(int argc, char* argv[])
         ocsForced = true;
     }
 
-    if (enableEpsWecmpRouting && enableMatrixFlows && enableEpsWecmp)
+    if (enableMatrixFlows)
     {
         Ipv4StaticRoutingHelper staticRoutingHelper;
         for (uint32_t flowIndex = 0; flowIndex < matrixFlowSpecs.size(); ++flowIndex)
@@ -3646,21 +3789,27 @@ main(int argc, char* argv[])
                 continue;
             }
 
+            uint32_t selectedSpine = 0;
             const int32_t decisionIndex = matrixFlowWecmpDecisionIndex[flowIndex];
-            if (decisionIndex < 0)
+            const bool hasWecmpRouteBinding =
+                enableEpsWecmpRouting && enableEpsWecmp && decisionIndex >= 0;
+            if (hasWecmpRouteBinding)
             {
-                continue;
+                const auto& decision =
+                    epsWecmpDecisions[static_cast<std::size_t>(decisionIndex)];
+                selectedSpine = decision.selectedSpine;
             }
-
-            const auto& decision =
-                epsWecmpDecisions[static_cast<std::size_t>(decisionIndex)];
-            const uint32_t selectedSpine = decision.selectedSpine;
             const Ipv4Address srcServerAddress = serverIpv4[spec.srcLeaf][spec.srcServer];
             const Ipv4Address dstServerAddress = serverIpv4[spec.dstLeaf][spec.dstServer];
             bool installed = false;
+            uint32_t installedHostRoutes = 0;
 
             if (selectedSpine < numSpines)
             {
+                Ptr<Ipv4StaticRouting> srcServerRouting = staticRoutingHelper.GetStaticRouting(
+                    servers.Get(serverIndex(spec.srcLeaf, spec.srcServer))->GetObject<Ipv4>());
+                Ptr<Ipv4StaticRouting> dstServerRouting = staticRoutingHelper.GetStaticRouting(
+                    servers.Get(serverIndex(spec.dstLeaf, spec.dstServer))->GetObject<Ipv4>());
                 Ptr<Ipv4StaticRouting> srcLeafRouting = staticRoutingHelper.GetStaticRouting(
                     leaves.Get(spec.srcLeaf)->GetObject<Ipv4>());
                 Ptr<Ipv4StaticRouting> dstLeafRouting = staticRoutingHelper.GetStaticRouting(
@@ -3668,38 +3817,67 @@ main(int argc, char* argv[])
                 Ptr<Ipv4StaticRouting> spineRouting = staticRoutingHelper.GetStaticRouting(
                     spines.Get(selectedSpine)->GetObject<Ipv4>());
 
+                srcServerRouting->AddHostRouteTo(dstServerAddress,
+                                                 leafServerIpv4[spec.srcLeaf][spec.srcServer],
+                                                 serverIfIndex[spec.srcLeaf][spec.srcServer]);
+                installedHostRoutes++;
                 srcLeafRouting->AddHostRouteTo(dstServerAddress,
                                                leafToSpineNextHop[spec.srcLeaf][selectedSpine],
                                                leafToSpineIfIndex[spec.srcLeaf][selectedSpine]);
+                installedHostRoutes++;
                 spineRouting->AddHostRouteTo(dstServerAddress,
                                              spineToLeafNextHop[selectedSpine][spec.dstLeaf],
                                              spineToLeafIfIndex[selectedSpine][spec.dstLeaf]);
+                installedHostRoutes++;
 
                 dstLeafRouting->AddHostRouteTo(srcServerAddress,
                                                leafToSpineNextHop[spec.dstLeaf][selectedSpine],
                                                leafToSpineIfIndex[spec.dstLeaf][selectedSpine]);
+                installedHostRoutes++;
                 spineRouting->AddHostRouteTo(srcServerAddress,
                                              spineToLeafNextHop[selectedSpine][spec.srcLeaf],
                                              spineToLeafIfIndex[selectedSpine][spec.srcLeaf]);
+                installedHostRoutes++;
+                dstServerRouting->AddHostRouteTo(srcServerAddress,
+                                                 leafServerIpv4[spec.dstLeaf][spec.dstServer],
+                                                 serverIfIndex[spec.dstLeaf][spec.dstServer]);
+                installedHostRoutes++;
                 installed = true;
             }
 
-            const bool pathFrozen = installed;
-            if (pathFrozen)
+            routeFixEpsResidualHostRoutes += installedHostRoutes;
+            if (hasWecmpRouteBinding && installed)
             {
                 spec.epsPathFrozen = true;
                 spec.frozenSpine = static_cast<int32_t>(selectedSpine);
+                routeFixWecmpFrozenRoutes++;
+            }
+            else if (installed)
+            {
+                routeFixDeterministicEpsRoutes++;
             }
 
-            epsWecmpRouteBindings.push_back({flowIndex,
-                                             spec.srcLeaf,
-                                             spec.dstLeaf,
-                                             selectedSpine,
-                                             srcServerAddress,
-                                             dstServerAddress,
-                                             installed,
-                                             pathFrozen,
-                                             spec.wecmpResidualDemand});
+            routeFixRecords.push_back({flowIndex,
+                                       spec.srcLeaf,
+                                       spec.dstLeaf,
+                                       selectedSpine,
+                                       spec.residualPathReason,
+                                       hasWecmpRouteBinding ? "wecmp-frozen" : "deterministic-spine0",
+                                       installedHostRoutes,
+                                       installed});
+
+            if (hasWecmpRouteBinding)
+            {
+                epsWecmpRouteBindings.push_back({flowIndex,
+                                                 spec.srcLeaf,
+                                                 spec.dstLeaf,
+                                                 selectedSpine,
+                                                 srcServerAddress,
+                                                 dstServerAddress,
+                                                 installed,
+                                                 installed,
+                                                 spec.wecmpResidualDemand});
+            }
         }
     }
 
@@ -4383,6 +4561,35 @@ main(int argc, char* argv[])
                   << std::endl;
         std::cout << "[HYBRID-DCN][WECMP-ROUTE] binding[" << bindingIndex
                   << "] residualDemand = " << binding.residualDemand << std::endl;
+    }
+
+    std::cout << "[HYBRID-DCN][ROUTE-FIX] skippedOcsRoutesForFallback = "
+              << routeFixSkippedOcsRoutesForFallback << std::endl;
+    std::cout << "[HYBRID-DCN][ROUTE-FIX] epsFallbackHostRoutes = "
+              << routeFixEpsResidualHostRoutes << std::endl;
+    std::cout << "[HYBRID-DCN][ROUTE-FIX] deterministicEpsRoutes = "
+              << routeFixDeterministicEpsRoutes << std::endl;
+    std::cout << "[HYBRID-DCN][ROUTE-FIX] wecmpFrozenRoutes = "
+              << routeFixWecmpFrozenRoutes << std::endl;
+    std::cout << "[HYBRID-DCN][ROUTE-FIX] fallbackRoutes = "
+              << routeFixRecords.size() << std::endl;
+    for (uint32_t recordIndex = 0; recordIndex < routeFixRecords.size(); ++recordIndex)
+    {
+        const auto& record = routeFixRecords[recordIndex];
+        std::cout << "[HYBRID-DCN][ROUTE-FIX] fallbackRoute[" << recordIndex
+                  << "] flowIndex = " << record.flowIndex << std::endl;
+        std::cout << "[HYBRID-DCN][ROUTE-FIX] fallbackRoute[" << recordIndex
+                  << "] pair = " << record.srcLeaf << "-" << record.dstLeaf << std::endl;
+        std::cout << "[HYBRID-DCN][ROUTE-FIX] fallbackRoute[" << recordIndex
+                  << "] spine = " << record.spine << std::endl;
+        std::cout << "[HYBRID-DCN][ROUTE-FIX] fallbackRoute[" << recordIndex
+                  << "] mode = " << record.mode << std::endl;
+        std::cout << "[HYBRID-DCN][ROUTE-FIX] fallbackRoute[" << recordIndex
+                  << "] reason = " << record.reason << std::endl;
+        std::cout << "[HYBRID-DCN][ROUTE-FIX] fallbackRoute[" << recordIndex
+                  << "] hostRoutes = " << record.hostRoutes << std::endl;
+        std::cout << "[HYBRID-DCN][ROUTE-FIX] fallbackRoute[" << recordIndex
+                  << "] installed = " << (record.installed ? "true" : "false") << std::endl;
     }
 
     uint32_t epsFrozenFlows = 0;
@@ -6018,6 +6225,56 @@ main(int argc, char* argv[])
             ? 0.0
             : static_cast<double>(resultResidualFlows) /
                   static_cast<double>(matrixFlowSpecs.size());
+    auto computeLinkUtilizationApprox = [&](const LinkCounter& counter) {
+        if (simTime <= 0 || counter.capacityGbps <= 0)
+        {
+            return 0.0;
+        }
+        return static_cast<double>(counter.txBytes) * 8.0 /
+               (simTime * counter.capacityGbps * 1e9);
+    };
+    uint32_t resultOcsLinkCounterCount = 0;
+    uint32_t resultEpsLinkCounterCount = 0;
+    double resultMaxOcsLinkUtilizationApprox = 0.0;
+    double resultMaxEpsLinkUtilizationApprox = 0.0;
+    double resultSumEpsLinkUtilizationApprox = 0.0;
+    std::vector<double> resultEpsLinkUtilizationApproxSamples;
+    for (const auto& counter : linkCounters)
+    {
+        const double utilizationApprox = computeLinkUtilizationApprox(counter);
+        if (counter.linkType == "ocs")
+        {
+            resultOcsLinkCounterCount++;
+            resultMaxOcsLinkUtilizationApprox =
+                std::max(resultMaxOcsLinkUtilizationApprox, utilizationApprox);
+        }
+        else if (counter.linkType == "eps-leaf-spine")
+        {
+            resultEpsLinkCounterCount++;
+            resultMaxEpsLinkUtilizationApprox =
+                std::max(resultMaxEpsLinkUtilizationApprox, utilizationApprox);
+            resultSumEpsLinkUtilizationApprox += utilizationApprox;
+            resultEpsLinkUtilizationApproxSamples.push_back(utilizationApprox);
+        }
+    }
+    const double resultAvgEpsLinkUtilizationApprox =
+        resultEpsLinkCounterCount > 0
+            ? resultSumEpsLinkUtilizationApprox /
+                  static_cast<double>(resultEpsLinkCounterCount)
+            : 0.0;
+    double resultEpsLinkUtilizationVarianceApprox = 0.0;
+    for (const auto utilizationApprox : resultEpsLinkUtilizationApproxSamples)
+    {
+        const double delta = utilizationApprox - resultAvgEpsLinkUtilizationApprox;
+        resultEpsLinkUtilizationVarianceApprox += delta * delta;
+    }
+    if (!resultEpsLinkUtilizationApproxSamples.empty())
+    {
+        resultEpsLinkUtilizationVarianceApprox /=
+            static_cast<double>(resultEpsLinkUtilizationApproxSamples.size());
+    }
+    const double resultEpsLinkUtilizationStddevApprox =
+        std::sqrt(resultEpsLinkUtilizationVarianceApprox);
     std::string ocsToEpsByteRatio = "0";
     if (g_epsTxBytes > 0)
     {
@@ -6171,6 +6428,20 @@ main(int argc, char* argv[])
               << resultEpsFallbackRatio << std::endl;
     std::cout << "[HYBRID-DCN][RESULT] residualFlowRatio = "
               << resultResidualFlowRatio << std::endl;
+    std::cout << "[HYBRID-DCN][RESULT] linkCounterCount = "
+              << linkCounters.size() << std::endl;
+    std::cout << "[HYBRID-DCN][RESULT] ocsLinkCounterCount = "
+              << resultOcsLinkCounterCount << std::endl;
+    std::cout << "[HYBRID-DCN][RESULT] epsLinkCounterCount = "
+              << resultEpsLinkCounterCount << std::endl;
+    std::cout << "[HYBRID-DCN][RESULT] maxOcsLinkUtilizationApprox = "
+              << resultMaxOcsLinkUtilizationApprox << std::endl;
+    std::cout << "[HYBRID-DCN][RESULT] maxEpsLinkUtilizationApprox = "
+              << resultMaxEpsLinkUtilizationApprox << std::endl;
+    std::cout << "[HYBRID-DCN][RESULT] avgEpsLinkUtilizationApprox = "
+              << resultAvgEpsLinkUtilizationApprox << std::endl;
+    std::cout << "[HYBRID-DCN][RESULT] epsLinkUtilizationStddevApprox = "
+              << resultEpsLinkUtilizationStddevApprox << std::endl;
     std::cout << "[HYBRID-DCN][RESULT] matrixFlowRxBytesTolerance = "
               << matrixFlowRxBytesTolerance << std::endl;
 
@@ -6496,6 +6767,8 @@ main(int argc, char* argv[])
         joinCsvPath(structuredResultDir, experimentName + "-wecmp.csv");
     const std::string ocsCandidatesCsvPath =
         joinCsvPath(structuredResultDir, experimentName + "-ocs-candidates.csv");
+    const std::string linksCsvPath =
+        joinCsvPath(structuredResultDir, experimentName + "-links.csv");
     bool structuredExportCheck = !enableStructuredResultExport;
     bool structuredExportEvaluated = false;
 
@@ -6514,6 +6787,7 @@ main(int argc, char* argv[])
         std::cout << "[HYBRID-DCN][EXPORT] wecmpCsv = " << wecmpCsvPath << std::endl;
         std::cout << "[HYBRID-DCN][EXPORT] ocsCandidatesCsv = "
                   << ocsCandidatesCsvPath << std::endl;
+        std::cout << "[HYBRID-DCN][EXPORT] linksCsv = " << linksCsvPath << std::endl;
 
         if (!enableStructuredResultExport)
         {
@@ -6576,7 +6850,14 @@ main(int argc, char* argv[])
                              "ocsByteShare",
                              "ocsHitRatio",
                              "epsFallbackRatio",
-                             "residualFlowRatio"});
+                             "residualFlowRatio",
+                             "linkCounterCount",
+                             "ocsLinkCounterCount",
+                             "epsLinkCounterCount",
+                             "maxOcsLinkUtilizationApprox",
+                             "maxEpsLinkUtilizationApprox",
+                             "avgEpsLinkUtilizationApprox",
+                             "epsLinkUtilizationStddevApprox"});
                 writeCsvRow(file,
                             {experimentName,
                              presetScenario,
@@ -6618,7 +6899,14 @@ main(int argc, char* argv[])
                              csvValue(resultOcsByteShare),
                              csvValue(resultOcsHitRatio),
                              csvValue(resultEpsFallbackRatio),
-                             csvValue(resultResidualFlowRatio)});
+                             csvValue(resultResidualFlowRatio),
+                             csvValue(linkCounters.size()),
+                             csvValue(resultOcsLinkCounterCount),
+                             csvValue(resultEpsLinkCounterCount),
+                             csvValue(resultMaxOcsLinkUtilizationApprox),
+                             csvValue(resultMaxEpsLinkUtilizationApprox),
+                             csvValue(resultAvgEpsLinkUtilizationApprox),
+                             csvValue(resultEpsLinkUtilizationStddevApprox)});
                 if (!file.good())
                 {
                     exportSuccess = false;
@@ -6818,6 +7106,53 @@ main(int argc, char* argv[])
                     exportSuccess = false;
                     std::cout << "[HYBRID-DCN][EXPORT] error = failed-to-write:"
                               << ocsCandidatesCsvPath << std::endl;
+                }
+            }
+        }
+
+        {
+            std::ofstream file = openCsv(linksCsvPath);
+            if (file.is_open())
+            {
+                writeCsvRow(file,
+                            {"linkIndex",
+                             "linkId",
+                             "linkType",
+                             "direction",
+                             "endpointAType",
+                             "endpointA",
+                             "endpointBType",
+                             "endpointB",
+                             "capacityGbps",
+                             "delay",
+                             "txPackets",
+                             "txBytes",
+                             "utilizationApprox",
+                             "note"});
+                for (uint32_t linkIndex = 0; linkIndex < linkCounters.size(); ++linkIndex)
+                {
+                    const auto& counter = linkCounters[linkIndex];
+                    writeCsvRow(file,
+                                {csvValue(linkIndex),
+                                 counter.linkId,
+                                 counter.linkType,
+                                 counter.direction,
+                                 counter.endpointAType,
+                                 csvValue(counter.endpointA),
+                                 counter.endpointBType,
+                                 csvValue(counter.endpointB),
+                                 csvValue(counter.capacityGbps),
+                                 counter.delay,
+                                 csvValue(counter.txPackets),
+                                 csvValue(counter.txBytes),
+                                 csvValue(computeLinkUtilizationApprox(counter)),
+                                 counter.note});
+                }
+                if (!file.good())
+                {
+                    exportSuccess = false;
+                    std::cout << "[HYBRID-DCN][EXPORT] error = failed-to-write:"
+                              << linksCsvPath << std::endl;
                 }
             }
         }
