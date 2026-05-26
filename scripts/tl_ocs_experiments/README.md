@@ -10,6 +10,7 @@ It does not run paper-candidate experiments, does not produce paper conclusions,
 - `run_medium_sanity.sh`: runs a four-scenario 8-leaf medium-sanity subset and then invokes validation and summary collection.
 - `validate_outputs.py`: validates CSV existence, schema, result status, route correctness, link time series, measured WECMP, and the Patch 4C later-flow proof.
 - `collect_summary.py`: helper that combines `*-summary.csv` files into one CSV table with parsed experiment metadata. It does not draw figures or make statistical claims.
+- `make_run_report.py`: creates a Markdown engineering validation report from manifest, validation, and summary CSVs. It does not draw figures or make paper conclusions.
 
 ## Running
 
@@ -70,6 +71,8 @@ Layout:
 - `manifest.csv`
 - `validation-report.csv`
 - `combined-summary.csv` for medium runs, and for smoke runs when `collect_summary.py` is invoked manually
+- `baseline-summary.csv`
+- `run-report.md`
 
 The runner creates an `ns3-cwd` directory under the run directory so relative simulator artifacts land under the same `/tmp` run tree rather than the repository's historical `results/raw`.
 
@@ -129,6 +132,16 @@ Validation checks include:
 - measured later proof records `measuredWecmpLaterProofPassed=true`;
 - `measured-wecmp.csv` has 16 EPS directed rows for measured WECMP scenarios.
 
+`validation-report.csv` fields:
+
+- `experimentName`
+- `check`
+- `severity`: `required` or `warning`
+- `status`: `pass`, `warn`, or `fail`
+- `message`
+
+Strict mode returns nonzero for any failed required check. Failure messages include expected paths for missing files, missing field lists for schema checks, route counter details for route checks, and expected/actual row counts where relevant.
+
 For medium 8l4s2h scenarios, validation infers expected counts from the experiment name:
 
 - `linkCounterCount = 8 * 4 * 2 + 2 = 66`
@@ -153,11 +166,38 @@ The combined table adds:
 - `wecmp`
 - `seed`
 
+The collector also writes `baseline-summary.csv` by default when `--run-dir` is provided. It groups by:
+
+- `suite`
+- `scale`
+- `traffic`
+- `baseline`
+- `admission`
+- `wecmp`
+
+It reports only row counts and simple means for directly observed fields such as FCT, goodput, OCS byte share, EPS fallback ratio, and link time-series rows. It does not compute confidence intervals and does not claim one baseline is better.
+
 These fields are parsed from:
 
 `<suite>__<scale>__<traffic>__<baseline>__<admission>__<wecmp>__seed<seed>`
 
 If a name does not match, metadata fields are set to `unknown` and a warning is printed. The collector does not plot, compute confidence intervals, or make statistical conclusions.
+
+## Run Report
+
+Run manually:
+
+```sh
+scripts/tl_ocs_experiments/make_run_report.py --run-dir /tmp/tl-ocs-experiments/<run-id>
+```
+
+The smoke and medium runners call this automatically after validation and summary collection pass.
+
+The report is written to:
+
+`/tmp/tl-ocs-experiments/<run-id>/run-report.md`
+
+`run-report.md` is an engineering validation report. It summarizes manifest return codes, validation pass/warn/fail counts, failed checks if any, baseline-summary rows, key metrics, route correctness checks, and WECMP proof status. It is not a paper result and must not be used as a final figure or statistical conclusion.
 
 Do not run paper-candidate from these scripts. Add a separate reviewed patch before any paper-candidate sweep.
 

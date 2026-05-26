@@ -192,9 +192,19 @@ if [ "${validation_rc}" -eq 0 ]; then
     fi
 fi
 
+if [ "${validation_rc}" -eq 0 ] && [ "${overall_rc}" -eq 0 ]; then
+    "${SCRIPT_DIR}/make_run_report.py" --run-dir "${RUN_DIR}"
+    report_rc=$?
+    if [ "${report_rc}" -ne 0 ]; then
+        overall_rc=1
+    fi
+fi
+
 echo "Run directory: ${RUN_DIR}"
 echo "Manifest: ${MANIFEST}"
 echo "Validation report: ${REPORT}"
 echo "Combined summary: ${RUN_DIR}/combined-summary.csv"
+echo "Baseline summary: ${RUN_DIR}/baseline-summary.csv"
+echo "Run report: ${RUN_DIR}/run-report.md"
 
 exit "${overall_rc}"

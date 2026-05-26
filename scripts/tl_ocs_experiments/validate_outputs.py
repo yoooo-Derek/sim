@@ -129,11 +129,13 @@ class Validator:
         self.failures = 0
 
     def record(self, scenario, check, ok, message, required=True):
+        severity = "required" if required else "warning"
         status = "pass" if ok else ("fail" if required or self.strict else "warn")
         self.rows.append(
             {
                 "experimentName": scenario,
                 "check": check,
+                "severity": severity,
                 "status": status,
                 "message": message,
             }
@@ -161,8 +163,11 @@ class Validator:
     def file_path(self, scenario, suffix):
         return self.csv_dir / f"{scenario}-{suffix}.csv"
 
+    def require_file(self, scenario, check, path):
+        return self.require(scenario, check, path.exists(), f"expected path: {path}")
+
     def validate_manifest(self):
-        if not self.require("GLOBAL", "manifest_exists", self.manifest_path.exists(), str(self.manifest_path)):
+        if not self.require_file("GLOBAL", "manifest_exists", self.manifest_path):
             return {}
         rows = read_rows(self.manifest_path)
         by_name = {row.get("experimentName", ""): row for row in rows}
@@ -180,7 +185,7 @@ class Validator:
 
     def validate_summary(self, scenario):
         path = self.file_path(scenario, "summary")
-        if not self.require(scenario, "summary_exists", path.exists(), str(path)):
+        if not self.require_file(scenario, "summary_exists", path):
             return None
         rows = read_rows(path)
         if not self.require(scenario, "summary_one_row", len(rows) == 1, f"rows={len(rows)}"):
@@ -272,7 +277,7 @@ class Validator:
 
     def validate_flows(self, scenario):
         path = self.file_path(scenario, "flows")
-        if not self.require(scenario, "flows_exists", path.exists(), str(path)):
+        if not self.require_file(scenario, "flows_exists", path):
             return []
         rows = read_rows(path)
         self.require(scenario, "flows_nonempty", len(rows) > 0, f"rows={len(rows)}")
@@ -311,7 +316,7 @@ class Validator:
 
     def validate_links(self, scenario, flows):
         path = self.file_path(scenario, "links")
-        if not self.require(scenario, "links_exists", path.exists(), str(path)):
+        if not self.require_file(scenario, "links_exists", path):
             return []
         rows = read_rows(path)
         expected_links = expected_link_counter_count(scenario)
@@ -321,9 +326,15 @@ class Validator:
         ocs_row, ocs_src, ocs_dst = find_selected_ocs_link(rows)
         self.require(scenario, "selected_ocs_link_present", ocs_row is not None, "found OCS a-to-b counter")
         ocs_tx = parse_int(ocs_row.get("txBytes"), 0) if ocs_row else 0
+        ocs_link_id = ocs_row.get("linkId", "missing") if ocs_row else "missing"
 
         if scenario.endswith("__hit__det__seed0"):
-            self.require(scenario, "route_ocs_hit_uses_ocs", (ocs_tx or 0) > 0, f"ocsTx={ocs_tx}")
+            self.require(
+                scenario,
+                "route_ocs_hit_uses_ocs",
+                (ocs_tx or 0) > 0,
+                f"selectedOcsLink={ocs_link_id} observedTxBytes={ocs_tx} expected>0",
+            )
             if ocs_src is not None and ocs_dst is not None:
                 self.require(
                     scenario,
@@ -337,7 +348,12 @@ class Validator:
                     f"{ocs_src}-{ocs_dst} flow has pathType=ocs",
                 )
         else:
-            self.require(scenario, "route_no_ocs_leakage", (ocs_tx or 0) == 0, f"ocsTx={ocs_tx}")
+            self.require(
+                scenario,
+                "route_no_ocs_leakage",
+                (ocs_tx or 0) == 0,
+                f"selectedOcsLink={ocs_link_id} observedTxBytes={ocs_tx} expected=0",
+            )
 
         if "admit_fallback__det" in scenario or "tl_ocs__fallback__det" in scenario:
             flow = first_matching_flow(flows, lambda row: row.get("pathType") in ("eps-fallback", "eps-residual"))
@@ -349,7 +365,7 @@ class Validator:
                     "route_deterministic_spine0",
                     tx(f"eps-leaf{src}-spine0-leaf-to-spine") > 0
                     and tx(f"eps-leaf{dst}-spine0-spine-to-leaf") > 0,
-                    f"src={src} dst={dst} leaf-spine={tx(f'eps-leaf{src}-spine0-leaf-to-spine')} spine-leaf={tx(f'eps-leaf{dst}-spine0-spine-to-leaf')}",
+                    f"src={src} dst={dst} selectedOcsLink={ocs_link_id} expected spine0 tx>0 leaf-spine={tx(f'eps-leaf{src}-spine0-leaf-to-spine')} spine-leaf={tx(f'eps-leaf{dst}-spine0-spine-to-leaf')}",
                 )
             else:
                 self.require(scenario, "route_deterministic_spine0", False, "no EPS fallback/residual flow")
@@ -369,7 +385,7 @@ class Validator:
                     "route_wecmp_frozen_spine",
                     tx(f"eps-leaf{src}-spine{spine}-leaf-to-spine") > 0
                     and tx(f"eps-leaf{dst}-spine{spine}-spine-to-leaf") > 0,
-                    f"src={src} dst={dst} spine={spine}",
+                    f"src={src} dst={dst} spine={spine} selectedOcsLink={ocs_link_id} expected frozen spine tx>0",
                 )
             else:
                 self.require(scenario, "route_wecmp_frozen_spine", False, "no frozen WECMP flow")
@@ -385,7 +401,7 @@ class Validator:
                     "route_measured_later_selected_spine",
                     tx(f"eps-leaf{src}-spine{selected}-leaf-to-spine") > 0
                     and tx(f"eps-leaf{dst}-spine{selected}-spine-to-leaf") > 0,
-                    f"src={src} dst={dst} selected={selected}",
+                    f"src={src} dst={dst} selected={selected} selectedOcsLink={ocs_link_id} expected measured selected spine tx>0",
                 )
             else:
                 self.require(scenario, "route_measured_later_selected_spine", False, "no measured later flow")
@@ -393,7 +409,7 @@ class Validator:
 
     def validate_timeseries(self, scenario):
         path = self.file_path(scenario, "link-timeseries")
-        if not self.require(scenario, "link_timeseries_exists", path.exists(), str(path)):
+        if not self.require_file(scenario, "link_timeseries_exists", path):
             return
         rows = read_rows(path)
         self.require(scenario, "link_timeseries_nonempty", len(rows) > 0, f"rows={len(rows)}")
@@ -407,21 +423,24 @@ class Validator:
         monotonic = True
         parseable = True
         nonzero = False
-        for row in rows:
+        offending_index = ""
+        for row_index, row in enumerate(rows, start=2):
             sample_time = parse_float(row.get("sampleTimeSeconds"))
             util = parse_float(row.get("utilizationApprox"))
             delta = parse_int(row.get("deltaTxBytes"), 0) or 0
             if sample_time is None or util is None or util < 0:
                 parseable = False
+                offending_index = str(row_index)
                 break
             if sample_time < last_time:
                 monotonic = False
+                offending_index = str(row_index)
             last_time = sample_time
             if delta > 0:
                 nonzero = True
-        self.require(scenario, "link_timeseries_monotonic", monotonic, "sampleTimeSeconds monotonic")
-        self.require(scenario, "link_timeseries_util_parseable", parseable, "utilizationApprox parseable >= 0")
-        self.require(scenario, "link_timeseries_nonzero_delta", nonzero, "at least one deltaTxBytes > 0")
+        self.require(scenario, "link_timeseries_monotonic", monotonic, f"rows={len(rows)} firstOffendingRow={offending_index or 'none'} sampleTimeSeconds monotonic")
+        self.require(scenario, "link_timeseries_util_parseable", parseable, f"rows={len(rows)} firstOffendingRow={offending_index or 'none'} utilizationApprox parseable >= 0")
+        self.require(scenario, "link_timeseries_nonzero_delta", nonzero, f"rows={len(rows)} at least one deltaTxBytes > 0")
 
     def validate_wecmp(self, scenario):
         needs_wecmp = "cp_wecmp" in scenario or "measured_" in scenario
@@ -431,7 +450,7 @@ class Validator:
                 rows = read_rows(path)
                 self.require(scenario, "wecmp_optional_exists", True, f"rows={len(rows)}")
             return
-        if not self.require(scenario, "wecmp_exists", path.exists(), str(path)):
+        if not self.require_file(scenario, "wecmp_exists", path):
             return
         rows = read_rows(path)
         self.require(scenario, "wecmp_nonempty", len(rows) > 0, f"rows={len(rows)}")
@@ -482,11 +501,11 @@ class Validator:
         path = self.file_path(scenario, "measured-wecmp")
         if not needs_measured:
             return
-        if not self.require(scenario, "measured_wecmp_exists", path.exists(), str(path)):
+        if not self.require_file(scenario, "measured_wecmp_exists", path):
             return
         rows = read_rows(path)
         expected_rows = expected_measured_wecmp_rows(scenario)
-        self.require(scenario, "measured_wecmp_row_count", len(rows) == expected_rows, f"rows={len(rows)} expected={expected_rows}")
+        self.require(scenario, "measured_wecmp_row_count", len(rows) == expected_rows, f"actual={len(rows)} expected={expected_rows}")
         self.require_fields(scenario, "measured_wecmp_schema", rows, ["hasSample", "measuredUtilization"])
         parseable = True
         for row in rows:
@@ -498,7 +517,7 @@ class Validator:
 
     def validate_ocs_candidates(self, scenario):
         path = self.file_path(scenario, "ocs-candidates")
-        self.require(scenario, "ocs_candidates_exists", path.exists(), str(path))
+        self.require_file(scenario, "ocs_candidates_exists", path)
 
     def run(self):
         self.validate_manifest()
@@ -513,14 +532,14 @@ class Validator:
         self.write_report()
         passed = sum(1 for row in self.rows if row["status"] == "pass")
         warnings = sum(1 for row in self.rows if row["status"] == "warn")
-        print(f"Validation checks: {passed} passed, {warnings} warnings, {self.failures} failed")
+        print(f"Validation checks: pass={passed} warn={warnings} fail={self.failures}")
         print(f"Validation report: {self.report_path}")
         return 0 if self.failures == 0 else 1
 
     def write_report(self):
         self.report_path.parent.mkdir(parents=True, exist_ok=True)
         with self.report_path.open("w", newline="") as handle:
-            writer = csv.DictWriter(handle, fieldnames=["experimentName", "check", "status", "message"])
+            writer = csv.DictWriter(handle, fieldnames=["experimentName", "check", "severity", "status", "message"])
             writer.writeheader()
             writer.writerows(self.rows)
 
