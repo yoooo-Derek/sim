@@ -30,6 +30,7 @@
 #include <set>
 #include <sstream>
 #include <string>
+#include <utility>
 #include <vector>
 
 using namespace ns3;
@@ -74,6 +75,15 @@ struct MatrixBulkFlowSpec
     uint64_t expectedBytes = 0;
     bool requiresEpsResidualPath = false;
     std::string residualPathReason = "none";
+    bool isMeasuredLaterProofFlow = false;
+    double measuredLaterDecisionTime = 0.0;
+    int32_t measuredLaterDecisionIndex = -1;
+    int32_t measuredLaterSelectedSpine = -1;
+    int32_t measuredLaterControlPlaneSelectedSpine = -1;
+    bool measuredLaterSelectedSpineChanged = false;
+    bool measuredLaterHasMeasuredSample = false;
+    bool measuredLaterAppliesToLaterFlow = false;
+    bool measuredLaterRouteInstalled = false;
 };
 
 struct OcsAdmissionEvent
@@ -607,6 +617,15 @@ main(int argc, char* argv[])
     std::string epsWecmpLoadSource = "control-plane";
     std::string measuredWecmpNoSampleFallback = "control-plane";
     double measuredWecmpWarmupTime = 0.0;
+    bool enableMeasuredWecmpLaterFlowProof = false;
+    double measuredWecmpLaterDecisionTime = 0.8;
+    double measuredWecmpLaterFlowStart = 0.9;
+    uint64_t measuredWecmpLaterFlowMaxBytes = 524288;
+    uint16_t measuredWecmpLaterFlowPort = 13000;
+    uint32_t measuredWecmpLaterSrcLeaf = 0;
+    uint32_t measuredWecmpLaterDstLeaf = 3;
+    uint32_t measuredWecmpLaterSrcServer = 1;
+    uint32_t measuredWecmpLaterDstServer = 1;
     std::string epsWecmpDiagnosticLoadMode = "none";
     double epsWecmpDiagnosticLoad = 0.0;
     uint32_t epsWecmpDiagnosticHotSpine = 0;
@@ -701,6 +720,15 @@ main(int argc, char* argv[])
             "epsWecmpLoadSource",
             "measuredWecmpNoSampleFallback",
             "measuredWecmpWarmupTime",
+            "enableMeasuredWecmpLaterFlowProof",
+            "measuredWecmpLaterDecisionTime",
+            "measuredWecmpLaterFlowStart",
+            "measuredWecmpLaterFlowMaxBytes",
+            "measuredWecmpLaterFlowPort",
+            "measuredWecmpLaterSrcLeaf",
+            "measuredWecmpLaterDstLeaf",
+            "measuredWecmpLaterSrcServer",
+            "measuredWecmpLaterDstServer",
             "epsWecmpDiagnosticLoadMode",
             "epsWecmpDiagnosticLoad",
             "epsWecmpDiagnosticHotSpine",
@@ -899,6 +927,33 @@ main(int argc, char* argv[])
     cmd.AddValue("measuredWecmpWarmupTime",
                  "Warmup time in seconds before measured WECMP decisions. Patch 4B records this value but does not add delayed decisions.",
                  measuredWecmpWarmupTime);
+    cmd.AddValue("enableMeasuredWecmpLaterFlowProof",
+                 "Enable the Patch 4C two-stage proof that measured WECMP only affects a later new flow.",
+                 enableMeasuredWecmpLaterFlowProof);
+    cmd.AddValue("measuredWecmpLaterDecisionTime",
+                 "Simulation time when the Patch 4C later-flow measured WECMP decision is made.",
+                 measuredWecmpLaterDecisionTime);
+    cmd.AddValue("measuredWecmpLaterFlowStart",
+                 "Simulation time when the Patch 4C later proof BulkSend flow starts.",
+                 measuredWecmpLaterFlowStart);
+    cmd.AddValue("measuredWecmpLaterFlowMaxBytes",
+                 "MaxBytes for the Patch 4C later proof BulkSend flow.",
+                 measuredWecmpLaterFlowMaxBytes);
+    cmd.AddValue("measuredWecmpLaterFlowPort",
+                 "TCP port for the Patch 4C later proof flow.",
+                 measuredWecmpLaterFlowPort);
+    cmd.AddValue("measuredWecmpLaterSrcLeaf",
+                 "Source leaf index for the Patch 4C later proof flow.",
+                 measuredWecmpLaterSrcLeaf);
+    cmd.AddValue("measuredWecmpLaterDstLeaf",
+                 "Destination leaf index for the Patch 4C later proof flow.",
+                 measuredWecmpLaterDstLeaf);
+    cmd.AddValue("measuredWecmpLaterSrcServer",
+                 "Source server offset for the Patch 4C later proof flow.",
+                 measuredWecmpLaterSrcServer);
+    cmd.AddValue("measuredWecmpLaterDstServer",
+                 "Destination server offset for the Patch 4C later proof flow.",
+                 measuredWecmpLaterDstServer);
     cmd.AddValue("epsWecmpDiagnosticLoadMode",
                  "EPS-WECMP diagnostic synthetic load mode: none or hot-spine.",
                  epsWecmpDiagnosticLoadMode);
@@ -1540,6 +1595,77 @@ main(int argc, char* argv[])
             << "[HYBRID-DCN][ERROR] measuredWecmpWarmupTime must be greater than or equal to 0."
             << std::endl;
         return 1;
+    }
+
+    if (enableMeasuredWecmpLaterFlowProof)
+    {
+        if (!enableMatrixFlows || !enableEpsWecmp || !enableEpsWecmpRouting)
+        {
+            std::cerr
+                << "[HYBRID-DCN][ERROR] enableMeasuredWecmpLaterFlowProof requires enableMatrixFlows, enableEpsWecmp, and enableEpsWecmpRouting."
+                << std::endl;
+            return 1;
+        }
+        if (epsWecmpLoadSource != "measured-snapshot")
+        {
+            std::cerr
+                << "[HYBRID-DCN][ERROR] enableMeasuredWecmpLaterFlowProof requires epsWecmpLoadSource=measured-snapshot."
+                << std::endl;
+            return 1;
+        }
+        if (measuredWecmpLaterDecisionTime < 0)
+        {
+            std::cerr
+                << "[HYBRID-DCN][ERROR] measuredWecmpLaterDecisionTime must be greater than or equal to 0."
+                << std::endl;
+            return 1;
+        }
+        if (measuredWecmpLaterDecisionTime >= measuredWecmpLaterFlowStart)
+        {
+            std::cerr
+                << "[HYBRID-DCN][ERROR] measuredWecmpLaterDecisionTime must be earlier than measuredWecmpLaterFlowStart."
+                << std::endl;
+            return 1;
+        }
+        if (measuredWecmpLaterFlowStart >= simTime)
+        {
+            std::cerr
+                << "[HYBRID-DCN][ERROR] measuredWecmpLaterFlowStart must be earlier than simTime."
+                << std::endl;
+            return 1;
+        }
+        if (measuredWecmpLaterFlowMaxBytes == 0)
+        {
+            std::cerr
+                << "[HYBRID-DCN][ERROR] measuredWecmpLaterFlowMaxBytes must be greater than 0."
+                << std::endl;
+            return 1;
+        }
+        if (measuredWecmpLaterFlowPort == 0)
+        {
+            std::cerr
+                << "[HYBRID-DCN][ERROR] measuredWecmpLaterFlowPort must be greater than 0."
+                << std::endl;
+            return 1;
+        }
+        if (measuredWecmpLaterSrcLeaf >= numLeaves ||
+            measuredWecmpLaterDstLeaf >= numLeaves ||
+            measuredWecmpLaterSrcServer >= serversPerLeaf ||
+            measuredWecmpLaterDstServer >= serversPerLeaf)
+        {
+            std::cerr
+                << "[HYBRID-DCN][ERROR] measured later proof leaf/server index is out of range."
+                << std::endl;
+            return 1;
+        }
+        if (measuredWecmpLaterSrcLeaf == measuredWecmpLaterDstLeaf &&
+            measuredWecmpLaterSrcServer == measuredWecmpLaterDstServer)
+        {
+            std::cerr
+                << "[HYBRID-DCN][ERROR] measured later proof source and destination host must differ."
+                << std::endl;
+            return 1;
+        }
     }
 
     if (epsWecmpDiagnosticLoadMode != "none" &&
@@ -2298,18 +2424,21 @@ main(int argc, char* argv[])
     auto runEpsWecmpUpdateForPair = [&](uint32_t srcLeaf,
                                         uint32_t dstLeaf,
                                         double residualDemand,
-                                        bool recordDecision) {
+                                        bool recordDecision,
+                                        const std::string& decisionLoadSource,
+                                        bool appliesToLaterFlow,
+                                        bool commitPairState) {
         EpsWecmpDecision decision{enableEpsWecmp && recordDecision,
                                   srcLeaf,
                                   dstLeaf,
                                   residualDemand,
                                   0,
                                   {}};
-        decision.loadSource = epsWecmpLoadSource;
+        decision.loadSource = decisionLoadSource;
         decision.noSampleFallbackMode = measuredWecmpNoSampleFallback;
         decision.decisionTimeSeconds = Simulator::Now().GetSeconds();
-        decision.measuredDecisionRequested = epsWecmpLoadSource == "measured-snapshot";
-        decision.appliesToLaterFlow = false;
+        decision.measuredDecisionRequested = decisionLoadSource == "measured-snapshot";
+        decision.appliesToLaterFlow = appliesToLaterFlow;
         if (!enableEpsWecmp || numSpines == 0 || residualDemand <= 0)
         {
             return decision;
@@ -2456,10 +2585,13 @@ main(int argc, char* argv[])
             state.boundedProbabilityDelta = boundedProbabilityDeltas[state.spineIndex];
         }
 
-        for (const auto& state : decision.linkStates)
+        if (commitPairState)
         {
-            pairState.probabilities[state.spineIndex] = state.updatedProbability;
-            pairState.smoothedUtilizations[state.spineIndex] = state.smoothedUtilization;
+            for (const auto& state : decision.linkStates)
+            {
+                pairState.probabilities[state.spineIndex] = state.updatedProbability;
+                pairState.smoothedUtilizations[state.spineIndex] = state.smoothedUtilization;
+            }
         }
 
         for (const auto& state : decision.linkStates)
@@ -3020,7 +3152,10 @@ main(int argc, char* argv[])
                     runEpsWecmpUpdateForPair(residualPair.leafA,
                                              residualPair.leafB,
                                              residualPair.residualDemand,
-                                             false);
+                                             false,
+                                             epsWecmpLoadSource,
+                                             false,
+                                             true);
                     wecmpSummary.updatedPairs++;
                 }
                 epsWecmpEpochSummaries.push_back(wecmpSummary);
@@ -3759,6 +3894,7 @@ main(int argc, char* argv[])
     std::vector<EpsWecmpDecision> epsWecmpDecisions;
     std::vector<int32_t> matrixFlowWecmpDecisionIndex;
     std::vector<EpsWecmpRouteBinding> epsWecmpRouteBindings;
+    int32_t measuredWecmpLaterFlowIndex = -1;
     std::vector<std::vector<double>> ocsAdmittedLoad(numLeaves,
                                                      std::vector<double>(numLeaves, 0.0));
 
@@ -3943,6 +4079,43 @@ main(int argc, char* argv[])
             return 1;
         }
 
+        if (enableMeasuredWecmpLaterFlowProof)
+        {
+            std::ostringstream flowName;
+            flowName << "matrix-flow-" << matrixFlowSpecs.size()
+                     << "-measured-later-proof";
+            matrixFlowSpecs.push_back({measuredWecmpLaterSrcLeaf,
+                                       measuredWecmpLaterDstLeaf,
+                                       measuredWecmpLaterSrcServer,
+                                       measuredWecmpLaterDstServer,
+                                       measuredWecmpLaterFlowPort,
+                                       false,
+                                       isOcsPairInstalled(measuredWecmpLaterSrcLeaf,
+                                                          measuredWecmpLaterDstLeaf),
+                                       false,
+                                       true,
+                                       matrixFlowDemand,
+                                       0.0,
+                                       0.0,
+                                       matrixFlowDemand,
+                                       matrixFlowDemand,
+                                       matrixFlowDemand,
+                                       false,
+                                       -1,
+                                       flowName.str()});
+            MatrixBulkFlowSpec& laterSpec = matrixFlowSpecs.back();
+            laterSpec.fallbackDataPlaneMode = "measured-wecmp-later-proof";
+            laterSpec.fallbackEventMapped = true;
+            laterSpec.fallbackMappingType = "measured-later-proof";
+            laterSpec.startTime = measuredWecmpLaterFlowStart;
+            laterSpec.expectedBytes = measuredWecmpLaterFlowMaxBytes;
+            laterSpec.requiresEpsResidualPath = true;
+            laterSpec.residualPathReason = "measured-later-proof";
+            laterSpec.isMeasuredLaterProofFlow = true;
+            laterSpec.measuredLaterDecisionTime = measuredWecmpLaterDecisionTime;
+            measuredWecmpLaterFlowIndex = static_cast<int32_t>(matrixFlowSpecs.size() - 1);
+        }
+
         matrixFlowStats.resize(matrixFlowSpecs.size(), {0, false, 0.0, 0.0});
     }
 
@@ -3956,7 +4129,7 @@ main(int argc, char* argv[])
         resetEpsPhysicalObservedTraffic();
         for (const auto& spec : matrixFlowSpecs)
         {
-            if (requiresEpsResidualPath(spec))
+            if (requiresEpsResidualPath(spec) && !spec.isMeasuredLaterProofFlow)
             {
                 accumulateEpsResidualTraffic(spec.srcLeaf,
                                              spec.dstLeaf,
@@ -3969,7 +4142,7 @@ main(int argc, char* argv[])
         for (uint32_t flowIndex = 0; flowIndex < matrixFlowSpecs.size(); ++flowIndex)
         {
             const auto& spec = matrixFlowSpecs[flowIndex];
-            if (!requiresEpsResidualPath(spec))
+            if (!requiresEpsResidualPath(spec) || spec.isMeasuredLaterProofFlow)
             {
                 continue;
             }
@@ -3978,6 +4151,9 @@ main(int argc, char* argv[])
                 runEpsWecmpUpdateForPair(spec.srcLeaf,
                                          spec.dstLeaf,
                                          spec.wecmpResidualDemand,
+                                         true,
+                                         epsWecmpLoadSource,
+                                         false,
                                          true);
             matrixFlowWecmpDecisionIndex[flowIndex] =
                 static_cast<int32_t>(epsWecmpDecisions.size());
@@ -4070,13 +4246,64 @@ main(int argc, char* argv[])
         ocsForced = true;
     }
 
+    auto installEpsHostRoutesForMatrixFlow = [&](MatrixBulkFlowSpec& spec,
+                                                 uint32_t selectedSpine) {
+        Ipv4StaticRoutingHelper staticRoutingHelper;
+        const Ipv4Address srcServerAddress = serverIpv4[spec.srcLeaf][spec.srcServer];
+        const Ipv4Address dstServerAddress = serverIpv4[spec.dstLeaf][spec.dstServer];
+        bool installed = false;
+        uint32_t installedHostRoutes = 0;
+
+        if (selectedSpine < numSpines)
+        {
+            Ptr<Ipv4StaticRouting> srcServerRouting = staticRoutingHelper.GetStaticRouting(
+                servers.Get(serverIndex(spec.srcLeaf, spec.srcServer))->GetObject<Ipv4>());
+            Ptr<Ipv4StaticRouting> dstServerRouting = staticRoutingHelper.GetStaticRouting(
+                servers.Get(serverIndex(spec.dstLeaf, spec.dstServer))->GetObject<Ipv4>());
+            Ptr<Ipv4StaticRouting> srcLeafRouting =
+                staticRoutingHelper.GetStaticRouting(leaves.Get(spec.srcLeaf)->GetObject<Ipv4>());
+            Ptr<Ipv4StaticRouting> dstLeafRouting =
+                staticRoutingHelper.GetStaticRouting(leaves.Get(spec.dstLeaf)->GetObject<Ipv4>());
+            Ptr<Ipv4StaticRouting> spineRouting =
+                staticRoutingHelper.GetStaticRouting(spines.Get(selectedSpine)->GetObject<Ipv4>());
+
+            srcServerRouting->AddHostRouteTo(dstServerAddress,
+                                             leafServerIpv4[spec.srcLeaf][spec.srcServer],
+                                             serverIfIndex[spec.srcLeaf][spec.srcServer]);
+            installedHostRoutes++;
+            srcLeafRouting->AddHostRouteTo(dstServerAddress,
+                                           leafToSpineNextHop[spec.srcLeaf][selectedSpine],
+                                           leafToSpineIfIndex[spec.srcLeaf][selectedSpine]);
+            installedHostRoutes++;
+            spineRouting->AddHostRouteTo(dstServerAddress,
+                                         spineToLeafNextHop[selectedSpine][spec.dstLeaf],
+                                         spineToLeafIfIndex[selectedSpine][spec.dstLeaf]);
+            installedHostRoutes++;
+
+            dstLeafRouting->AddHostRouteTo(srcServerAddress,
+                                           leafToSpineNextHop[spec.dstLeaf][selectedSpine],
+                                           leafToSpineIfIndex[spec.dstLeaf][selectedSpine]);
+            installedHostRoutes++;
+            spineRouting->AddHostRouteTo(srcServerAddress,
+                                         spineToLeafNextHop[selectedSpine][spec.srcLeaf],
+                                         spineToLeafIfIndex[selectedSpine][spec.srcLeaf]);
+            installedHostRoutes++;
+            dstServerRouting->AddHostRouteTo(srcServerAddress,
+                                             leafServerIpv4[spec.dstLeaf][spec.dstServer],
+                                             serverIfIndex[spec.dstLeaf][spec.dstServer]);
+            installedHostRoutes++;
+            installed = true;
+        }
+
+        return std::make_pair(installed, installedHostRoutes);
+    };
+
     if (enableMatrixFlows)
     {
-        Ipv4StaticRoutingHelper staticRoutingHelper;
         for (uint32_t flowIndex = 0; flowIndex < matrixFlowSpecs.size(); ++flowIndex)
         {
             auto& spec = matrixFlowSpecs[flowIndex];
-            if (!requiresEpsResidualPath(spec))
+            if (!requiresEpsResidualPath(spec) || spec.isMeasuredLaterProofFlow)
             {
                 continue;
             }
@@ -4093,49 +4320,9 @@ main(int argc, char* argv[])
             }
             const Ipv4Address srcServerAddress = serverIpv4[spec.srcLeaf][spec.srcServer];
             const Ipv4Address dstServerAddress = serverIpv4[spec.dstLeaf][spec.dstServer];
-            bool installed = false;
-            uint32_t installedHostRoutes = 0;
-
-            if (selectedSpine < numSpines)
-            {
-                Ptr<Ipv4StaticRouting> srcServerRouting = staticRoutingHelper.GetStaticRouting(
-                    servers.Get(serverIndex(spec.srcLeaf, spec.srcServer))->GetObject<Ipv4>());
-                Ptr<Ipv4StaticRouting> dstServerRouting = staticRoutingHelper.GetStaticRouting(
-                    servers.Get(serverIndex(spec.dstLeaf, spec.dstServer))->GetObject<Ipv4>());
-                Ptr<Ipv4StaticRouting> srcLeafRouting = staticRoutingHelper.GetStaticRouting(
-                    leaves.Get(spec.srcLeaf)->GetObject<Ipv4>());
-                Ptr<Ipv4StaticRouting> dstLeafRouting = staticRoutingHelper.GetStaticRouting(
-                    leaves.Get(spec.dstLeaf)->GetObject<Ipv4>());
-                Ptr<Ipv4StaticRouting> spineRouting = staticRoutingHelper.GetStaticRouting(
-                    spines.Get(selectedSpine)->GetObject<Ipv4>());
-
-                srcServerRouting->AddHostRouteTo(dstServerAddress,
-                                                 leafServerIpv4[spec.srcLeaf][spec.srcServer],
-                                                 serverIfIndex[spec.srcLeaf][spec.srcServer]);
-                installedHostRoutes++;
-                srcLeafRouting->AddHostRouteTo(dstServerAddress,
-                                               leafToSpineNextHop[spec.srcLeaf][selectedSpine],
-                                               leafToSpineIfIndex[spec.srcLeaf][selectedSpine]);
-                installedHostRoutes++;
-                spineRouting->AddHostRouteTo(dstServerAddress,
-                                             spineToLeafNextHop[selectedSpine][spec.dstLeaf],
-                                             spineToLeafIfIndex[selectedSpine][spec.dstLeaf]);
-                installedHostRoutes++;
-
-                dstLeafRouting->AddHostRouteTo(srcServerAddress,
-                                               leafToSpineNextHop[spec.dstLeaf][selectedSpine],
-                                               leafToSpineIfIndex[spec.dstLeaf][selectedSpine]);
-                installedHostRoutes++;
-                spineRouting->AddHostRouteTo(srcServerAddress,
-                                             spineToLeafNextHop[selectedSpine][spec.srcLeaf],
-                                             spineToLeafIfIndex[selectedSpine][spec.srcLeaf]);
-                installedHostRoutes++;
-                dstServerRouting->AddHostRouteTo(srcServerAddress,
-                                                 leafServerIpv4[spec.dstLeaf][spec.dstServer],
-                                                 serverIfIndex[spec.dstLeaf][spec.dstServer]);
-                installedHostRoutes++;
-                installed = true;
-            }
+            const auto installResult = installEpsHostRoutesForMatrixFlow(spec, selectedSpine);
+            const bool installed = installResult.first;
+            const uint32_t installedHostRoutes = installResult.second;
 
             routeFixEpsResidualHostRoutes += installedHostRoutes;
             if (hasWecmpRouteBinding && installed)
@@ -4280,8 +4467,11 @@ main(int argc, char* argv[])
         for (uint32_t flowIndex = 0; flowIndex < matrixFlowSpecs.size(); ++flowIndex)
         {
             auto& spec = matrixFlowSpecs[flowIndex];
-            spec.startTime = matrixFlowStart + (0.02 * static_cast<double>(flowIndex));
-            spec.expectedBytes = matrixFlowMaxBytes;
+            if (!spec.isMeasuredLaterProofFlow)
+            {
+                spec.startTime = matrixFlowStart + (0.02 * static_cast<double>(flowIndex));
+                spec.expectedBytes = matrixFlowMaxBytes;
+            }
             Address sinkAddress(InetSocketAddress(Ipv4Address::GetAny(), spec.port));
             PacketSinkHelper matrixPacketSink("ns3::TcpSocketFactory", sinkAddress);
             ApplicationContainer sinkApps = matrixPacketSink.Install(
@@ -6051,6 +6241,99 @@ main(int argc, char* argv[])
     g_epsTxPackets = 0;
     g_epsTxBytes = 0;
 
+    if (enableMeasuredWecmpLaterFlowProof && measuredWecmpLaterFlowIndex >= 0)
+    {
+        Simulator::Schedule(
+            Seconds(measuredWecmpLaterDecisionTime),
+            [&]() {
+                if (measuredWecmpLaterFlowIndex < 0 ||
+                    static_cast<std::size_t>(measuredWecmpLaterFlowIndex) >=
+                        matrixFlowSpecs.size())
+                {
+                    return;
+                }
+
+                const uint32_t flowIndex =
+                    static_cast<uint32_t>(measuredWecmpLaterFlowIndex);
+                auto& spec = matrixFlowSpecs[flowIndex];
+                if (!requiresEpsResidualPath(spec))
+                {
+                    return;
+                }
+
+                EpsWecmpDecision baselineDecision =
+                    runEpsWecmpUpdateForPair(spec.srcLeaf,
+                                             spec.dstLeaf,
+                                             spec.wecmpResidualDemand,
+                                             false,
+                                             "control-plane",
+                                             true,
+                                             false);
+                EpsWecmpDecision measuredDecision =
+                    runEpsWecmpUpdateForPair(spec.srcLeaf,
+                                             spec.dstLeaf,
+                                             spec.wecmpResidualDemand,
+                                             true,
+                                             "measured-snapshot",
+                                             true,
+                                             false);
+                measuredDecision.controlPlaneSelectedSpine = baselineDecision.selectedSpine;
+                const uint32_t selectedSpine = measuredDecision.selectedSpine;
+
+                matrixFlowWecmpDecisionIndex[flowIndex] =
+                    static_cast<int32_t>(epsWecmpDecisions.size());
+                spec.measuredLaterDecisionIndex = matrixFlowWecmpDecisionIndex[flowIndex];
+                epsWecmpDecisions.push_back(measuredDecision);
+
+                const Ipv4Address srcServerAddress =
+                    serverIpv4[spec.srcLeaf][spec.srcServer];
+                const Ipv4Address dstServerAddress =
+                    serverIpv4[spec.dstLeaf][spec.dstServer];
+                const auto installResult =
+                    installEpsHostRoutesForMatrixFlow(spec, selectedSpine);
+                const bool installed = installResult.first;
+                const uint32_t installedHostRoutes = installResult.second;
+
+                routeFixEpsResidualHostRoutes += installedHostRoutes;
+                if (installed)
+                {
+                    spec.epsPathFrozen = true;
+                    spec.frozenSpine = static_cast<int32_t>(selectedSpine);
+                    spec.measuredLaterRouteInstalled = true;
+                    routeFixWecmpFrozenRoutes++;
+                }
+
+                routeFixRecords.push_back({flowIndex,
+                                           spec.srcLeaf,
+                                           spec.dstLeaf,
+                                           selectedSpine,
+                                           spec.residualPathReason,
+                                           "measured-later-wecmp-frozen",
+                                           installedHostRoutes,
+                                           installed});
+                epsWecmpRouteBindings.push_back({flowIndex,
+                                                 spec.srcLeaf,
+                                                 spec.dstLeaf,
+                                                 selectedSpine,
+                                                 srcServerAddress,
+                                                 dstServerAddress,
+                                                 installed,
+                                                 installed,
+                                                 spec.wecmpResidualDemand});
+
+                spec.measuredLaterSelectedSpine = static_cast<int32_t>(selectedSpine);
+                spec.measuredLaterControlPlaneSelectedSpine =
+                    static_cast<int32_t>(baselineDecision.selectedSpine);
+                spec.measuredLaterSelectedSpineChanged =
+                    selectedSpine != baselineDecision.selectedSpine;
+                spec.measuredLaterHasMeasuredSample =
+                    measuredDecision.measuredDecisionUsed &&
+                    !measuredDecision.measuredDecisionFallback &&
+                    !measuredDecision.measuredNoSample;
+                spec.measuredLaterAppliesToLaterFlow = measuredDecision.appliesToLaterFlow;
+            });
+    }
+
     std::vector<LinkUtilizationSample> linkUtilizationSamples;
     uint32_t linkUtilizationNextSampleIndex = 0;
     const bool linkTimeseriesEnabled = linkUtilizationSampleInterval > 0.0;
@@ -6071,6 +6354,14 @@ main(int argc, char* argv[])
     Simulator::Stop(Seconds(simTime));
     Simulator::Run();
     Simulator::Destroy();
+
+    if (measuredWecmpNoSampleError)
+    {
+        std::cerr
+            << "[HYBRID-DCN][ERROR] measured WECMP requested but no measured sample was available and measuredWecmpNoSampleFallback=error."
+            << std::endl;
+        return 1;
+    }
 
     if (enableMatrixFlows)
     {
@@ -6686,6 +6977,56 @@ main(int argc, char* argv[])
             }
         }
     }
+    uint64_t measuredWecmpLaterFlowCount = 0;
+    uint64_t measuredWecmpLaterFlowCompletedCount = 0;
+    uint64_t measuredWecmpLaterDecisionCount = 0;
+    uint64_t measuredWecmpLaterChangedSelectedSpineCount = 0;
+    bool measuredWecmpLaterRouteInstalled = false;
+    bool measuredWecmpLaterOcsLeakageDetected = false;
+    bool measuredWecmpLaterProofPassed = false;
+    for (uint32_t flowIndex = 0; flowIndex < matrixFlowSpecs.size(); ++flowIndex)
+    {
+        const auto& spec = matrixFlowSpecs[flowIndex];
+        if (!spec.isMeasuredLaterProofFlow)
+        {
+            continue;
+        }
+        measuredWecmpLaterFlowCount++;
+        if (flowIndex < matrixFlowStats.size() &&
+            isMatrixFlowCompleted(spec, matrixFlowStats[flowIndex]))
+        {
+            measuredWecmpLaterFlowCompletedCount++;
+        }
+        if (spec.measuredLaterDecisionIndex >= 0)
+        {
+            measuredWecmpLaterDecisionCount++;
+        }
+        if (spec.measuredLaterSelectedSpineChanged)
+        {
+            measuredWecmpLaterChangedSelectedSpineCount++;
+        }
+        if (spec.measuredLaterRouteInstalled)
+        {
+            measuredWecmpLaterRouteInstalled = true;
+        }
+        for (const auto& counter : linkCounters)
+        {
+            const bool ocsPairMatch =
+                counter.linkType == "ocs" &&
+                ((counter.endpointA == spec.srcLeaf && counter.endpointB == spec.dstLeaf) ||
+                 (counter.endpointA == spec.dstLeaf && counter.endpointB == spec.srcLeaf));
+            if (ocsPairMatch && counter.txBytes > 0)
+            {
+                measuredWecmpLaterOcsLeakageDetected = true;
+            }
+        }
+    }
+    measuredWecmpLaterProofPassed =
+        enableMeasuredWecmpLaterFlowProof && measuredWecmpLaterFlowCount > 0 &&
+        measuredWecmpLaterFlowCompletedCount == measuredWecmpLaterFlowCount &&
+        measuredWecmpLaterDecisionCount == measuredWecmpLaterFlowCount &&
+        measuredWecmpLaterChangedSelectedSpineCount > 0 &&
+        measuredWecmpLaterRouteInstalled && !measuredWecmpLaterOcsLeakageDetected;
     std::string ocsToEpsByteRatio = "0";
     if (g_epsTxBytes > 0)
     {
@@ -7337,7 +7678,17 @@ main(int argc, char* argv[])
                              "measuredWecmpNoSampleDecisionCount",
                              "measuredWecmpCandidateRowsWithSample",
                              "measuredWecmpCandidateRowsWithoutSample",
-                             "measuredWecmpChangedSelectedSpineCount"});
+                             "measuredWecmpChangedSelectedSpineCount",
+                             "measuredWecmpLaterFlowProofEnabled",
+                             "measuredWecmpLaterDecisionTime",
+                             "measuredWecmpLaterFlowStart",
+                             "measuredWecmpLaterFlowCount",
+                             "measuredWecmpLaterFlowCompletedCount",
+                             "measuredWecmpLaterDecisionCount",
+                             "measuredWecmpLaterChangedSelectedSpineCount",
+                             "measuredWecmpLaterRouteInstalled",
+                             "measuredWecmpLaterOcsLeakageDetected",
+                             "measuredWecmpLaterProofPassed"});
                 writeCsvRow(file,
                             {experimentName,
                              presetScenario,
@@ -7406,7 +7757,17 @@ main(int argc, char* argv[])
                              csvValue(measuredWecmpNoSampleDecisionCount),
                              csvValue(measuredWecmpCandidateRowsWithSample),
                              csvValue(measuredWecmpCandidateRowsWithoutSample),
-                             csvValue(measuredWecmpChangedSelectedSpineCount)});
+                             csvValue(measuredWecmpChangedSelectedSpineCount),
+                             csvBool(enableMeasuredWecmpLaterFlowProof),
+                             csvValue(measuredWecmpLaterDecisionTime),
+                             csvValue(measuredWecmpLaterFlowStart),
+                             csvValue(measuredWecmpLaterFlowCount),
+                             csvValue(measuredWecmpLaterFlowCompletedCount),
+                             csvValue(measuredWecmpLaterDecisionCount),
+                             csvValue(measuredWecmpLaterChangedSelectedSpineCount),
+                             csvBool(measuredWecmpLaterRouteInstalled),
+                             csvBool(measuredWecmpLaterOcsLeakageDetected),
+                             csvBool(measuredWecmpLaterProofPassed)});
                 if (!file.good())
                 {
                     exportSuccess = false;
@@ -7453,7 +7814,15 @@ main(int argc, char* argv[])
                              "goodputMbps",
                              "pathType",
                              "fctSeconds",
-                             "rxDurationSeconds"});
+                             "rxDurationSeconds",
+                             "isMeasuredLaterProofFlow",
+                             "measuredLaterDecisionTime",
+                             "measuredLaterDecisionIndex",
+                             "measuredLaterSelectedSpine",
+                             "measuredLaterControlPlaneSelectedSpine",
+                             "measuredLaterSelectedSpineChanged",
+                             "measuredLaterHasMeasuredSample",
+                             "measuredLaterAppliesToLaterFlow"});
                 for (uint32_t flowIndex = 0; flowIndex < matrixFlowSpecs.size(); ++flowIndex)
                 {
                     const auto& spec = matrixFlowSpecs[flowIndex];
@@ -7500,7 +7869,15 @@ main(int argc, char* argv[])
                                  csvValue(goodputMbps),
                                  classifyMatrixFlowPathType(spec),
                                  csvValue(fctSeconds),
-                                 csvValue(rxDurationSeconds)});
+                                 csvValue(rxDurationSeconds),
+                                 csvBool(spec.isMeasuredLaterProofFlow),
+                                 csvValue(spec.measuredLaterDecisionTime),
+                                 csvValue(spec.measuredLaterDecisionIndex),
+                                 csvValue(spec.measuredLaterSelectedSpine),
+                                 csvValue(spec.measuredLaterControlPlaneSelectedSpine),
+                                 csvBool(spec.measuredLaterSelectedSpineChanged),
+                                 csvBool(spec.measuredLaterHasMeasuredSample),
+                                 csvBool(spec.measuredLaterAppliesToLaterFlow)});
                 }
                 if (!file.good())
                 {
@@ -7544,7 +7921,8 @@ main(int argc, char* argv[])
                              "measuredDecisionFallback",
                              "measuredNoSample",
                              "decisionTimeSeconds",
-                             "appliesToLaterFlow"});
+                             "appliesToLaterFlow",
+                             "controlPlaneSelectedSpine"});
                 for (uint32_t decisionIndex = 0; decisionIndex < epsWecmpDecisions.size();
                      ++decisionIndex)
                 {
@@ -7580,7 +7958,8 @@ main(int argc, char* argv[])
                                      csvBool(decision.measuredDecisionFallback),
                                      csvBool(decision.measuredNoSample),
                                      csvValue(decision.decisionTimeSeconds),
-                                     csvBool(decision.appliesToLaterFlow)});
+                                     csvBool(decision.appliesToLaterFlow),
+                                     csvValue(decision.controlPlaneSelectedSpine)});
                     }
                 }
                 if (!file.good())
