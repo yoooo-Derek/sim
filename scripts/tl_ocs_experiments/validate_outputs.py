@@ -1,17 +1,25 @@
 #!/usr/bin/env python3
 import argparse
 import csv
+import re
 import sys
 from pathlib import Path
 
 
-SCENARIOS = [
+SMOKE_SCENARIOS = [
     "smoke__4l2s2h__skewed__static_ocs03__hit__det__seed0",
     "smoke__4l2s2h__skewed__static_ocs03__admit_fallback__det__seed0",
     "smoke__4l2s2h__skewed__tl_ocs__fallback__det__seed0",
     "smoke__4l2s2h__skewed__tl_ocs__fallback__cp_wecmp__seed0",
     "smoke__4l2s2h__skewed__tl_ocs__fallback__measured_nosample__seed0",
     "smoke__4l2s2h__skewed__tl_ocs__fallback__measured_later__seed0",
+]
+
+MEDIUM_SCENARIOS = [
+    "medium__8l4s2h__skewed__static_ocs07__hit__det__seed0",
+    "medium__8l4s2h__skewed__static_ocs07__admit_fallback__det__seed0",
+    "medium__8l4s2h__skewed__tl_ocs__fallback__cp_wecmp__seed0",
+    "medium__8l4s2h__skewed__tl_ocs__fallback__measured_later__seed0",
 ]
 
 
@@ -38,26 +46,99 @@ def is_true(value):
     return str(value).strip().lower() == "true"
 
 
+def parse_experiment_name(name):
+    parts = name.split("__")
+    metadata = {
+        "suite": "unknown",
+        "scale": "unknown",
+        "traffic": "unknown",
+        "baseline": "unknown",
+        "admission": "unknown",
+        "wecmp": "unknown",
+        "seed": "unknown",
+    }
+    if len(parts) == 7:
+        metadata.update(
+            {
+                "suite": parts[0],
+                "scale": parts[1],
+                "traffic": parts[2],
+                "baseline": parts[3],
+                "admission": parts[4],
+                "wecmp": parts[5],
+                "seed": parts[6][4:] if parts[6].startswith("seed") else parts[6],
+            }
+        )
+    return metadata
+
+
+def parse_scale(scale):
+    match = re.fullmatch(r"(\d+)l(\d+)s(\d+)h", scale)
+    if not match:
+        return 4, 2, 2
+    return tuple(int(part) for part in match.groups())
+
+
+def expected_link_counter_count(scenario):
+    metadata = parse_experiment_name(scenario)
+    leaves, spines, _servers = parse_scale(metadata["scale"])
+    return leaves * spines * 2 + 2
+
+
+def expected_measured_wecmp_rows(scenario):
+    metadata = parse_experiment_name(scenario)
+    leaves, spines, _servers = parse_scale(metadata["scale"])
+    return leaves * spines * 2
+
+
+def find_selected_ocs_link(rows):
+    for row in rows:
+        if row.get("linkType") == "ocs" and row.get("direction") == "a-to-b":
+            match = re.search(r"ocs-leaf(\d+)-leaf(\d+)-a-to-b", row.get("linkId", ""))
+            if match:
+                return row, int(match.group(1)), int(match.group(2))
+    return None, None, None
+
+
+def link_tx_by_id(rows):
+    by_id = {row.get("linkId", ""): row for row in rows}
+
+    def tx(link_id):
+        return parse_int(by_id.get(link_id, {}).get("txBytes"), 0) or 0
+
+    return tx
+
+
+def first_matching_flow(flows, predicate):
+    for row in flows:
+        if predicate(row):
+            return row
+    return None
+
+
 class Validator:
-    def __init__(self, run_dir, csv_dir, manifest_path, report_path, strict):
+    def __init__(self, run_dir, csv_dir, manifest_path, report_path, suite, scenarios, strict):
         self.run_dir = run_dir
         self.csv_dir = csv_dir
         self.manifest_path = manifest_path
         self.report_path = report_path
+        self.suite = suite
+        self.scenarios = list(scenarios)
         self.strict = strict
         self.rows = []
         self.failures = 0
 
-    def record(self, scenario, check, ok, message):
+    def record(self, scenario, check, ok, message, required=True):
+        status = "pass" if ok else ("fail" if required or self.strict else "warn")
         self.rows.append(
             {
                 "experimentName": scenario,
                 "check": check,
-                "status": "pass" if ok else "fail",
+                "status": status,
                 "message": message,
             }
         )
-        if not ok:
+        if status == "fail":
             self.failures += 1
 
     def require(self, scenario, check, condition, message):
@@ -85,7 +166,7 @@ class Validator:
             return {}
         rows = read_rows(self.manifest_path)
         by_name = {row.get("experimentName", ""): row for row in rows}
-        for scenario in SCENARIOS:
+        for scenario in self.scenarios:
             row = by_name.get(scenario)
             self.require(scenario, "manifest_row", row is not None, "manifest contains scenario")
             if row is not None:
@@ -134,11 +215,12 @@ class Validator:
             and (parse_int(row.get("completedFlowCount"), 0) or 0) > 0,
             f"completedFlows={row.get('completedFlows')} completedFlowCount={row.get('completedFlowCount')}",
         )
+        expected_links = expected_link_counter_count(scenario)
         self.require(
             scenario,
             "link_counter_count",
-            parse_int(row.get("linkCounterCount")) == 18,
-            f"linkCounterCount={row.get('linkCounterCount')}",
+            parse_int(row.get("linkCounterCount")) == expected_links,
+            f"linkCounterCount={row.get('linkCounterCount')} expected={expected_links}",
         )
         self.require(
             scenario,
@@ -232,50 +314,81 @@ class Validator:
         if not self.require(scenario, "links_exists", path.exists(), str(path)):
             return []
         rows = read_rows(path)
-        self.require(scenario, "links_row_count", len(rows) == 18, f"rows={len(rows)}")
+        expected_links = expected_link_counter_count(scenario)
+        self.require(scenario, "links_row_count", len(rows) == expected_links, f"rows={len(rows)} expected={expected_links}")
         self.require_fields(scenario, "links_schema", rows, ["linkId", "linkType", "direction", "txBytes", "utilizationApprox"])
-        by_id = {row.get("linkId", ""): row for row in rows}
+        tx = link_tx_by_id(rows)
+        ocs_row, ocs_src, ocs_dst = find_selected_ocs_link(rows)
+        self.require(scenario, "selected_ocs_link_present", ocs_row is not None, "found OCS a-to-b counter")
+        ocs_tx = parse_int(ocs_row.get("txBytes"), 0) if ocs_row else 0
 
-        def tx(link_id):
-            return parse_int(by_id.get(link_id, {}).get("txBytes"), 0) or 0
-
-        ocs03 = tx("ocs-leaf0-leaf3-a-to-b")
         if scenario.endswith("__hit__det__seed0"):
-            self.require(scenario, "route_ocs_hit_uses_ocs", ocs03 > 0, f"ocs03={ocs03}")
-            self.require(
-                scenario,
-                "flows_ocs_hit_path",
-                any(row.get("srcLeaf") == "0" and row.get("dstLeaf") == "3" and row.get("pathType") == "ocs" for row in flows),
-                "0-3 flow has pathType=ocs",
-            )
+            self.require(scenario, "route_ocs_hit_uses_ocs", (ocs_tx or 0) > 0, f"ocsTx={ocs_tx}")
+            if ocs_src is not None and ocs_dst is not None:
+                self.require(
+                    scenario,
+                    "flows_ocs_hit_path",
+                    any(
+                        row.get("srcLeaf") == str(ocs_src)
+                        and row.get("dstLeaf") == str(ocs_dst)
+                        and row.get("pathType") == "ocs"
+                        for row in flows
+                    ),
+                    f"{ocs_src}-{ocs_dst} flow has pathType=ocs",
+                )
         else:
-            self.require(scenario, "route_no_ocs_leakage", ocs03 == 0, f"ocs03={ocs03}")
+            self.require(scenario, "route_no_ocs_leakage", (ocs_tx or 0) == 0, f"ocsTx={ocs_tx}")
 
         if "admit_fallback__det" in scenario or "tl_ocs__fallback__det" in scenario:
-            self.require(
-                scenario,
-                "route_deterministic_spine0",
-                tx("eps-leaf0-spine0-leaf-to-spine") > 0 and tx("eps-leaf3-spine0-spine-to-leaf") > 0,
-                f"leaf0-spine0={tx('eps-leaf0-spine0-leaf-to-spine')} spine0-leaf3={tx('eps-leaf3-spine0-spine-to-leaf')}",
-            )
+            flow = first_matching_flow(flows, lambda row: row.get("pathType") in ("eps-fallback", "eps-residual"))
+            if flow:
+                src = parse_int(flow.get("srcLeaf"))
+                dst = parse_int(flow.get("dstLeaf"))
+                self.require(
+                    scenario,
+                    "route_deterministic_spine0",
+                    tx(f"eps-leaf{src}-spine0-leaf-to-spine") > 0
+                    and tx(f"eps-leaf{dst}-spine0-spine-to-leaf") > 0,
+                    f"src={src} dst={dst} leaf-spine={tx(f'eps-leaf{src}-spine0-leaf-to-spine')} spine-leaf={tx(f'eps-leaf{dst}-spine0-spine-to-leaf')}",
+                )
+            else:
+                self.require(scenario, "route_deterministic_spine0", False, "no EPS fallback/residual flow")
+
         if "cp_wecmp" in scenario or "measured_nosample" in scenario:
-            self.require(
-                scenario,
-                "route_wecmp_spine1",
-                tx("eps-leaf0-spine1-leaf-to-spine") > 0 and tx("eps-leaf3-spine1-spine-to-leaf") > 0,
-                f"leaf0-spine1={tx('eps-leaf0-spine1-leaf-to-spine')} spine1-leaf3={tx('eps-leaf3-spine1-spine-to-leaf')}",
+            flow = first_matching_flow(
+                flows,
+                lambda row: row.get("pathType") in ("eps-fallback", "eps-residual")
+                and (parse_int(row.get("frozenSpine"), -1) or -1) >= 0,
             )
+            if flow:
+                src = parse_int(flow.get("srcLeaf"))
+                dst = parse_int(flow.get("dstLeaf"))
+                spine = parse_int(flow.get("frozenSpine"))
+                self.require(
+                    scenario,
+                    "route_wecmp_frozen_spine",
+                    tx(f"eps-leaf{src}-spine{spine}-leaf-to-spine") > 0
+                    and tx(f"eps-leaf{dst}-spine{spine}-spine-to-leaf") > 0,
+                    f"src={src} dst={dst} spine={spine}",
+                )
+            else:
+                self.require(scenario, "route_wecmp_frozen_spine", False, "no frozen WECMP flow")
+
         if scenario.endswith("measured_later__seed0"):
             later = [row for row in flows if is_true(row.get("isMeasuredLaterProofFlow"))]
             selected = parse_int(later[0].get("measuredLaterSelectedSpine")) if later else None
-            if selected is not None:
+            if later and selected is not None:
+                src = parse_int(later[0].get("srcLeaf"))
+                dst = parse_int(later[0].get("dstLeaf"))
                 self.require(
                     scenario,
                     "route_measured_later_selected_spine",
-                    tx(f"eps-leaf0-spine{selected}-leaf-to-spine") > 0
-                    and tx(f"eps-leaf3-spine{selected}-spine-to-leaf") > 0,
-                    f"selected={selected} leaf0={tx(f'eps-leaf0-spine{selected}-leaf-to-spine')} leaf3={tx(f'eps-leaf3-spine{selected}-spine-to-leaf')}",
+                    tx(f"eps-leaf{src}-spine{selected}-leaf-to-spine") > 0
+                    and tx(f"eps-leaf{dst}-spine{selected}-spine-to-leaf") > 0,
+                    f"src={src} dst={dst} selected={selected}",
                 )
+            else:
+                self.require(scenario, "route_measured_later_selected_spine", False, "no measured later flow")
         return rows
 
     def validate_timeseries(self, scenario):
@@ -372,7 +485,8 @@ class Validator:
         if not self.require(scenario, "measured_wecmp_exists", path.exists(), str(path)):
             return
         rows = read_rows(path)
-        self.require(scenario, "measured_wecmp_row_count", len(rows) == 16, f"rows={len(rows)}")
+        expected_rows = expected_measured_wecmp_rows(scenario)
+        self.require(scenario, "measured_wecmp_row_count", len(rows) == expected_rows, f"rows={len(rows)} expected={expected_rows}")
         self.require_fields(scenario, "measured_wecmp_schema", rows, ["hasSample", "measuredUtilization"])
         parseable = True
         for row in rows:
@@ -388,7 +502,7 @@ class Validator:
 
     def run(self):
         self.validate_manifest()
-        for scenario in SCENARIOS:
+        for scenario in self.scenarios:
             self.validate_ocs_candidates(scenario)
             self.validate_summary(scenario)
             flows = self.validate_flows(scenario)
@@ -397,8 +511,9 @@ class Validator:
             self.validate_wecmp(scenario)
             self.validate_measured_wecmp(scenario)
         self.write_report()
-        passed = len(self.rows) - self.failures
-        print(f"Validation checks: {passed} passed, {self.failures} failed")
+        passed = sum(1 for row in self.rows if row["status"] == "pass")
+        warnings = sum(1 for row in self.rows if row["status"] == "warn")
+        print(f"Validation checks: {passed} passed, {warnings} warnings, {self.failures} failed")
         print(f"Validation report: {self.report_path}")
         return 0 if self.failures == 0 else 1
 
@@ -410,12 +525,20 @@ class Validator:
             writer.writerows(self.rows)
 
 
+def scenarios_from_manifest(path):
+    if not path.exists():
+        return []
+    return [row.get("experimentName", "") for row in read_rows(path) if row.get("experimentName")]
+
+
 def main():
-    parser = argparse.ArgumentParser(description="Validate TL-OCS small-smoke outputs.")
+    parser = argparse.ArgumentParser(description="Validate TL-OCS experiment outputs.")
     parser.add_argument("--run-dir", required=True)
     parser.add_argument("--manifest")
     parser.add_argument("--csv-dir")
     parser.add_argument("--report")
+    parser.add_argument("--suite", choices=["smoke", "medium"], default="smoke")
+    parser.add_argument("--scenarios-from-manifest", action="store_true")
     parser.add_argument("--strict", action="store_true")
     args = parser.parse_args()
 
@@ -424,7 +547,18 @@ def main():
     csv_dir = Path(args.csv_dir) if args.csv_dir else run_dir / "csv"
     report = Path(args.report) if args.report else run_dir / "validation-report.csv"
 
-    validator = Validator(run_dir, csv_dir, manifest, report, args.strict)
+    if args.scenarios_from_manifest:
+        scenarios = scenarios_from_manifest(manifest)
+    elif args.suite == "medium":
+        scenarios = MEDIUM_SCENARIOS
+    else:
+        scenarios = SMOKE_SCENARIOS
+
+    if not scenarios:
+        print("ERROR: no scenarios to validate", file=sys.stderr)
+        return 2
+
+    validator = Validator(run_dir, csv_dir, manifest, report, args.suite, scenarios, args.strict)
     return validator.run()
 
 
