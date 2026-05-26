@@ -22,6 +22,12 @@ struct EpsWecmpLinkState
     double boundedProbabilityDelta;
     double pathLoadMetric;
     double candidatePathLoad;
+    bool hasMeasuredSample = false;
+    double measuredSrcToSpineUtilization = 0.0;
+    double measuredSpineToDstUtilization = 0.0;
+    double measuredPathUtilization = 0.0;
+    double controlPlanePathLoadMetric = 0.0;
+    double effectivePathLoadMetric = 0.0;
 };
 
 struct EpsWecmpDecision
@@ -32,6 +38,15 @@ struct EpsWecmpDecision
     double residualDemand;
     uint32_t selectedSpine;
     std::vector<EpsWecmpLinkState> linkStates;
+    std::string loadSource = "control-plane";
+    std::string noSampleFallbackMode = "control-plane";
+    double decisionTimeSeconds = 0.0;
+    bool measuredDecisionRequested = false;
+    bool measuredDecisionUsed = false;
+    bool measuredDecisionFallback = false;
+    bool measuredNoSample = false;
+    bool appliesToLaterFlow = false;
+    uint32_t controlPlaneSelectedSpine = 0;
 };
 
 struct EpsWecmpPairState

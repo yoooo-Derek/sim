@@ -132,6 +132,26 @@ struct LinkUtilizationSample
     double utilizationApprox;
 };
 
+struct MeasuredEpsDirectedLinkSnapshot
+{
+    bool hasSample;
+    double lastSampleTime;
+    double utilizationApprox;
+    double sampleThroughputMbps;
+    uint64_t deltaTxBytes;
+    uint64_t cumulativeTxBytes;
+    double capacityMbps;
+    uint64_t updateCount;
+};
+
+struct MeasuredWecmpPathLoad
+{
+    bool hasSample;
+    double srcToSpineUtilization;
+    double spineToDstUtilization;
+    double pathUtilization;
+};
+
 void
 MatrixBulkSinkRxTrace(std::vector<MatrixBulkFlowStats>* stats,
                       uint32_t flowIndex,
@@ -172,6 +192,11 @@ LinkTxTrace(std::vector<LinkCounter>* counters, uint32_t counterIndex, Ptr<const
 void
 SampleLinkUtilizationTimeSeries(std::vector<LinkCounter>* counters,
                                 std::vector<LinkUtilizationSample>* samples,
+                                std::vector<std::vector<MeasuredEpsDirectedLinkSnapshot>>*
+                                    epsLeafToSpineSnapshots,
+                                std::vector<std::vector<MeasuredEpsDirectedLinkSnapshot>>*
+                                    epsSpineToLeafSnapshots,
+                                uint64_t* measuredSnapshotUpdateCount,
                                 double sampleIntervalSeconds,
                                 double stopTimeSeconds,
                                 uint32_t* nextSampleIndex)
@@ -217,6 +242,41 @@ SampleLinkUtilizationTimeSeries(std::vector<LinkCounter>* counters,
                             sampleThroughputMbps,
                             utilizationApprox});
 
+        if (counter.linkType == "eps-leaf-spine" &&
+            epsLeafToSpineSnapshots != nullptr &&
+            epsSpineToLeafSnapshots != nullptr)
+        {
+            MeasuredEpsDirectedLinkSnapshot* snapshot = nullptr;
+            if (counter.endpointAType == "leaf" && counter.endpointBType == "spine" &&
+                counter.endpointA < epsLeafToSpineSnapshots->size() &&
+                counter.endpointB < epsLeafToSpineSnapshots->at(counter.endpointA).size())
+            {
+                snapshot = &epsLeafToSpineSnapshots->at(counter.endpointA).at(counter.endpointB);
+            }
+            else if (counter.endpointAType == "spine" && counter.endpointBType == "leaf" &&
+                     counter.endpointB < epsSpineToLeafSnapshots->size() &&
+                     counter.endpointA < epsSpineToLeafSnapshots->at(counter.endpointB).size())
+            {
+                snapshot = &epsSpineToLeafSnapshots->at(counter.endpointB).at(counter.endpointA);
+            }
+
+            if (snapshot != nullptr)
+            {
+                snapshot->hasSample = true;
+                snapshot->lastSampleTime = now;
+                snapshot->utilizationApprox = utilizationApprox;
+                snapshot->sampleThroughputMbps = sampleThroughputMbps;
+                snapshot->deltaTxBytes = deltaTxBytes;
+                snapshot->cumulativeTxBytes = counter.txBytes;
+                snapshot->capacityMbps = capacityMbps;
+                snapshot->updateCount++;
+                if (measuredSnapshotUpdateCount != nullptr)
+                {
+                    *measuredSnapshotUpdateCount += 1;
+                }
+            }
+        }
+
         counter.lastSampleTxPackets = counter.txPackets;
         counter.lastSampleTxBytes = counter.txBytes;
         counter.lastSampleTime = now;
@@ -228,6 +288,9 @@ SampleLinkUtilizationTimeSeries(std::vector<LinkCounter>* counters,
                             &SampleLinkUtilizationTimeSeries,
                             counters,
                             samples,
+                            epsLeafToSpineSnapshots,
+                            epsSpineToLeafSnapshots,
+                            measuredSnapshotUpdateCount,
                             sampleIntervalSeconds,
                             stopTimeSeconds,
                             nextSampleIndex);
@@ -541,6 +604,9 @@ main(int argc, char* argv[])
     uint32_t epsWecmpEpochs = 3;
     double epsWecmpCapacity = 100.0;
     std::string epsWecmpPathMetric = "max";
+    std::string epsWecmpLoadSource = "control-plane";
+    std::string measuredWecmpNoSampleFallback = "control-plane";
+    double measuredWecmpWarmupTime = 0.0;
     std::string epsWecmpDiagnosticLoadMode = "none";
     double epsWecmpDiagnosticLoad = 0.0;
     uint32_t epsWecmpDiagnosticHotSpine = 0;
@@ -632,6 +698,9 @@ main(int argc, char* argv[])
             "epsWecmpMaxDelta",
             "epsWecmpEpochs",
             "epsWecmpCapacity",
+            "epsWecmpLoadSource",
+            "measuredWecmpNoSampleFallback",
+            "measuredWecmpWarmupTime",
             "epsWecmpDiagnosticLoadMode",
             "epsWecmpDiagnosticLoad",
             "epsWecmpDiagnosticHotSpine",
@@ -821,6 +890,15 @@ main(int argc, char* argv[])
     cmd.AddValue("epsWecmpPathMetric",
                  "EPS-WECMP path metric over leaf-spine links: max or average.",
                  epsWecmpPathMetric);
+    cmd.AddValue("epsWecmpLoadSource",
+                 "EPS-WECMP load source: control-plane or measured-snapshot.",
+                 epsWecmpLoadSource);
+    cmd.AddValue("measuredWecmpNoSampleFallback",
+                 "Fallback mode when epsWecmpLoadSource=measured-snapshot has no runtime measured sample: control-plane, zero, or error.",
+                 measuredWecmpNoSampleFallback);
+    cmd.AddValue("measuredWecmpWarmupTime",
+                 "Warmup time in seconds before measured WECMP decisions. Patch 4B records this value but does not add delayed decisions.",
+                 measuredWecmpWarmupTime);
     cmd.AddValue("epsWecmpDiagnosticLoadMode",
                  "EPS-WECMP diagnostic synthetic load mode: none or hot-spine.",
                  epsWecmpDiagnosticLoadMode);
@@ -1437,6 +1515,33 @@ main(int argc, char* argv[])
         return 1;
     }
 
+    if (epsWecmpLoadSource != "control-plane" &&
+        epsWecmpLoadSource != "measured-snapshot")
+    {
+        std::cerr
+            << "[HYBRID-DCN][ERROR] epsWecmpLoadSource must be control-plane or measured-snapshot."
+            << std::endl;
+        return 1;
+    }
+
+    if (measuredWecmpNoSampleFallback != "control-plane" &&
+        measuredWecmpNoSampleFallback != "zero" &&
+        measuredWecmpNoSampleFallback != "error")
+    {
+        std::cerr
+            << "[HYBRID-DCN][ERROR] measuredWecmpNoSampleFallback must be control-plane, zero, or error."
+            << std::endl;
+        return 1;
+    }
+
+    if (measuredWecmpWarmupTime < 0)
+    {
+        std::cerr
+            << "[HYBRID-DCN][ERROR] measuredWecmpWarmupTime must be greater than or equal to 0."
+            << std::endl;
+        return 1;
+    }
+
     if (epsWecmpDiagnosticLoadMode != "none" &&
         epsWecmpDiagnosticLoadMode != "hot-spine")
     {
@@ -2040,6 +2145,19 @@ main(int argc, char* argv[])
     std::vector<std::vector<EpsPhysicalLinkState>> epsPhysicalLinkStates(
         numLeaves,
         std::vector<EpsPhysicalLinkState>(numSpines));
+    const MeasuredEpsDirectedLinkSnapshot emptyMeasuredEpsSnapshot{
+        false, 0.0, 0.0, 0.0, 0, 0, 0.0, 0};
+    std::vector<std::vector<MeasuredEpsDirectedLinkSnapshot>>
+        epsMeasuredLeafToSpineSnapshots(
+            numLeaves,
+            std::vector<MeasuredEpsDirectedLinkSnapshot>(numSpines,
+                                                         emptyMeasuredEpsSnapshot));
+    std::vector<std::vector<MeasuredEpsDirectedLinkSnapshot>>
+        epsMeasuredSpineToLeafSnapshots(
+            numLeaves,
+            std::vector<MeasuredEpsDirectedLinkSnapshot>(numSpines,
+                                                         emptyMeasuredEpsSnapshot));
+    uint64_t measuredWecmpSnapshotUpdateCount = 0;
     std::string finalEpochMatrixMode = trafficMatrixMode;
 
     for (uint32_t leafIndex = 0; leafIndex < numLeaves; ++leafIndex)
@@ -2144,6 +2262,39 @@ main(int argc, char* argv[])
         return true;
     };
 
+    auto getMeasuredWecmpPathLoad = [&](uint32_t srcLeaf,
+                                        uint32_t dstLeaf,
+                                        uint32_t spineIndex) {
+        MeasuredWecmpPathLoad pathLoad{false, 0.0, 0.0, 0.0};
+        if (srcLeaf >= epsMeasuredLeafToSpineSnapshots.size() ||
+            dstLeaf >= epsMeasuredSpineToLeafSnapshots.size() ||
+            spineIndex >= epsMeasuredLeafToSpineSnapshots[srcLeaf].size() ||
+            spineIndex >= epsMeasuredSpineToLeafSnapshots[dstLeaf].size())
+        {
+            return pathLoad;
+        }
+
+        const auto& srcToSpine = epsMeasuredLeafToSpineSnapshots[srcLeaf][spineIndex];
+        const auto& spineToDst = epsMeasuredSpineToLeafSnapshots[dstLeaf][spineIndex];
+        pathLoad.hasSample = srcToSpine.hasSample && spineToDst.hasSample;
+        pathLoad.srcToSpineUtilization = srcToSpine.utilizationApprox;
+        pathLoad.spineToDstUtilization = spineToDst.utilizationApprox;
+        if (epsWecmpPathMetric == "max")
+        {
+            pathLoad.pathUtilization =
+                std::max(pathLoad.srcToSpineUtilization,
+                         pathLoad.spineToDstUtilization);
+        }
+        else
+        {
+            pathLoad.pathUtilization =
+                0.5 * (pathLoad.srcToSpineUtilization +
+                       pathLoad.spineToDstUtilization);
+        }
+        return pathLoad;
+    };
+
+    bool measuredWecmpNoSampleError = false;
     auto runEpsWecmpUpdateForPair = [&](uint32_t srcLeaf,
                                         uint32_t dstLeaf,
                                         double residualDemand,
@@ -2154,6 +2305,11 @@ main(int argc, char* argv[])
                                   residualDemand,
                                   0,
                                   {}};
+        decision.loadSource = epsWecmpLoadSource;
+        decision.noSampleFallbackMode = measuredWecmpNoSampleFallback;
+        decision.decisionTimeSeconds = Simulator::Now().GetSeconds();
+        decision.measuredDecisionRequested = epsWecmpLoadSource == "measured-snapshot";
+        decision.appliesToLaterFlow = false;
         if (!enableEpsWecmp || numSpines == 0 || residualDemand <= 0)
         {
             return decision;
@@ -2207,6 +2363,44 @@ main(int argc, char* argv[])
                 state.utilization = state.smoothedUtilization;
                 state.pathLoadMetric = state.smoothedUtilization;
                 state.candidatePathLoad = state.observedTraffic;
+                state.controlPlanePathLoadMetric = state.pathLoadMetric;
+                state.effectivePathLoadMetric = state.pathLoadMetric;
+                if (decision.measuredDecisionRequested)
+                {
+                    const MeasuredWecmpPathLoad measuredPathLoad =
+                        getMeasuredWecmpPathLoad(srcLeaf, dstLeaf, state.spineIndex);
+                    state.hasMeasuredSample = measuredPathLoad.hasSample;
+                    state.measuredSrcToSpineUtilization =
+                        measuredPathLoad.srcToSpineUtilization;
+                    state.measuredSpineToDstUtilization =
+                        measuredPathLoad.spineToDstUtilization;
+                    state.measuredPathUtilization =
+                        measuredPathLoad.pathUtilization;
+                    if (measuredPathLoad.hasSample)
+                    {
+                        decision.measuredDecisionUsed = true;
+                        state.pathLoadMetric = measuredPathLoad.pathUtilization;
+                        state.smoothedUtilization = measuredPathLoad.pathUtilization;
+                        state.utilization = measuredPathLoad.pathUtilization;
+                        state.effectivePathLoadMetric = measuredPathLoad.pathUtilization;
+                    }
+                    else
+                    {
+                        decision.measuredNoSample = true;
+                        decision.measuredDecisionFallback = true;
+                        if (measuredWecmpNoSampleFallback == "zero")
+                        {
+                            state.pathLoadMetric = 0.0;
+                            state.smoothedUtilization = 0.0;
+                            state.utilization = 0.0;
+                            state.effectivePathLoadMetric = 0.0;
+                        }
+                        else if (measuredWecmpNoSampleFallback == "error")
+                        {
+                            measuredWecmpNoSampleError = true;
+                        }
+                    }
+                }
                 state.attractiveness =
                     1.0 /
                     (std::pow(state.smoothedUtilization, epsWecmpGamma) + epsWecmpEpsilon);
@@ -2278,6 +2472,7 @@ main(int argc, char* argv[])
                 decision.selectedSpine = state.spineIndex;
             }
         }
+        decision.controlPlaneSelectedSpine = decision.selectedSpine;
 
         if (!recordDecision)
         {
@@ -3790,6 +3985,14 @@ main(int argc, char* argv[])
         }
     }
 
+    if (measuredWecmpNoSampleError)
+    {
+        std::cerr
+            << "[HYBRID-DCN][ERROR] measured WECMP requested but no measured sample was available and measuredWecmpNoSampleFallback=error."
+            << std::endl;
+        return 1;
+    }
+
     if (routeMode == "ocs-forced")
     {
         Ipv4StaticRoutingHelper staticRoutingHelper;
@@ -4436,10 +4639,20 @@ main(int argc, char* argv[])
 
     std::cout << "[HYBRID-DCN][WECMP] enabled = "
               << (enableEpsWecmp ? "true" : "false") << std::endl;
-    std::cout << "[HYBRID-DCN][WECMP] source = control-plane-estimated-residual-load"
+    std::cout << "[HYBRID-DCN][WECMP] source = "
+              << (epsWecmpLoadSource == "control-plane"
+                      ? "control-plane-estimated-residual-load"
+                      : "measured-snapshot")
               << std::endl;
     std::cout << "[HYBRID-DCN][WECMP] ns3MeasuredUtilization = false"
               << std::endl;
+    std::cout << "[HYBRID-DCN][WECMP] measuredSnapshotRequested = "
+              << (epsWecmpLoadSource == "measured-snapshot" ? "true" : "false")
+              << std::endl;
+    std::cout << "[HYBRID-DCN][WECMP] measuredNoSampleFallback = "
+              << measuredWecmpNoSampleFallback << std::endl;
+    std::cout << "[HYBRID-DCN][WECMP] measuredWarmupTime = "
+              << measuredWecmpWarmupTime << std::endl;
     std::cout << "[HYBRID-DCN][WECMP] observedTrafficSemantic = "
                  "residual-demand-weighted-by-current-wecmp-probability"
               << std::endl;
@@ -5847,6 +6060,9 @@ main(int argc, char* argv[])
                             &SampleLinkUtilizationTimeSeries,
                             &linkCounters,
                             &linkUtilizationSamples,
+                            &epsMeasuredLeafToSpineSnapshots,
+                            &epsMeasuredSpineToLeafSnapshots,
+                            &measuredWecmpSnapshotUpdateCount,
                             linkUtilizationSampleInterval,
                             simTime,
                             &linkUtilizationNextSampleIndex);
@@ -6414,6 +6630,62 @@ main(int argc, char* argv[])
             ? linkTimeseriesSumUtilizationApprox /
                   static_cast<double>(linkUtilizationSamples.size())
             : 0.0;
+    uint64_t measuredWecmpSnapshotCount = 0;
+    auto countMeasuredSnapshotEntries = [](const auto& snapshots) {
+        uint64_t count = 0;
+        for (const auto& leafSnapshots : snapshots)
+        {
+            for (const auto& snapshot : leafSnapshots)
+            {
+                if (snapshot.hasSample)
+                {
+                    count++;
+                }
+            }
+        }
+        return count;
+    };
+    measuredWecmpSnapshotCount +=
+        countMeasuredSnapshotEntries(epsMeasuredLeafToSpineSnapshots);
+    measuredWecmpSnapshotCount +=
+        countMeasuredSnapshotEntries(epsMeasuredSpineToLeafSnapshots);
+    uint64_t measuredWecmpDecisionCount = 0;
+    uint64_t measuredWecmpFallbackDecisionCount = 0;
+    uint64_t measuredWecmpNoSampleDecisionCount = 0;
+    uint64_t measuredWecmpCandidateRowsWithSample = 0;
+    uint64_t measuredWecmpCandidateRowsWithoutSample = 0;
+    uint64_t measuredWecmpChangedSelectedSpineCount = 0;
+    for (const auto& decision : epsWecmpDecisions)
+    {
+        if (!decision.measuredDecisionRequested)
+        {
+            continue;
+        }
+        measuredWecmpDecisionCount++;
+        if (decision.measuredDecisionFallback)
+        {
+            measuredWecmpFallbackDecisionCount++;
+        }
+        if (decision.measuredNoSample)
+        {
+            measuredWecmpNoSampleDecisionCount++;
+        }
+        if (decision.selectedSpine != decision.controlPlaneSelectedSpine)
+        {
+            measuredWecmpChangedSelectedSpineCount++;
+        }
+        for (const auto& state : decision.linkStates)
+        {
+            if (state.hasMeasuredSample)
+            {
+                measuredWecmpCandidateRowsWithSample++;
+            }
+            else
+            {
+                measuredWecmpCandidateRowsWithoutSample++;
+            }
+        }
+    }
     std::string ocsToEpsByteRatio = "0";
     if (g_epsTxBytes > 0)
     {
@@ -6597,6 +6869,31 @@ main(int argc, char* argv[])
               << linkTimeseriesMaxEpsUtilizationApprox << std::endl;
     std::cout << "[HYBRID-DCN][RESULT] linkTimeseriesMaxOcsUtilizationApprox = "
               << linkTimeseriesMaxOcsUtilizationApprox << std::endl;
+    std::cout << "[HYBRID-DCN][RESULT] epsWecmpLoadSource = "
+              << epsWecmpLoadSource << std::endl;
+    std::cout << "[HYBRID-DCN][RESULT] measuredWecmpEnabled = "
+              << (epsWecmpLoadSource == "measured-snapshot" ? "true" : "false")
+              << std::endl;
+    std::cout << "[HYBRID-DCN][RESULT] measuredWecmpNoSampleFallback = "
+              << measuredWecmpNoSampleFallback << std::endl;
+    std::cout << "[HYBRID-DCN][RESULT] measuredWecmpWarmupTime = "
+              << measuredWecmpWarmupTime << std::endl;
+    std::cout << "[HYBRID-DCN][RESULT] measuredWecmpSnapshotCount = "
+              << measuredWecmpSnapshotCount << std::endl;
+    std::cout << "[HYBRID-DCN][RESULT] measuredWecmpSnapshotUpdateCount = "
+              << measuredWecmpSnapshotUpdateCount << std::endl;
+    std::cout << "[HYBRID-DCN][RESULT] measuredWecmpDecisionCount = "
+              << measuredWecmpDecisionCount << std::endl;
+    std::cout << "[HYBRID-DCN][RESULT] measuredWecmpFallbackDecisionCount = "
+              << measuredWecmpFallbackDecisionCount << std::endl;
+    std::cout << "[HYBRID-DCN][RESULT] measuredWecmpNoSampleDecisionCount = "
+              << measuredWecmpNoSampleDecisionCount << std::endl;
+    std::cout << "[HYBRID-DCN][RESULT] measuredWecmpCandidateRowsWithSample = "
+              << measuredWecmpCandidateRowsWithSample << std::endl;
+    std::cout << "[HYBRID-DCN][RESULT] measuredWecmpCandidateRowsWithoutSample = "
+              << measuredWecmpCandidateRowsWithoutSample << std::endl;
+    std::cout << "[HYBRID-DCN][RESULT] measuredWecmpChangedSelectedSpineCount = "
+              << measuredWecmpChangedSelectedSpineCount << std::endl;
     std::cout << "[HYBRID-DCN][RESULT] matrixFlowRxBytesTolerance = "
               << matrixFlowRxBytesTolerance << std::endl;
 
@@ -6926,6 +7223,8 @@ main(int argc, char* argv[])
         joinCsvPath(structuredResultDir, experimentName + "-links.csv");
     const std::string linkTimeseriesCsvPath =
         joinCsvPath(structuredResultDir, experimentName + "-link-timeseries.csv");
+    const std::string measuredWecmpCsvPath =
+        joinCsvPath(structuredResultDir, experimentName + "-measured-wecmp.csv");
     bool structuredExportCheck = !enableStructuredResultExport;
     bool structuredExportEvaluated = false;
 
@@ -6947,6 +7246,8 @@ main(int argc, char* argv[])
         std::cout << "[HYBRID-DCN][EXPORT] linksCsv = " << linksCsvPath << std::endl;
         std::cout << "[HYBRID-DCN][EXPORT] linkTimeseriesCsv = "
                   << linkTimeseriesCsvPath << std::endl;
+        std::cout << "[HYBRID-DCN][EXPORT] measuredWecmpCsv = "
+                  << measuredWecmpCsvPath << std::endl;
 
         if (!enableStructuredResultExport)
         {
@@ -7024,7 +7325,19 @@ main(int argc, char* argv[])
                              "linkTimeseriesMaxUtilizationApprox",
                              "linkTimeseriesAvgUtilizationApprox",
                              "linkTimeseriesMaxEpsUtilizationApprox",
-                             "linkTimeseriesMaxOcsUtilizationApprox"});
+                             "linkTimeseriesMaxOcsUtilizationApprox",
+                             "epsWecmpLoadSource",
+                             "measuredWecmpEnabled",
+                             "measuredWecmpNoSampleFallback",
+                             "measuredWecmpWarmupTime",
+                             "measuredWecmpSnapshotCount",
+                             "measuredWecmpSnapshotUpdateCount",
+                             "measuredWecmpDecisionCount",
+                             "measuredWecmpFallbackDecisionCount",
+                             "measuredWecmpNoSampleDecisionCount",
+                             "measuredWecmpCandidateRowsWithSample",
+                             "measuredWecmpCandidateRowsWithoutSample",
+                             "measuredWecmpChangedSelectedSpineCount"});
                 writeCsvRow(file,
                             {experimentName,
                              presetScenario,
@@ -7081,7 +7394,19 @@ main(int argc, char* argv[])
                              csvValue(linkTimeseriesMaxUtilizationApprox),
                              csvValue(linkTimeseriesAvgUtilizationApprox),
                              csvValue(linkTimeseriesMaxEpsUtilizationApprox),
-                             csvValue(linkTimeseriesMaxOcsUtilizationApprox)});
+                             csvValue(linkTimeseriesMaxOcsUtilizationApprox),
+                             epsWecmpLoadSource,
+                             csvBool(epsWecmpLoadSource == "measured-snapshot"),
+                             measuredWecmpNoSampleFallback,
+                             csvValue(measuredWecmpWarmupTime),
+                             csvValue(measuredWecmpSnapshotCount),
+                             csvValue(measuredWecmpSnapshotUpdateCount),
+                             csvValue(measuredWecmpDecisionCount),
+                             csvValue(measuredWecmpFallbackDecisionCount),
+                             csvValue(measuredWecmpNoSampleDecisionCount),
+                             csvValue(measuredWecmpCandidateRowsWithSample),
+                             csvValue(measuredWecmpCandidateRowsWithoutSample),
+                             csvValue(measuredWecmpChangedSelectedSpineCount)});
                 if (!file.good())
                 {
                     exportSuccess = false;
@@ -7205,7 +7530,21 @@ main(int argc, char* argv[])
                              "previousProbability",
                              "updatedProbability",
                              "probabilityDelta",
-                             "boundedProbabilityDelta"});
+                             "boundedProbabilityDelta",
+                             "loadSource",
+                             "hasMeasuredSample",
+                             "measuredSrcToSpineUtilization",
+                             "measuredSpineToDstUtilization",
+                             "measuredPathUtilization",
+                             "controlPlanePathLoadMetric",
+                             "effectivePathLoadMetric",
+                             "noSampleFallbackMode",
+                             "measuredDecisionRequested",
+                             "measuredDecisionUsed",
+                             "measuredDecisionFallback",
+                             "measuredNoSample",
+                             "decisionTimeSeconds",
+                             "appliesToLaterFlow"});
                 for (uint32_t decisionIndex = 0; decisionIndex < epsWecmpDecisions.size();
                      ++decisionIndex)
                 {
@@ -7227,7 +7566,21 @@ main(int argc, char* argv[])
                                      csvValue(state.previousProbability),
                                      csvValue(state.updatedProbability),
                                      csvValue(state.probabilityDelta),
-                                     csvValue(state.boundedProbabilityDelta)});
+                                     csvValue(state.boundedProbabilityDelta),
+                                     decision.loadSource,
+                                     csvBool(state.hasMeasuredSample),
+                                     csvValue(state.measuredSrcToSpineUtilization),
+                                     csvValue(state.measuredSpineToDstUtilization),
+                                     csvValue(state.measuredPathUtilization),
+                                     csvValue(state.controlPlanePathLoadMetric),
+                                     csvValue(state.effectivePathLoadMetric),
+                                     decision.noSampleFallbackMode,
+                                     csvBool(decision.measuredDecisionRequested),
+                                     csvBool(decision.measuredDecisionUsed),
+                                     csvBool(decision.measuredDecisionFallback),
+                                     csvBool(decision.measuredNoSample),
+                                     csvValue(decision.decisionTimeSeconds),
+                                     csvBool(decision.appliesToLaterFlow)});
                     }
                 }
                 if (!file.good())
@@ -7390,6 +7743,69 @@ main(int argc, char* argv[])
                     exportSuccess = false;
                     std::cout << "[HYBRID-DCN][EXPORT] error = failed-to-write:"
                               << linkTimeseriesCsvPath << std::endl;
+                }
+            }
+        }
+
+        {
+            std::ofstream file = openCsv(measuredWecmpCsvPath);
+            if (file.is_open())
+            {
+                writeCsvRow(file,
+                            {"experimentName",
+                             "sampleTimeSeconds",
+                             "leaf",
+                             "spine",
+                             "direction",
+                             "capacityMbps",
+                             "deltaTxBytes",
+                             "cumulativeTxBytes",
+                             "sampleThroughputMbps",
+                             "measuredUtilization",
+                             "hasSample"});
+                for (uint32_t leafIndex = 0; leafIndex < numLeaves; ++leafIndex)
+                {
+                    for (uint32_t spineIndex = 0; spineIndex < numSpines; ++spineIndex)
+                    {
+                        const auto& leafToSpine =
+                            epsMeasuredLeafToSpineSnapshots[leafIndex][spineIndex];
+                        const auto& spineToLeaf =
+                            epsMeasuredSpineToLeafSnapshots[leafIndex][spineIndex];
+                        writeCsvRow(file,
+                                    {experimentName,
+                                     csvValue(leafToSpine.lastSampleTime),
+                                     csvValue(leafIndex),
+                                     csvValue(spineIndex),
+                                     "leaf-to-spine",
+                                     csvValue(leafToSpine.capacityMbps > 0.0
+                                                  ? leafToSpine.capacityMbps
+                                                  : leafSpineCapacityGbps * 1000.0),
+                                     csvValue(leafToSpine.deltaTxBytes),
+                                     csvValue(leafToSpine.cumulativeTxBytes),
+                                     csvValue(leafToSpine.sampleThroughputMbps),
+                                     csvValue(leafToSpine.utilizationApprox),
+                                     csvBool(leafToSpine.hasSample)});
+                        writeCsvRow(file,
+                                    {experimentName,
+                                     csvValue(spineToLeaf.lastSampleTime),
+                                     csvValue(leafIndex),
+                                     csvValue(spineIndex),
+                                     "spine-to-leaf",
+                                     csvValue(spineToLeaf.capacityMbps > 0.0
+                                                  ? spineToLeaf.capacityMbps
+                                                  : leafSpineCapacityGbps * 1000.0),
+                                     csvValue(spineToLeaf.deltaTxBytes),
+                                     csvValue(spineToLeaf.cumulativeTxBytes),
+                                     csvValue(spineToLeaf.sampleThroughputMbps),
+                                     csvValue(spineToLeaf.utilizationApprox),
+                                     csvBool(spineToLeaf.hasSample)});
+                    }
+                }
+                if (!file.good())
+                {
+                    exportSuccess = false;
+                    std::cout << "[HYBRID-DCN][EXPORT] error = failed-to-write:"
+                              << measuredWecmpCsvPath << std::endl;
                 }
             }
         }
