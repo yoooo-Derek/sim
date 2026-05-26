@@ -112,7 +112,24 @@ struct LinkCounter
     std::string delay;
     uint64_t txPackets;
     uint64_t txBytes;
+    uint64_t lastSampleTxPackets;
+    uint64_t lastSampleTxBytes;
+    double lastSampleTime;
     std::string note;
+};
+
+struct LinkUtilizationSample
+{
+    uint32_t sampleIndex;
+    uint32_t linkIndex;
+    double sampleTimeSeconds;
+    double intervalSeconds;
+    uint64_t deltaTxPackets;
+    uint64_t deltaTxBytes;
+    uint64_t cumulativeTxPackets;
+    uint64_t cumulativeTxBytes;
+    double sampleThroughputMbps;
+    double utilizationApprox;
 };
 
 void
@@ -150,6 +167,71 @@ LinkTxTrace(std::vector<LinkCounter>* counters, uint32_t counterIndex, Ptr<const
     LinkCounter& counter = counters->at(counterIndex);
     counter.txPackets += 1;
     counter.txBytes += packet->GetSize();
+}
+
+void
+SampleLinkUtilizationTimeSeries(std::vector<LinkCounter>* counters,
+                                std::vector<LinkUtilizationSample>* samples,
+                                double sampleIntervalSeconds,
+                                double stopTimeSeconds,
+                                uint32_t* nextSampleIndex)
+{
+    if (counters == nullptr || samples == nullptr || nextSampleIndex == nullptr ||
+        sampleIntervalSeconds <= 0.0)
+    {
+        return;
+    }
+
+    const double now = Simulator::Now().GetSeconds();
+    const uint32_t sampleIndex = *nextSampleIndex;
+    *nextSampleIndex += 1;
+
+    for (uint32_t linkIndex = 0; linkIndex < counters->size(); ++linkIndex)
+    {
+        LinkCounter& counter = counters->at(linkIndex);
+        const double intervalSeconds = now - counter.lastSampleTime;
+        const uint64_t deltaTxPackets =
+            counter.txPackets >= counter.lastSampleTxPackets
+                ? counter.txPackets - counter.lastSampleTxPackets
+                : 0;
+        const uint64_t deltaTxBytes =
+            counter.txBytes >= counter.lastSampleTxBytes
+                ? counter.txBytes - counter.lastSampleTxBytes
+                : 0;
+        const double sampleThroughputMbps =
+            intervalSeconds > 0.0
+                ? static_cast<double>(deltaTxBytes) * 8.0 / intervalSeconds / 1e6
+                : 0.0;
+        const double capacityMbps = counter.capacityGbps * 1000.0;
+        const double utilizationApprox =
+            capacityMbps > 0.0 ? sampleThroughputMbps / capacityMbps : 0.0;
+
+        samples->push_back({sampleIndex,
+                            linkIndex,
+                            now,
+                            intervalSeconds,
+                            deltaTxPackets,
+                            deltaTxBytes,
+                            counter.txPackets,
+                            counter.txBytes,
+                            sampleThroughputMbps,
+                            utilizationApprox});
+
+        counter.lastSampleTxPackets = counter.txPackets;
+        counter.lastSampleTxBytes = counter.txBytes;
+        counter.lastSampleTime = now;
+    }
+
+    if (now + sampleIntervalSeconds <= stopTimeSeconds + 1e-9)
+    {
+        Simulator::Schedule(Seconds(sampleIntervalSeconds),
+                            &SampleLinkUtilizationTimeSeries,
+                            counters,
+                            samples,
+                            sampleIntervalSeconds,
+                            stopTimeSeconds,
+                            nextSampleIndex);
+    }
 }
 
 struct ControlEpochSummary
@@ -472,6 +554,7 @@ main(int argc, char* argv[])
     uint32_t detailedFlowLogLimit = 50;
     bool enableStructuredResultExport = false;
     std::string structuredResultDir = "../sim/results/raw";
+    double linkUtilizationSampleInterval = 0.1;
     bool enableResultValidation = true;
     std::string validationMode = "warn";
 
@@ -777,6 +860,9 @@ main(int argc, char* argv[])
     cmd.AddValue("structuredResultDir",
                  "Directory for structured result CSV outputs.",
                  structuredResultDir);
+    cmd.AddValue("linkUtilizationSampleInterval",
+                 "Per-link measured Tx utilization sample interval in seconds. Values <= 0 disable link time-series sampling.",
+                 linkUtilizationSampleInterval);
     cmd.AddValue("enableResultValidation",
                  "Enable Stage-24 result consistency validation logs.",
                  enableResultValidation);
@@ -3242,6 +3328,9 @@ main(int argc, char* argv[])
                                 delay,
                                 0,
                                 0,
+                                0,
+                                0,
+                                0.0,
                                 note});
         return static_cast<uint32_t>(linkCounters.size() - 1);
     };
@@ -5749,6 +5838,20 @@ main(int argc, char* argv[])
     g_epsTxPackets = 0;
     g_epsTxBytes = 0;
 
+    std::vector<LinkUtilizationSample> linkUtilizationSamples;
+    uint32_t linkUtilizationNextSampleIndex = 0;
+    const bool linkTimeseriesEnabled = linkUtilizationSampleInterval > 0.0;
+    if (linkTimeseriesEnabled && !linkCounters.empty())
+    {
+        Simulator::Schedule(Seconds(linkUtilizationSampleInterval),
+                            &SampleLinkUtilizationTimeSeries,
+                            &linkCounters,
+                            &linkUtilizationSamples,
+                            linkUtilizationSampleInterval,
+                            simTime,
+                            &linkUtilizationNextSampleIndex);
+    }
+
     Simulator::Stop(Seconds(simTime));
     Simulator::Run();
     Simulator::Destroy();
@@ -6275,6 +6378,42 @@ main(int argc, char* argv[])
     }
     const double resultEpsLinkUtilizationStddevApprox =
         std::sqrt(resultEpsLinkUtilizationVarianceApprox);
+    uint64_t linkTimeseriesNonzeroSampleRows = 0;
+    double linkTimeseriesMaxUtilizationApprox = 0.0;
+    double linkTimeseriesSumUtilizationApprox = 0.0;
+    double linkTimeseriesMaxEpsUtilizationApprox = 0.0;
+    double linkTimeseriesMaxOcsUtilizationApprox = 0.0;
+    for (const auto& sample : linkUtilizationSamples)
+    {
+        linkTimeseriesSumUtilizationApprox += sample.utilizationApprox;
+        linkTimeseriesMaxUtilizationApprox =
+            std::max(linkTimeseriesMaxUtilizationApprox, sample.utilizationApprox);
+        if (sample.deltaTxBytes > 0)
+        {
+            linkTimeseriesNonzeroSampleRows++;
+        }
+        if (sample.linkIndex < linkCounters.size())
+        {
+            const auto& counter = linkCounters[sample.linkIndex];
+            if (counter.linkType == "eps-leaf-spine")
+            {
+                linkTimeseriesMaxEpsUtilizationApprox =
+                    std::max(linkTimeseriesMaxEpsUtilizationApprox,
+                             sample.utilizationApprox);
+            }
+            else if (counter.linkType == "ocs")
+            {
+                linkTimeseriesMaxOcsUtilizationApprox =
+                    std::max(linkTimeseriesMaxOcsUtilizationApprox,
+                             sample.utilizationApprox);
+            }
+        }
+    }
+    const double linkTimeseriesAvgUtilizationApprox =
+        !linkUtilizationSamples.empty()
+            ? linkTimeseriesSumUtilizationApprox /
+                  static_cast<double>(linkUtilizationSamples.size())
+            : 0.0;
     std::string ocsToEpsByteRatio = "0";
     if (g_epsTxBytes > 0)
     {
@@ -6442,6 +6581,22 @@ main(int argc, char* argv[])
               << resultAvgEpsLinkUtilizationApprox << std::endl;
     std::cout << "[HYBRID-DCN][RESULT] epsLinkUtilizationStddevApprox = "
               << resultEpsLinkUtilizationStddevApprox << std::endl;
+    std::cout << "[HYBRID-DCN][RESULT] linkUtilizationSampleIntervalSeconds = "
+              << linkUtilizationSampleInterval << std::endl;
+    std::cout << "[HYBRID-DCN][RESULT] linkTimeseriesEnabled = "
+              << (linkTimeseriesEnabled ? "true" : "false") << std::endl;
+    std::cout << "[HYBRID-DCN][RESULT] linkTimeseriesSampleRows = "
+              << linkUtilizationSamples.size() << std::endl;
+    std::cout << "[HYBRID-DCN][RESULT] linkTimeseriesNonzeroSampleRows = "
+              << linkTimeseriesNonzeroSampleRows << std::endl;
+    std::cout << "[HYBRID-DCN][RESULT] linkTimeseriesMaxUtilizationApprox = "
+              << linkTimeseriesMaxUtilizationApprox << std::endl;
+    std::cout << "[HYBRID-DCN][RESULT] linkTimeseriesAvgUtilizationApprox = "
+              << linkTimeseriesAvgUtilizationApprox << std::endl;
+    std::cout << "[HYBRID-DCN][RESULT] linkTimeseriesMaxEpsUtilizationApprox = "
+              << linkTimeseriesMaxEpsUtilizationApprox << std::endl;
+    std::cout << "[HYBRID-DCN][RESULT] linkTimeseriesMaxOcsUtilizationApprox = "
+              << linkTimeseriesMaxOcsUtilizationApprox << std::endl;
     std::cout << "[HYBRID-DCN][RESULT] matrixFlowRxBytesTolerance = "
               << matrixFlowRxBytesTolerance << std::endl;
 
@@ -6769,6 +6924,8 @@ main(int argc, char* argv[])
         joinCsvPath(structuredResultDir, experimentName + "-ocs-candidates.csv");
     const std::string linksCsvPath =
         joinCsvPath(structuredResultDir, experimentName + "-links.csv");
+    const std::string linkTimeseriesCsvPath =
+        joinCsvPath(structuredResultDir, experimentName + "-link-timeseries.csv");
     bool structuredExportCheck = !enableStructuredResultExport;
     bool structuredExportEvaluated = false;
 
@@ -6788,6 +6945,8 @@ main(int argc, char* argv[])
         std::cout << "[HYBRID-DCN][EXPORT] ocsCandidatesCsv = "
                   << ocsCandidatesCsvPath << std::endl;
         std::cout << "[HYBRID-DCN][EXPORT] linksCsv = " << linksCsvPath << std::endl;
+        std::cout << "[HYBRID-DCN][EXPORT] linkTimeseriesCsv = "
+                  << linkTimeseriesCsvPath << std::endl;
 
         if (!enableStructuredResultExport)
         {
@@ -6857,7 +7016,15 @@ main(int argc, char* argv[])
                              "maxOcsLinkUtilizationApprox",
                              "maxEpsLinkUtilizationApprox",
                              "avgEpsLinkUtilizationApprox",
-                             "epsLinkUtilizationStddevApprox"});
+                             "epsLinkUtilizationStddevApprox",
+                             "linkUtilizationSampleIntervalSeconds",
+                             "linkTimeseriesEnabled",
+                             "linkTimeseriesSampleRows",
+                             "linkTimeseriesNonzeroSampleRows",
+                             "linkTimeseriesMaxUtilizationApprox",
+                             "linkTimeseriesAvgUtilizationApprox",
+                             "linkTimeseriesMaxEpsUtilizationApprox",
+                             "linkTimeseriesMaxOcsUtilizationApprox"});
                 writeCsvRow(file,
                             {experimentName,
                              presetScenario,
@@ -6906,7 +7073,15 @@ main(int argc, char* argv[])
                              csvValue(resultMaxOcsLinkUtilizationApprox),
                              csvValue(resultMaxEpsLinkUtilizationApprox),
                              csvValue(resultAvgEpsLinkUtilizationApprox),
-                             csvValue(resultEpsLinkUtilizationStddevApprox)});
+                             csvValue(resultEpsLinkUtilizationStddevApprox),
+                             csvValue(linkUtilizationSampleInterval),
+                             csvBool(linkTimeseriesEnabled),
+                             csvValue(linkUtilizationSamples.size()),
+                             csvValue(linkTimeseriesNonzeroSampleRows),
+                             csvValue(linkTimeseriesMaxUtilizationApprox),
+                             csvValue(linkTimeseriesAvgUtilizationApprox),
+                             csvValue(linkTimeseriesMaxEpsUtilizationApprox),
+                             csvValue(linkTimeseriesMaxOcsUtilizationApprox)});
                 if (!file.good())
                 {
                     exportSuccess = false;
@@ -7153,6 +7328,68 @@ main(int argc, char* argv[])
                     exportSuccess = false;
                     std::cout << "[HYBRID-DCN][EXPORT] error = failed-to-write:"
                               << linksCsvPath << std::endl;
+                }
+            }
+        }
+
+        {
+            std::ofstream file = openCsv(linkTimeseriesCsvPath);
+            if (file.is_open())
+            {
+                writeCsvRow(file,
+                            {"experimentName",
+                             "sampleIndex",
+                             "sampleTimeSeconds",
+                             "intervalSeconds",
+                             "linkType",
+                             "linkId",
+                             "direction",
+                             "srcNode",
+                             "dstNode",
+                             "capacityMbps",
+                             "deltaTxPackets",
+                             "deltaTxBytes",
+                             "cumulativeTxPackets",
+                             "cumulativeTxBytes",
+                             "sampleThroughputMbps",
+                             "utilizationApprox"});
+                for (const auto& sample : linkUtilizationSamples)
+                {
+                    if (sample.linkIndex >= linkCounters.size())
+                    {
+                        exportSuccess = false;
+                        std::cout << "[HYBRID-DCN][EXPORT] error = invalid-link-sample-index:"
+                                  << sample.linkIndex << std::endl;
+                        continue;
+                    }
+                    const auto& counter = linkCounters[sample.linkIndex];
+                    std::ostringstream srcNode;
+                    srcNode << counter.endpointAType << counter.endpointA;
+                    std::ostringstream dstNode;
+                    dstNode << counter.endpointBType << counter.endpointB;
+                    writeCsvRow(file,
+                                {experimentName,
+                                 csvValue(sample.sampleIndex),
+                                 csvValue(sample.sampleTimeSeconds),
+                                 csvValue(sample.intervalSeconds),
+                                 counter.linkType,
+                                 counter.linkId,
+                                 counter.direction,
+                                 srcNode.str(),
+                                 dstNode.str(),
+                                 csvValue(counter.capacityGbps * 1000.0),
+                                 csvValue(sample.deltaTxPackets),
+                                 csvValue(sample.deltaTxBytes),
+                                 csvValue(sample.cumulativeTxPackets),
+                                 csvValue(sample.cumulativeTxBytes),
+                                 csvValue(sample.sampleThroughputMbps),
+                                 csvValue(sample.utilizationApprox)});
+                }
+                if (!file.good())
+                {
+                    exportSuccess = false;
+                    std::cout << "[HYBRID-DCN][EXPORT] error = failed-to-write:"
+                              << linkTimeseriesCsvPath << std::endl;
                 }
             }
         }
