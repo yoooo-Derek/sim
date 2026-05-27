@@ -7733,19 +7733,7 @@ main(int argc, char* argv[])
             std::ofstream file = openCsv(ocsCandidatesCsvPath);
             if (file.is_open())
             {
-                writeCsvRow(file,
-                            {"candidateIndex",
-                             "leafA",
-                             "leafB",
-                             "traffic",
-                             "expected",
-                             "modularityGain",
-                             "utility",
-                             "communityFactor",
-                             "stateHoldingGain",
-                             "selectionScore",
-                             "selected",
-                             "rejectReason"});
+                writeCsvRow(file, OcsCandidatesCsvHeader());
                 for (uint32_t candidateIndex = 0; candidateIndex < candidateEdges.size();
                      ++candidateIndex)
                 {

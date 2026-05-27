@@ -5,6 +5,24 @@
 #include <vector>
 
 inline const std::vector<std::string>&
+OcsCandidatesCsvHeader()
+{
+    static const std::vector<std::string> header = {"candidateIndex",
+                                                    "leafA",
+                                                    "leafB",
+                                                    "traffic",
+                                                    "expected",
+                                                    "modularityGain",
+                                                    "utility",
+                                                    "communityFactor",
+                                                    "stateHoldingGain",
+                                                    "selectionScore",
+                                                    "selected",
+                                                    "rejectReason"};
+    return header;
+}
+
+inline const std::vector<std::string>&
 LinksCsvHeader()
 {
     static const std::vector<std::string> header = {"linkIndex",
