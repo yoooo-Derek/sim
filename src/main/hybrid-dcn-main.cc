@@ -16,6 +16,7 @@
 #include "../ocs/ocs-state.h"
 #include "../result/csv-utils.h"
 #include "../result/structured-result-paths.h"
+#include "../result/structured-result-schema.h"
 #include "../traffic/traffic-matrix.h"
 #else
 #include "../../sim/src/eps/eps-wecmp-state.h"
@@ -24,6 +25,7 @@
 #include "../../sim/src/ocs/ocs-state.h"
 #include "../../sim/src/result/csv-utils.h"
 #include "../../sim/src/result/structured-result-paths.h"
+#include "../../sim/src/result/structured-result-schema.h"
 #include "../../sim/src/traffic/traffic-matrix.h"
 #endif
 
@@ -7777,21 +7779,7 @@ main(int argc, char* argv[])
             std::ofstream file = openCsv(linksCsvPath);
             if (file.is_open())
             {
-                writeCsvRow(file,
-                            {"linkIndex",
-                             "linkId",
-                             "linkType",
-                             "direction",
-                             "endpointAType",
-                             "endpointA",
-                             "endpointBType",
-                             "endpointB",
-                             "capacityGbps",
-                             "delay",
-                             "txPackets",
-                             "txBytes",
-                             "utilizationApprox",
-                             "note"});
+                writeCsvRow(file, LinksCsvHeader());
                 for (uint32_t linkIndex = 0; linkIndex < linkCounters.size(); ++linkIndex)
                 {
                     const auto& counter = linkCounters[linkIndex];
@@ -7824,23 +7812,7 @@ main(int argc, char* argv[])
             std::ofstream file = openCsv(linkTimeseriesCsvPath);
             if (file.is_open())
             {
-                writeCsvRow(file,
-                            {"experimentName",
-                             "sampleIndex",
-                             "sampleTimeSeconds",
-                             "intervalSeconds",
-                             "linkType",
-                             "linkId",
-                             "direction",
-                             "srcNode",
-                             "dstNode",
-                             "capacityMbps",
-                             "deltaTxPackets",
-                             "deltaTxBytes",
-                             "cumulativeTxPackets",
-                             "cumulativeTxBytes",
-                             "sampleThroughputMbps",
-                             "utilizationApprox"});
+                writeCsvRow(file, LinkTimeseriesCsvHeader());
                 for (const auto& sample : linkUtilizationSamples)
                 {
                     if (sample.linkIndex >= linkCounters.size())
@@ -7886,18 +7858,7 @@ main(int argc, char* argv[])
             std::ofstream file = openCsv(measuredWecmpCsvPath);
             if (file.is_open())
             {
-                writeCsvRow(file,
-                            {"experimentName",
-                             "sampleTimeSeconds",
-                             "leaf",
-                             "spine",
-                             "direction",
-                             "capacityMbps",
-                             "deltaTxBytes",
-                             "cumulativeTxBytes",
-                             "sampleThroughputMbps",
-                             "measuredUtilization",
-                             "hasSample"});
+                writeCsvRow(file, MeasuredWecmpCsvHeader());
                 for (uint32_t leafIndex = 0; leafIndex < numLeaves; ++leafIndex)
                 {
                     for (uint32_t spineIndex = 0; spineIndex < numSpines; ++spineIndex)
