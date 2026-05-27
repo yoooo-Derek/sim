@@ -83,6 +83,28 @@ FormatCommunityLabelVector(const std::vector<uint32_t>& labels)
     return stream.str();
 }
 
+static double
+ComputeNearestRankP99(std::vector<double> samples)
+{
+    if (samples.empty())
+    {
+        return 0.0;
+    }
+    std::sort(samples.begin(), samples.end());
+    std::size_t index =
+        static_cast<std::size_t>(std::ceil(0.99 * static_cast<double>(samples.size())));
+    if (index == 0)
+    {
+        index = 1;
+    }
+    index -= 1;
+    if (index >= samples.size())
+    {
+        index = samples.size() - 1;
+    }
+    return samples[index];
+}
+
 struct OcsInstalledLink
 {
     uint32_t leafA;
@@ -6612,26 +6634,7 @@ main(int argc, char* argv[])
         resultAvgFctSeconds /= static_cast<double>(resultCompletedFctSeconds.size());
     }
 
-    auto computeNearestRankP99 = [](std::vector<double> samples) {
-        if (samples.empty())
-        {
-            return 0.0;
-        }
-        std::sort(samples.begin(), samples.end());
-        std::size_t index =
-            static_cast<std::size_t>(std::ceil(0.99 * static_cast<double>(samples.size())));
-        if (index == 0)
-        {
-            index = 1;
-        }
-        index -= 1;
-        if (index >= samples.size())
-        {
-            index = samples.size() - 1;
-        }
-        return samples[index];
-    };
-    const double resultP99FctSeconds = computeNearestRankP99(resultCompletedFctSeconds);
+    const double resultP99FctSeconds = ComputeNearestRankP99(resultCompletedFctSeconds);
 
     const double resultEffectiveDuration =
         simTime > matrixFlowStart ? (simTime - matrixFlowStart) : 0.0;
