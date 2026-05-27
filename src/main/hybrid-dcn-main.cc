@@ -43,6 +43,27 @@
 
 using namespace ns3;
 
+static void
+RegisterDetailedTraceCommandLineOptions(CommandLine& cmd,
+                                        bool& enableDetailedAlgorithmTrace,
+                                        uint32_t& detailedCandidateLogLimit,
+                                        bool& enableDetailedFlowTrace,
+                                        uint32_t& detailedFlowLogLimit)
+{
+    cmd.AddValue("enableDetailedAlgorithmTrace",
+                 "Enable detailed Louvain and OCS candidate diagnostics.",
+                 enableDetailedAlgorithmTrace);
+    cmd.AddValue("detailedCandidateLogLimit",
+                 "Maximum number of detailed candidate diagnostics to print.",
+                 detailedCandidateLogLimit);
+    cmd.AddValue("enableDetailedFlowTrace",
+                 "Enable detailed matrix-flow, admission, and path diagnostics.",
+                 enableDetailedFlowTrace);
+    cmd.AddValue("detailedFlowLogLimit",
+                 "Maximum number of detailed flow diagnostics to print.",
+                 detailedFlowLogLimit);
+}
+
 struct OcsInstalledLink
 {
     uint32_t leafA;
@@ -785,18 +806,11 @@ main(int argc, char* argv[])
     cmd.AddValue("strictAlgorithmInvariantCheck",
                  "Return non-zero when a Stage-40 invariant check fails.",
                  strictAlgorithmInvariantCheck);
-    cmd.AddValue("enableDetailedAlgorithmTrace",
-                 "Enable detailed Louvain and OCS candidate diagnostics.",
-                 enableDetailedAlgorithmTrace);
-    cmd.AddValue("detailedCandidateLogLimit",
-                 "Maximum number of detailed candidate diagnostics to print.",
-                 detailedCandidateLogLimit);
-    cmd.AddValue("enableDetailedFlowTrace",
-                 "Enable detailed matrix-flow, admission, and path diagnostics.",
-                 enableDetailedFlowTrace);
-    cmd.AddValue("detailedFlowLogLimit",
-                 "Maximum number of detailed flow diagnostics to print.",
-                 detailedFlowLogLimit);
+    RegisterDetailedTraceCommandLineOptions(cmd,
+                                            enableDetailedAlgorithmTrace,
+                                            detailedCandidateLogLimit,
+                                            enableDetailedFlowTrace,
+                                            detailedFlowLogLimit);
     cmd.AddValue("enableStructuredResultExport",
                  "Write structured summary, flow, WECMP, and OCS-candidate CSV outputs.",
                  enableStructuredResultExport);
