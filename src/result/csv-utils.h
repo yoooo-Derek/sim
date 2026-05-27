@@ -3,6 +3,7 @@
 
 #include <cstddef>
 #include <fstream>
+#include <iostream>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -70,6 +71,18 @@ joinCsvPath(const std::string& directory, const std::string& fileName)
         return directory + fileName;
     }
     return directory + "/" + fileName;
+}
+
+inline std::ofstream
+OpenStructuredResultCsv(const std::string& path, bool& exportSuccess)
+{
+    std::ofstream file(path);
+    if (!file.is_open())
+    {
+        exportSuccess = false;
+        std::cout << "[HYBRID-DCN][EXPORT] error = failed-to-open:" << path << std::endl;
+    }
+    return file;
 }
 
 #endif

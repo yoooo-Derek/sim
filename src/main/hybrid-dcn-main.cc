@@ -105,18 +105,6 @@ ComputeNearestRankP99(std::vector<double> samples)
     return samples[index];
 }
 
-static std::ofstream
-OpenStructuredResultCsv(const std::string& path, bool& exportSuccess)
-{
-    std::ofstream file(path);
-    if (!file.is_open())
-    {
-        exportSuccess = false;
-        std::cout << "[HYBRID-DCN][EXPORT] error = failed-to-open:" << path << std::endl;
-    }
-    return file;
-}
-
 struct OcsInstalledLink
 {
     uint32_t leafA;
