@@ -64,6 +64,25 @@ RegisterDetailedTraceCommandLineOptions(CommandLine& cmd,
                  detailedFlowLogLimit);
 }
 
+static std::string
+FormatCommunityLabelVector(const std::vector<uint32_t>& labels)
+{
+    if (labels.empty())
+    {
+        return std::string("none");
+    }
+    std::ostringstream stream;
+    for (uint32_t labelIndex = 0; labelIndex < labels.size(); ++labelIndex)
+    {
+        if (labelIndex > 0)
+        {
+            stream << ",";
+        }
+        stream << labelIndex << ":" << labels[labelIndex];
+    }
+    return stream.str();
+}
+
 struct OcsInstalledLink
 {
     uint32_t leafA;
@@ -5746,23 +5765,6 @@ main(int argc, char* argv[])
                   << std::endl;
     }
 
-    auto formatCommunityLabelVector = [](const std::vector<uint32_t>& labels) {
-        if (labels.empty())
-        {
-            return std::string("none");
-        }
-        std::ostringstream stream;
-        for (uint32_t labelIndex = 0; labelIndex < labels.size(); ++labelIndex)
-        {
-            if (labelIndex > 0)
-            {
-                stream << ",";
-            }
-            stream << labelIndex << ":" << labels[labelIndex];
-        }
-        return stream.str();
-    };
-
     std::vector<uint32_t> replayOcsDegree(numLeaves, 0);
     std::vector<OcsCandidateEdge> replaySelectedEdges;
     std::vector<std::string> replayRejectReasons(candidateEdges.size(),
@@ -5826,7 +5828,7 @@ main(int argc, char* argv[])
         std::cout << "[HYBRID-DCN][TRACE] louvainModularityQ = "
                   << louvainResult.modularityQ << std::endl;
         std::cout << "[HYBRID-DCN][TRACE] communityLabelVector = "
-                  << formatCommunityLabelVector(activeCommunityLabels) << std::endl;
+                  << FormatCommunityLabelVector(activeCommunityLabels) << std::endl;
         std::cout << "[HYBRID-DCN][TRACE] candidateSortRule = "
                      "descending-selectionScore-ascending-leafA-ascending-leafB"
                   << std::endl;
