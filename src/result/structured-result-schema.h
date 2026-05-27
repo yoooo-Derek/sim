@@ -59,6 +59,53 @@ WecmpCsvHeader()
 }
 
 inline const std::vector<std::string>&
+FlowsCsvHeader()
+{
+    static const std::vector<std::string> header = {"flowIndex",
+                                                    "name",
+                                                    "srcLeaf",
+                                                    "dstLeaf",
+                                                    "rawDemand",
+                                                    "controlDemand",
+                                                    "ocsPairInstalled",
+                                                    "admissionMode",
+                                                    "ocsAdmitted",
+                                                    "ocsCovered",
+                                                    "fallbackToEps",
+                                                    "fallbackDataPlaneMode",
+                                                    "fallbackEventMapped",
+                                                    "fallbackMappingType",
+                                                    "plannedResidualDemand",
+                                                    "realResidualDemand",
+                                                    "wecmpResidualDemand",
+                                                    "requiresEpsResidualPath",
+                                                    "residualPathReason",
+                                                    "epsPathFrozen",
+                                                    "frozenSpine",
+                                                    "packetSinkPort",
+                                                    "startTime",
+                                                    "expectedBytes",
+                                                    "rxBytes",
+                                                    "completed",
+                                                    "completionRatio",
+                                                    "firstRx",
+                                                    "lastRx",
+                                                    "goodputMbps",
+                                                    "pathType",
+                                                    "fctSeconds",
+                                                    "rxDurationSeconds",
+                                                    "isMeasuredLaterProofFlow",
+                                                    "measuredLaterDecisionTime",
+                                                    "measuredLaterDecisionIndex",
+                                                    "measuredLaterSelectedSpine",
+                                                    "measuredLaterControlPlaneSelectedSpine",
+                                                    "measuredLaterSelectedSpineChanged",
+                                                    "measuredLaterHasMeasuredSample",
+                                                    "measuredLaterAppliesToLaterFlow"};
+    return header;
+}
+
+inline const std::vector<std::string>&
 LinksCsvHeader()
 {
     static const std::vector<std::string> header = {"linkIndex",
