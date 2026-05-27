@@ -7650,37 +7650,7 @@ main(int argc, char* argv[])
             std::ofstream file = openCsv(wecmpCsvPath);
             if (file.is_open())
             {
-                writeCsvRow(file,
-                            {"decisionIndex",
-                             "srcLeaf",
-                             "dstLeaf",
-                             "residualDemand",
-                             "selectedSpine",
-                             "spineIndex",
-                             "pathLoadMetric",
-                             "candidatePathLoad",
-                             "attractiveness",
-                             "normalizedAttractiveness",
-                             "targetProbability",
-                             "previousProbability",
-                             "updatedProbability",
-                             "probabilityDelta",
-                             "boundedProbabilityDelta",
-                             "loadSource",
-                             "hasMeasuredSample",
-                             "measuredSrcToSpineUtilization",
-                             "measuredSpineToDstUtilization",
-                             "measuredPathUtilization",
-                             "controlPlanePathLoadMetric",
-                             "effectivePathLoadMetric",
-                             "noSampleFallbackMode",
-                             "measuredDecisionRequested",
-                             "measuredDecisionUsed",
-                             "measuredDecisionFallback",
-                             "measuredNoSample",
-                             "decisionTimeSeconds",
-                             "appliesToLaterFlow",
-                             "controlPlaneSelectedSpine"});
+                writeCsvRow(file, WecmpCsvHeader());
                 for (uint32_t decisionIndex = 0; decisionIndex < epsWecmpDecisions.size();
                      ++decisionIndex)
                 {

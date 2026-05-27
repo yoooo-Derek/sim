@@ -23,6 +23,42 @@ OcsCandidatesCsvHeader()
 }
 
 inline const std::vector<std::string>&
+WecmpCsvHeader()
+{
+    static const std::vector<std::string> header = {"decisionIndex",
+                                                    "srcLeaf",
+                                                    "dstLeaf",
+                                                    "residualDemand",
+                                                    "selectedSpine",
+                                                    "spineIndex",
+                                                    "pathLoadMetric",
+                                                    "candidatePathLoad",
+                                                    "attractiveness",
+                                                    "normalizedAttractiveness",
+                                                    "targetProbability",
+                                                    "previousProbability",
+                                                    "updatedProbability",
+                                                    "probabilityDelta",
+                                                    "boundedProbabilityDelta",
+                                                    "loadSource",
+                                                    "hasMeasuredSample",
+                                                    "measuredSrcToSpineUtilization",
+                                                    "measuredSpineToDstUtilization",
+                                                    "measuredPathUtilization",
+                                                    "controlPlanePathLoadMetric",
+                                                    "effectivePathLoadMetric",
+                                                    "noSampleFallbackMode",
+                                                    "measuredDecisionRequested",
+                                                    "measuredDecisionUsed",
+                                                    "measuredDecisionFallback",
+                                                    "measuredNoSample",
+                                                    "decisionTimeSeconds",
+                                                    "appliesToLaterFlow",
+                                                    "controlPlaneSelectedSpine"};
+    return header;
+}
+
+inline const std::vector<std::string>&
 LinksCsvHeader()
 {
     static const std::vector<std::string> header = {"linkIndex",
