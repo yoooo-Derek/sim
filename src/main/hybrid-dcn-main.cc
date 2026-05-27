@@ -105,6 +105,18 @@ ComputeNearestRankP99(std::vector<double> samples)
     return samples[index];
 }
 
+static std::ofstream
+OpenStructuredResultCsv(const std::string& path, bool& exportSuccess)
+{
+    std::ofstream file(path);
+    if (!file.is_open())
+    {
+        exportSuccess = false;
+        std::cout << "[HYBRID-DCN][EXPORT] error = failed-to-open:" << path << std::endl;
+    }
+    return file;
+}
+
 struct OcsInstalledLink
 {
     uint32_t leafA;
@@ -7375,19 +7387,9 @@ main(int argc, char* argv[])
         }
 
         bool exportSuccess = true;
-        auto openCsv = [&](const std::string& path) {
-            std::ofstream file(path);
-            if (!file.is_open())
-            {
-                exportSuccess = false;
-                std::cout << "[HYBRID-DCN][EXPORT] error = failed-to-open:" << path
-                          << std::endl;
-            }
-            return file;
-        };
 
         {
-            std::ofstream file = openCsv(summaryCsvPath);
+            std::ofstream file = OpenStructuredResultCsv(summaryCsvPath, exportSuccess);
             if (file.is_open())
             {
                 writeCsvRow(file, SummaryCsvHeader());
@@ -7480,7 +7482,7 @@ main(int argc, char* argv[])
         }
 
         {
-            std::ofstream file = openCsv(flowsCsvPath);
+            std::ofstream file = OpenStructuredResultCsv(flowsCsvPath, exportSuccess);
             if (file.is_open())
             {
                 writeCsvRow(file, FlowsCsvHeader());
@@ -7550,7 +7552,7 @@ main(int argc, char* argv[])
         }
 
         {
-            std::ofstream file = openCsv(wecmpCsvPath);
+            std::ofstream file = OpenStructuredResultCsv(wecmpCsvPath, exportSuccess);
             if (file.is_open())
             {
                 writeCsvRow(file, WecmpCsvHeader());
@@ -7603,7 +7605,7 @@ main(int argc, char* argv[])
         }
 
         {
-            std::ofstream file = openCsv(ocsCandidatesCsvPath);
+            std::ofstream file = OpenStructuredResultCsv(ocsCandidatesCsvPath, exportSuccess);
             if (file.is_open())
             {
                 writeCsvRow(file, OcsCandidatesCsvHeader());
@@ -7637,7 +7639,7 @@ main(int argc, char* argv[])
         }
 
         {
-            std::ofstream file = openCsv(linksCsvPath);
+            std::ofstream file = OpenStructuredResultCsv(linksCsvPath, exportSuccess);
             if (file.is_open())
             {
                 writeCsvRow(file, LinksCsvHeader());
@@ -7670,7 +7672,7 @@ main(int argc, char* argv[])
         }
 
         {
-            std::ofstream file = openCsv(linkTimeseriesCsvPath);
+            std::ofstream file = OpenStructuredResultCsv(linkTimeseriesCsvPath, exportSuccess);
             if (file.is_open())
             {
                 writeCsvRow(file, LinkTimeseriesCsvHeader());
@@ -7716,7 +7718,7 @@ main(int argc, char* argv[])
         }
 
         {
-            std::ofstream file = openCsv(measuredWecmpCsvPath);
+            std::ofstream file = OpenStructuredResultCsv(measuredWecmpCsvPath, exportSuccess);
             if (file.is_open())
             {
                 writeCsvRow(file, MeasuredWecmpCsvHeader());
