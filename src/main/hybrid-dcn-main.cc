@@ -14,12 +14,14 @@
 #include "../metrics/trace-metrics.h"
 #include "../model/louvain.h"
 #include "../ocs/ocs-state.h"
+#include "../result/csv-utils.h"
 #include "../traffic/traffic-matrix.h"
 #else
 #include "../../sim/src/eps/eps-wecmp-state.h"
 #include "../../sim/src/metrics/trace-metrics.h"
 #include "../../sim/src/model/louvain.h"
 #include "../../sim/src/ocs/ocs-state.h"
+#include "../../sim/src/result/csv-utils.h"
 #include "../../sim/src/traffic/traffic-matrix.h"
 #endif
 
@@ -7305,56 +7307,6 @@ main(int argc, char* argv[])
                   << passFail(overallResultConsistency) << std::endl;
         overallResultConsistencyStatus = passFail(overallResultConsistency);
     }
-
-    auto csvEscape = [](const std::string& value) {
-        const bool needsQuotes = value.find_first_of(",\"\n\r") != std::string::npos;
-        if (!needsQuotes)
-        {
-            return value;
-        }
-
-        std::ostringstream escaped;
-        escaped << '"';
-        for (const char ch : value)
-        {
-            if (ch == '"')
-            {
-                escaped << "\"\"";
-            }
-            else
-            {
-                escaped << ch;
-            }
-        }
-        escaped << '"';
-        return escaped.str();
-    };
-    auto csvBool = [](bool value) {
-        return value ? std::string("true") : std::string("false");
-    };
-    auto csvValue = [](const auto& value) {
-        std::ostringstream stream;
-        stream << value;
-        return stream.str();
-    };
-    auto writeCsvRow = [&](std::ofstream& file, const std::vector<std::string>& values) {
-        for (std::size_t valueIndex = 0; valueIndex < values.size(); ++valueIndex)
-        {
-            if (valueIndex > 0)
-            {
-                file << ",";
-            }
-            file << csvEscape(values[valueIndex]);
-        }
-        file << "\n";
-    };
-    auto joinCsvPath = [](const std::string& directory, const std::string& fileName) {
-        if (directory.empty() || directory[directory.size() - 1] == '/')
-        {
-            return directory + fileName;
-        }
-        return directory + "/" + fileName;
-    };
 
     const std::string summaryCsvPath =
         joinCsvPath(structuredResultDir, experimentName + "-summary.csv");
