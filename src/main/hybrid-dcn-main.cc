@@ -15,6 +15,7 @@
 #include "../model/louvain.h"
 #include "../ocs/ocs-state.h"
 #include "../result/csv-utils.h"
+#include "../result/structured-result-paths.h"
 #include "../traffic/traffic-matrix.h"
 #else
 #include "../../sim/src/eps/eps-wecmp-state.h"
@@ -22,6 +23,7 @@
 #include "../../sim/src/model/louvain.h"
 #include "../../sim/src/ocs/ocs-state.h"
 #include "../../sim/src/result/csv-utils.h"
+#include "../../sim/src/result/structured-result-paths.h"
 #include "../../sim/src/traffic/traffic-matrix.h"
 #endif
 
@@ -7308,20 +7310,18 @@ main(int argc, char* argv[])
         overallResultConsistencyStatus = passFail(overallResultConsistency);
     }
 
-    const std::string summaryCsvPath =
-        joinCsvPath(structuredResultDir, experimentName + "-summary.csv");
-    const std::string flowsCsvPath =
-        joinCsvPath(structuredResultDir, experimentName + "-flows.csv");
-    const std::string wecmpCsvPath =
-        joinCsvPath(structuredResultDir, experimentName + "-wecmp.csv");
-    const std::string ocsCandidatesCsvPath =
-        joinCsvPath(structuredResultDir, experimentName + "-ocs-candidates.csv");
-    const std::string linksCsvPath =
-        joinCsvPath(structuredResultDir, experimentName + "-links.csv");
-    const std::string linkTimeseriesCsvPath =
-        joinCsvPath(structuredResultDir, experimentName + "-link-timeseries.csv");
-    const std::string measuredWecmpCsvPath =
-        joinCsvPath(structuredResultDir, experimentName + "-measured-wecmp.csv");
+    const StructuredResultCsvPaths structuredResultCsvPaths =
+        BuildStructuredResultCsvPaths(structuredResultDir, experimentName);
+    const std::string& summaryCsvPath = structuredResultCsvPaths.summaryCsvPath;
+    const std::string& flowsCsvPath = structuredResultCsvPaths.flowsCsvPath;
+    const std::string& wecmpCsvPath = structuredResultCsvPaths.wecmpCsvPath;
+    const std::string& ocsCandidatesCsvPath =
+        structuredResultCsvPaths.ocsCandidatesCsvPath;
+    const std::string& linksCsvPath = structuredResultCsvPaths.linksCsvPath;
+    const std::string& linkTimeseriesCsvPath =
+        structuredResultCsvPaths.linkTimeseriesCsvPath;
+    const std::string& measuredWecmpCsvPath =
+        structuredResultCsvPaths.measuredWecmpCsvPath;
     bool structuredExportCheck = !enableStructuredResultExport;
     bool structuredExportEvaluated = false;
 
