@@ -85,4 +85,17 @@ OpenStructuredResultCsv(const std::string& path, bool& exportSuccess)
     return file;
 }
 
+inline std::ofstream
+OpenStructuredResultCsvWithHeader(const std::string& path,
+                                  const std::vector<std::string>& header,
+                                  bool& exportSuccess)
+{
+    std::ofstream file = OpenStructuredResultCsv(path, exportSuccess);
+    if (file.is_open())
+    {
+        writeCsvRow(file, header);
+    }
+    return file;
+}
+
 #endif

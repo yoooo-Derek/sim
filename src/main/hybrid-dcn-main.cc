@@ -7377,10 +7377,10 @@ main(int argc, char* argv[])
         bool exportSuccess = true;
 
         {
-            std::ofstream file = OpenStructuredResultCsv(summaryCsvPath, exportSuccess);
+            std::ofstream file =
+                OpenStructuredResultCsvWithHeader(summaryCsvPath, SummaryCsvHeader(), exportSuccess);
             if (file.is_open())
             {
-                writeCsvRow(file, SummaryCsvHeader());
                 writeCsvRow(file,
                             {experimentName,
                              presetScenario,
@@ -7470,10 +7470,10 @@ main(int argc, char* argv[])
         }
 
         {
-            std::ofstream file = OpenStructuredResultCsv(flowsCsvPath, exportSuccess);
+            std::ofstream file =
+                OpenStructuredResultCsvWithHeader(flowsCsvPath, FlowsCsvHeader(), exportSuccess);
             if (file.is_open())
             {
-                writeCsvRow(file, FlowsCsvHeader());
                 for (uint32_t flowIndex = 0; flowIndex < matrixFlowSpecs.size(); ++flowIndex)
                 {
                     const auto& spec = matrixFlowSpecs[flowIndex];
@@ -7540,10 +7540,10 @@ main(int argc, char* argv[])
         }
 
         {
-            std::ofstream file = OpenStructuredResultCsv(wecmpCsvPath, exportSuccess);
+            std::ofstream file =
+                OpenStructuredResultCsvWithHeader(wecmpCsvPath, WecmpCsvHeader(), exportSuccess);
             if (file.is_open())
             {
-                writeCsvRow(file, WecmpCsvHeader());
                 for (uint32_t decisionIndex = 0; decisionIndex < epsWecmpDecisions.size();
                      ++decisionIndex)
                 {
@@ -7593,10 +7593,11 @@ main(int argc, char* argv[])
         }
 
         {
-            std::ofstream file = OpenStructuredResultCsv(ocsCandidatesCsvPath, exportSuccess);
+            std::ofstream file = OpenStructuredResultCsvWithHeader(ocsCandidatesCsvPath,
+                                                                   OcsCandidatesCsvHeader(),
+                                                                   exportSuccess);
             if (file.is_open())
             {
-                writeCsvRow(file, OcsCandidatesCsvHeader());
                 for (uint32_t candidateIndex = 0; candidateIndex < candidateEdges.size();
                      ++candidateIndex)
                 {
@@ -7627,10 +7628,10 @@ main(int argc, char* argv[])
         }
 
         {
-            std::ofstream file = OpenStructuredResultCsv(linksCsvPath, exportSuccess);
+            std::ofstream file =
+                OpenStructuredResultCsvWithHeader(linksCsvPath, LinksCsvHeader(), exportSuccess);
             if (file.is_open())
             {
-                writeCsvRow(file, LinksCsvHeader());
                 for (uint32_t linkIndex = 0; linkIndex < linkCounters.size(); ++linkIndex)
                 {
                     const auto& counter = linkCounters[linkIndex];
@@ -7660,10 +7661,11 @@ main(int argc, char* argv[])
         }
 
         {
-            std::ofstream file = OpenStructuredResultCsv(linkTimeseriesCsvPath, exportSuccess);
+            std::ofstream file = OpenStructuredResultCsvWithHeader(linkTimeseriesCsvPath,
+                                                                   LinkTimeseriesCsvHeader(),
+                                                                   exportSuccess);
             if (file.is_open())
             {
-                writeCsvRow(file, LinkTimeseriesCsvHeader());
                 for (const auto& sample : linkUtilizationSamples)
                 {
                     if (sample.linkIndex >= linkCounters.size())
@@ -7706,10 +7708,11 @@ main(int argc, char* argv[])
         }
 
         {
-            std::ofstream file = OpenStructuredResultCsv(measuredWecmpCsvPath, exportSuccess);
+            std::ofstream file = OpenStructuredResultCsvWithHeader(measuredWecmpCsvPath,
+                                                                   MeasuredWecmpCsvHeader(),
+                                                                   exportSuccess);
             if (file.is_open())
             {
-                writeCsvRow(file, MeasuredWecmpCsvHeader());
                 for (uint32_t leafIndex = 0; leafIndex < numLeaves; ++leafIndex)
                 {
                     for (uint32_t spineIndex = 0; spineIndex < numSpines; ++spineIndex)
